@@ -6,17 +6,21 @@
 #define V8_HEAP_FACTORY_INL_H_
 
 #include "src/heap/factory.h"
+// Include the non-inl header before the rest of the headers.
 
 // Clients of this interface shouldn't depend on lots of heap internals.
 // Do not include anything from src/heap here!
-#include "src/execution/isolate-inl.h"
+#include "src/common/globals.h"
 #include "src/handles/handles-inl.h"
-#include "src/objects/feedback-cell.h"
+#include "src/heap/factory-base-inl.h"
+#include "src/objects/dictionary.h"
+#include "src/objects/foreign.h"
 #include "src/objects/heap-number-inl.h"
-#include "src/objects/objects-inl.h"
-#include "src/objects/oddball.h"
+#include "src/objects/heap-object-inl.h"
+#include "src/objects/map-inl.h"
 #include "src/objects/string-inl.h"
-#include "src/strings/string-hasher.h"
+#include "src/objects/string-table-inl.h"
+#include "src/objects/tagged-field-inl.h"
 
 namespace v8 {
 namespace internal {
@@ -25,97 +29,122 @@ namespace internal {
   Handle<Type> Factory::name() {                                             \
     return Handle<Type>(&isolate()->roots_table()[RootIndex::k##CamelName]); \
   }
-ROOT_LIST(ROOT_ACCESSOR)
+MUTABLE_ROOT_LIST(ROOT_ACCESSOR)
 #undef ROOT_ACCESSOR
 
-Handle<String> Factory::InternalizeString(Handle<String> string) {
-  if (string->IsInternalizedString()) return string;
-  return StringTable::LookupString(isolate(), string);
+template <typename T>
+  requires(std::is_convertible_v<Handle<T>, Handle<String>>)
+Handle<String> Factory::InternalizeString(Handle<T> string) {
+  // T should be a subtype of String, which is enforced by the second template
+  // argument.
+  if (IsInternalizedString(*string)) return string;
+  return indirect_handle(
+      isolate()->string_table()->LookupString(isolate(), string), isolate());
 }
 
-Handle<Name> Factory::InternalizeName(Handle<Name> name) {
-  if (name->IsUniqueName()) return name;
-  return StringTable::LookupString(isolate(), Handle<String>::cast(name));
+template <typename T>
+  requires(std::is_convertible_v<Handle<T>, Handle<Name>>)
+Handle<Name> Factory::InternalizeName(Handle<T> name) {
+  // T should be a subtype of Name, which is enforced by the second template
+  // argument.
+  if (IsUniqueName(*name)) return name;
+  return indirect_handle(
+      isolate()->string_table()->LookupString(isolate(), Cast<String>(name)),
+      isolate());
 }
 
-Handle<String> Factory::NewSubString(Handle<String> str, int begin, int end) {
+template <typename T>
+  requires(std::is_convertible_v<DirectHandle<T>, DirectHandle<String>>)
+DirectHandle<String> Factory::InternalizeString(DirectHandle<T> string) {
+  // T should be a subtype of String, which is enforced by the second template
+  // argument.
+  if (IsInternalizedString(*string)) return string;
+  return isolate()->string_table()->LookupString(isolate(), string);
+}
+
+template <typename T>
+  requires(std::is_convertible_v<DirectHandle<T>, DirectHandle<Name>>)
+DirectHandle<Name> Factory::InternalizeName(DirectHandle<T> name) {
+  // T should be a subtype of Name, which is enforced by the second template
+  // argument.
+  if (IsUniqueName(*name)) return name;
+  return isolate()->string_table()->LookupString(isolate(), Cast<String>(name));
+}
+
+template <size_t N>
+Handle<String> Factory::NewStringFromStaticChars(const char (&str)[N],
+                                                 AllocationType allocation) {
+  DCHECK_EQ(N, strlen(str) + 1);
+  return NewStringFromOneByte(base::StaticOneByteVector(str), allocation)
+      .ToHandleChecked();
+}
+
+template <typename T, template <typename> typename HandleType>
+  requires(std::is_convertible_v<HandleType<T>, HandleType<String>>)
+HandleType<String> Factory::NewSubString(HandleType<T> str, uint32_t begin,
+                                         uint32_t end) {
   if (begin == 0 && end == str->length()) return str;
   return NewProperSubString(str, begin, end);
 }
 
-Handle<Object> Factory::NewNumberFromSize(size_t value) {
-  // We can't use Smi::IsValid() here because that operates on a signed
-  // intptr_t, and casting from size_t could create a bogus sign bit.
-  if (value <= static_cast<size_t>(Smi::kMaxValue)) {
-    return Handle<Object>(Smi::FromIntptr(static_cast<intptr_t>(value)),
-                          isolate());
-  }
-  return NewNumber(static_cast<double>(value));
-}
-
-Handle<Object> Factory::NewNumberFromInt64(int64_t value) {
-  if (value <= std::numeric_limits<int32_t>::max() &&
-      value >= std::numeric_limits<int32_t>::min() &&
-      Smi::IsValid(static_cast<int32_t>(value))) {
-    return Handle<Object>(Smi::FromInt(static_cast<int32_t>(value)), isolate());
-  }
-  return NewNumber(static_cast<double>(value));
-}
-
-template <AllocationType allocation>
-Handle<HeapNumber> Factory::NewHeapNumber(double value) {
-  Handle<HeapNumber> heap_number = NewHeapNumber<allocation>();
-  heap_number->set_value(value);
-  return heap_number;
-}
-
-template <AllocationType allocation>
-Handle<HeapNumber> Factory::NewHeapNumberFromBits(uint64_t bits) {
-  Handle<HeapNumber> heap_number = NewHeapNumber<allocation>();
-  heap_number->set_value_as_bits(bits);
-  return heap_number;
-}
-
-Handle<HeapNumber> Factory::NewHeapNumberWithHoleNaN() {
-  return NewHeapNumberFromBits(kHoleNanInt64);
-}
-
-Handle<JSArray> Factory::NewJSArrayWithElements(Handle<FixedArrayBase> elements,
-                                                ElementsKind elements_kind,
-                                                AllocationType allocation) {
-  return NewJSArrayWithElements(elements, elements_kind, elements->length(),
-                                allocation);
+Handle<JSArray> Factory::NewJSArrayWithElements(
+    DirectHandle<FixedArrayBase> elements, ElementsKind elements_kind,
+    AllocationType allocation) {
+  return NewJSArrayWithElements(elements, elements_kind,
+                                elements->ulength().value(), allocation);
 }
 
 Handle<JSObject> Factory::NewFastOrSlowJSObjectFromMap(
-    Handle<Map> map, int number_of_slow_properties, AllocationType allocation,
-    Handle<AllocationSite> allocation_site) {
-  return map->is_dictionary_map()
-             ? NewSlowJSObjectFromMap(map, number_of_slow_properties,
-                                      allocation, allocation_site)
-             : NewJSObjectFromMap(map, allocation, allocation_site);
+    DirectHandle<Map> map, int number_of_slow_properties,
+    AllocationType allocation, DirectHandle<AllocationSite> allocation_site,
+    NewJSObjectType new_js_object_type) {
+  auto js_object =
+      map->is_dictionary_map()
+          ? NewSlowJSObjectFromMap(map, number_of_slow_properties, allocation,
+                                   allocation_site, new_js_object_type)
+          : NewJSObjectFromMap(map, allocation, allocation_site,
+                               new_js_object_type);
+  return js_object;
 }
 
-Handle<Object> Factory::NewURIError() {
-  return NewError(isolate()->uri_error_function(),
-                  MessageTemplate::kURIMalformed);
+Handle<JSObject> Factory::NewFastOrSlowJSObjectFromMap(DirectHandle<Map> map) {
+  return NewFastOrSlowJSObjectFromMap(map,
+                                      PropertyDictionary::kInitialCapacity);
 }
 
-Handle<String> Factory::Uint32ToString(uint32_t value, bool check_cache) {
-  Handle<String> result;
-  int32_t int32v = static_cast<int32_t>(value);
-  if (int32v >= 0 && Smi::IsValid(int32v)) {
-    result = NumberToString(Smi::FromInt(int32v), check_cache);
-  } else {
-    result = NumberToString(NewNumberFromUint(value), check_cache);
-  }
+template <ExternalPointerTag tag>
+Handle<Foreign> Factory::NewForeign(Address addr,
+                                    AllocationType allocation_type) {
+  // Statically ensure that it is safe to allocate foreigns in paged spaces.
+  static_assert(sizeof(Foreign) <= kMaxRegularHeapObjectSize);
+  Tagged<Map> map = *foreign_map();
+  Tagged<Foreign> foreign = Cast<Foreign>(
+      AllocateRawWithImmortalMap(map->instance_size(), allocation_type, map));
+  DisallowGarbageCollection no_gc;
+  foreign->init_foreign_address<tag>(isolate(), addr);
+  return handle(foreign, isolate());
+}
 
-  if (result->length() <= String::kMaxArrayIndexSize &&
-      result->hash_field() == String::kEmptyHashField) {
-    uint32_t field = StringHasher::MakeArrayIndexHash(value, result->length());
-    result->set_hash_field(field);
-  }
-  return result;
+ReadOnlyRoots Factory::read_only_roots() const {
+  return ReadOnlyRoots(isolate());
+}
+
+HeapAllocator* Factory::allocator() const {
+  return isolate()->heap()->allocator();
+}
+
+Factory::CodeBuilder& Factory::CodeBuilder::set_empty_source_position_table() {
+  return set_source_position_table(
+      isolate_->factory()->empty_trusted_byte_array());
+}
+
+Factory::CodeBuilder& Factory::CodeBuilder::set_interpreter_data(
+    Handle<UnionOf<BytecodeArray, InterpreterData>> interpreter_data) {
+  // This DCHECK requires this function to be in -inl.h.
+  DCHECK(IsInterpreterData(*interpreter_data) ||
+         IsBytecodeArray(*interpreter_data));
+  interpreter_data_ = interpreter_data;
+  return *this;
 }
 
 }  // namespace internal

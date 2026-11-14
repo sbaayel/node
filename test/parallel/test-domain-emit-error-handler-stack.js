@@ -5,17 +5,15 @@ const assert = require('assert');
 const domain = require('domain');
 const EventEmitter = require('events');
 
-/*
- * Make sure that the domains stack and the active domain is setup properly when
- * a domain's error handler is called due to an error event being emitted.
- * More specifically, we want to test that:
- * - the active domain in the domain's error handler is *not* that domain, *but*
- *   the active domain is a any direct parent domain at the time the error was
- *   emitted.
- * - the domains stack in the domain's error handler does *not* include that
- *   domain, *but* it includes all parents of that domain when the error was
- *   emitted.
- */
+// Make sure that the domains stack and the active domain is setup properly when
+// a domain's error handler is called due to an error event being emitted.
+// More specifically, we want to test that:
+// - the active domain in the domain's error handler is//not* that domain,//but*
+//   the active domain is a any direct parent domain at the time the error was
+//   emitted.
+// - the domains stack in the domain's error handler does//not* include that
+//   domain, *but* it includes all parents of that domain when the error was
+//   emitted.
 const d1 = domain.create();
 const d2 = domain.create();
 const d3 = domain.create();
@@ -38,9 +36,11 @@ function checkExpectedDomains(err) {
   // Then make sure that the domains stack and active domain is setup as
   // expected when executing a callback scheduled via nextTick from the error
   // handler.
+  // Note: With AsyncLocalStorage-based domains, async callbacks inherit the
+  // full stack from when they were scheduled, so stack length matches the
+  // sync context.
   process.nextTick(() => {
-    const expectedStackLengthInNextTickCb =
-            err.expectedStackLength > 0 ? 1 : 0;
+    const expectedStackLengthInNextTickCb = err.expectedStackLength;
     if (domain._stack.length !== expectedStackLengthInNextTickCb) {
       console.error('expected stack length in nextTick cb to be %d, ' +
                 'but instead is %d', expectedStackLengthInNextTickCb,
@@ -72,22 +72,22 @@ d3.on('error', common.mustCall((err) => {
   checkExpectedDomains(err);
 }, 1));
 
-d1.run(() => {
+d1.run(common.mustCall(() => {
   const ee = new EventEmitter();
   assert.strictEqual(process.domain, d1);
   assert.strictEqual(domain._stack.length, 1);
 
   const err = new Error('oops');
   err.expectedStackLength = 0;
-  err.expectedActiveDomain = null;
+  err.expectedActiveDomain = undefined;
   ee.emit('error', err);
 
   assert.strictEqual(process.domain, d1);
   assert.strictEqual(domain._stack.length, 1);
-});
+}));
 
-d1.run(() => {
-  d1.run(() => {
+d1.run(common.mustCall(() => {
+  d1.run(common.mustCall(() => {
     const ee = new EventEmitter();
 
     assert.strictEqual(process.domain, d1);
@@ -95,16 +95,16 @@ d1.run(() => {
 
     const err = new Error('oops');
     err.expectedStackLength = 0;
-    err.expectedActiveDomain = null;
+    err.expectedActiveDomain = undefined;
     ee.emit('error', err);
 
     assert.strictEqual(process.domain, d1);
     assert.strictEqual(domain._stack.length, 2);
-  });
-});
+  }));
+}));
 
-d1.run(() => {
-  d2.run(() => {
+d1.run(common.mustCall(() => {
+  d2.run(common.mustCall(() => {
     const ee = new EventEmitter();
 
     assert.strictEqual(process.domain, d2);
@@ -117,12 +117,12 @@ d1.run(() => {
 
     assert.strictEqual(process.domain, d2);
     assert.strictEqual(domain._stack.length, 2);
-  });
-});
+  }));
+}));
 
-d1.run(() => {
-  d2.run(() => {
-    d2.run(() => {
+d1.run(common.mustCall(() => {
+  d2.run(common.mustCall(() => {
+    d2.run(common.mustCall(() => {
       const ee = new EventEmitter();
 
       assert.strictEqual(process.domain, d2);
@@ -135,14 +135,14 @@ d1.run(() => {
 
       assert.strictEqual(process.domain, d2);
       assert.strictEqual(domain._stack.length, 3);
-    });
-  });
-});
+    }));
+  }));
+}));
 
-d3.run(() => {
-  d1.run(() => {
-    d3.run(() => {
-      d3.run(() => {
+d3.run(common.mustCall(() => {
+  d1.run(common.mustCall(() => {
+    d3.run(common.mustCall(() => {
+      d3.run(common.mustCall(() => {
         const ee = new EventEmitter();
 
         assert.strictEqual(process.domain, d3);
@@ -155,7 +155,7 @@ d3.run(() => {
 
         assert.strictEqual(process.domain, d3);
         assert.strictEqual(domain._stack.length, 4);
-      });
-    });
-  });
-});
+      }));
+    }));
+  }));
+}));

@@ -25,7 +25,9 @@
 // (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-// Flags: --allow-natives-syntax --expose-gc --nostress-opt
+// Flags: --allow-natives-syntax --expose-gc
+// Flags: --deopt-every-n-times=0
+// Flags: --js-staging
 
 var elements_kind = {
   fast_smi_only             :  'fast smi only elements',
@@ -38,6 +40,7 @@ var elements_kind = {
   fixed_uint16              :  'fixed uint16 elements',
   fixed_int32               :  'fixed int32 elements',
   fixed_uint32              :  'fixed uint32 elements',
+  fixed_float16             :  'fixed float16 elements',
   fixed_float32             :  'fixed float32 elements',
   fixed_float64             :  'fixed float64 elements',
   fixed_uint8_clamped       :  'fixed uint8_clamped elements'
@@ -66,6 +69,9 @@ function getKind(obj) {
   }
   if (%HasFixedUint32Elements(obj)) {
     return elements_kind.fixed_uint32;
+  }
+  if (%HasFixedFloat16Elements(obj)) {
+    return elements_kind.fixed_float16;
   }
   if (%HasFixedFloat32Elements(obj)) {
     return elements_kind.fixed_float32;
@@ -109,11 +115,16 @@ function test_wrapper() {
   assertKind(elements_kind.fast, you);
 
   var temp = [];
-  temp[0xDECAF] = 0;
+  // If we store beyond kMaxGap (1024) we should transition to slow elements.
+  temp[1024] = 0;
   assertKind(elements_kind.dictionary, temp);
 
   var fast_double_array = new Array(0xDECAF);
-  for (var i = 0; i < 0xDECAF; i++) fast_double_array[i] = i / 2;
+  // If the gap is greater than 1024 (kMaxGap) we would transition the array
+  // to slow. So increment should be less than 1024.
+  for (var i = 0; i < 0xDECAF; i+=1023) {
+    fast_double_array[i] = i / 2;
+  }
   assertKind(elements_kind.fast_double, fast_double_array);
 
   assertKind(elements_kind.fixed_int8,    new Int8Array(007));
@@ -122,6 +133,7 @@ function test_wrapper() {
   assertKind(elements_kind.fixed_uint16,  new Uint16Array(42));
   assertKind(elements_kind.fixed_int32,   new Int32Array(0xF));
   assertKind(elements_kind.fixed_uint32,  new Uint32Array(23));
+  assertKind(elements_kind.fixed_float16, new Float16Array(7));
   assertKind(elements_kind.fixed_float32, new Float32Array(7));
   assertKind(elements_kind.fixed_float64, new Float64Array(0));
   assertKind(elements_kind.fixed_uint8_clamped, new Uint8ClampedArray(512));
@@ -133,6 +145,7 @@ function test_wrapper() {
   assertKind(elements_kind.fixed_uint16,  new Uint16Array(ab));
   assertKind(elements_kind.fixed_int32,   new Int32Array(ab));
   assertKind(elements_kind.fixed_uint32,  new Uint32Array(ab));
+  assertKind(elements_kind.fixed_float16, new Float16Array(ab));
   assertKind(elements_kind.fixed_float32, new Float32Array(ab));
   assertKind(elements_kind.fixed_float64, new Float64Array(ab));
   assertKind(elements_kind.fixed_uint8_clamped, new Uint8ClampedArray(ab));

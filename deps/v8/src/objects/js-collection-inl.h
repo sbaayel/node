@@ -6,12 +6,11 @@
 #define V8_OBJECTS_JS_COLLECTION_INL_H_
 
 #include "src/objects/js-collection.h"
+// Include the non-inl header before the rest of the headers.
 
-#include "src/heap/heap-write-barrier-inl.h"
-#include "src/objects/heap-object-inl.h"
+#include "src/objects/js-collection-iterator-inl.h"
 #include "src/objects/objects-inl.h"
 #include "src/objects/ordered-hash-table-inl.h"
-#include "src/roots/roots-inl.h"
 
 // Has to be the last include (doesn't have include guards):
 #include "src/objects/object-macros.h"
@@ -19,40 +18,25 @@
 namespace v8 {
 namespace internal {
 
-TQ_OBJECT_CONSTRUCTORS_IMPL(JSCollection)
-TQ_OBJECT_CONSTRUCTORS_IMPL(JSMap)
-TQ_OBJECT_CONSTRUCTORS_IMPL(JSSet)
-TQ_OBJECT_CONSTRUCTORS_IMPL(JSWeakCollection)
-TQ_OBJECT_CONSTRUCTORS_IMPL(JSWeakMap)
-TQ_OBJECT_CONSTRUCTORS_IMPL(JSWeakSet)
+Tagged<Object> JSCollection::table() const { return table_.load(); }
 
-// TODO(jkummerow): Move JSCollectionIterator to js-collection.h?
-// TODO(jkummerow): Introduce IsJSCollectionIterator() check? Or unchecked
-// version of OBJECT_CONSTRUCTORS_IMPL macro?
-TQ_OBJECT_CONSTRUCTORS_IMPL(JSCollectionIterator)
-template <class Derived, class TableType>
-OrderedHashTableIterator<Derived, TableType>::OrderedHashTableIterator(
-    Address ptr)
-    : JSCollectionIterator(ptr) {}
-
-JSMapIterator::JSMapIterator(Address ptr)
-    : OrderedHashTableIterator<JSMapIterator, OrderedHashMap>(ptr) {
-  SLOW_DCHECK(IsJSMapIterator());
+void JSCollection::set_table(Tagged<Object> value, WriteBarrierMode mode) {
+  table_.store(this, value, mode);
 }
 
-JSSetIterator::JSSetIterator(Address ptr)
-    : OrderedHashTableIterator<JSSetIterator, OrderedHashSet>(ptr) {
-  SLOW_DCHECK(IsJSSetIterator());
+Tagged<Object> JSWeakCollection::table() const { return table_.load(); }
+
+void JSWeakCollection::set_table(Tagged<Object> value, WriteBarrierMode mode) {
+  table_.store(this, value, mode);
 }
 
-CAST_ACCESSOR(JSSetIterator)
-CAST_ACCESSOR(JSMapIterator)
-
-Object JSMapIterator::CurrentValue() {
-  OrderedHashMap table = OrderedHashMap::cast(this->table());
+Tagged<Object> JSMapIterator::CurrentValue() {
+  Tagged<OrderedHashMap> table = Cast<OrderedHashMap>(this->table());
   int index = Smi::ToInt(this->index());
-  Object value = table.ValueAt(index);
-  DCHECK(!value.IsTheHole());
+  DCHECK_GE(index, 0);
+  InternalIndex entry(index);
+  Tagged<Object> value = table->ValueAt(entry);
+  DCHECK(!IsHashTableHole(value));
   return value;
 }
 

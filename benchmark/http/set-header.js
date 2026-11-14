@@ -1,9 +1,9 @@
 'use strict';
 const common = require('../common.js');
-const PORT = common.PORT;
 
 const bench = common.createBenchmark(main, {
-  res: ['normal', 'setHeader', 'setHeaderWH']
+  res: ['normal', 'setHeader', 'setHeaderWH', 'setHeaderImplicit'],
+  duration: 5,
 });
 
 const type = 'bytes';
@@ -15,16 +15,18 @@ const c = 50;
 // normal: writeHead(status, {...})
 // setHeader: statusCode = status, setHeader(...) x2
 // setHeaderWH: setHeader(...), writeHead(status, ...)
-function main({ res }) {
-  process.env.PORT = PORT;
+// setHeaderImplicit: statusCode = status, setHeader(...) x1, framing left to end()
+function main({ res, duration }) {
   const server = require('../fixtures/simple-http-server.js')
-  .listen(PORT)
+  .listen(0)
   .on('listening', () => {
-    const path = `/${type}/${len}/${chunks}/normal/${chunkedEnc}`;
+    const path = `/${type}/${len}/${chunks}/${res}/${chunkedEnc}`;
 
     bench.http({
       path: path,
-      connections: c
+      connections: c,
+      duration,
+      port: server.address().port,
     }, () => {
       server.close();
     });

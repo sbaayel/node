@@ -5,19 +5,34 @@
 #include "src/ic/binary-op-assembler.h"
 
 #include "src/common/globals.h"
+#include "src/execution/protectors.h"
+#include "src/flags/flags.h"
+#include "src/objects/property-cell.h"
 
 namespace v8 {
 namespace internal {
 
+#include "src/codegen/define-code-stub-assembler-macros.inc"
+
+namespace {
+
+inline bool IsBigInt64OpSupported(BinaryOpAssembler* assembler, Operation op) {
+  return assembler->Is64() && op != Operation::kExponentiate &&
+         op != Operation::kShiftLeft && op != Operation::kShiftRight &&
+         op != Operation::kShiftRightLogical;
+}
+
+}  // namespace
+
 TNode<Object> BinaryOpAssembler::Generate_AddWithFeedback(
-    TNode<Context> context, TNode<Object> lhs, TNode<Object> rhs,
-    TNode<UintPtrT> slot_id, TNode<HeapObject> maybe_feedback_vector,
-    bool rhs_known_smi) {
+    const LazyNode<Context>& context, TNode<Object> lhs, TNode<Object> rhs,
+    const FeedbackUpdater& feedback_updater, bool rhs_known_smi) {
   // Shared entry for floating point addition.
   Label do_fadd(this), if_lhsisnotnumber(this, Label::kDeferred),
       check_rhsisoddball(this, Label::kDeferred),
       call_with_oddball_feedback(this), call_with_any_feedback(this),
-      call_add_stub(this), end(this), bigint(this, Label::kDeferred);
+      call_add_stub(this), end(this), bigint(this, Label::kDeferred),
+      bigint64(this);
   TVARIABLE(Float64T, var_fadd_lhs);
   TVARIABLE(Float64T, var_fadd_rhs);
   TVARIABLE(Smi, var_type_feedback);
@@ -32,6 +47,13 @@ TNode<Object> BinaryOpAssembler::Generate_AddWithFeedback(
   Label if_lhsisnotsmi(this,
                        rhs_known_smi ? Label::kDeferred : Label::kNonDeferred);
   Branch(TaggedIsNotSmi(lhs), &if_lhsisnotsmi, &if_lhsissmi);
+
+  auto IsAdditiveSafeIntegerFeedback = [&](TNode<Float64T> value) {
+    return Select<BoolT>(
+        IsAdditiveSafeIntegerFeedbackEnabled(),
+        [&] { return IsAdditiveSafeInteger(value); },
+        [&] { return BoolConstant(false); });
+  };
 
   BIND(&if_lhsissmi);
   {
@@ -50,6 +72,10 @@ TNode<Object> BinaryOpAssembler::Generate_AddWithFeedback(
 
         var_fadd_lhs = SmiToFloat64(lhs_smi);
         var_fadd_rhs = LoadHeapNumberValue(rhs_heap_object);
+        var_type_feedback = SelectSmiConstant(
+            IsAdditiveSafeIntegerFeedback(var_fadd_rhs.value()),
+            BinaryOperationFeedback::kAdditiveSafeInteger,
+            BinaryOperationFeedback::kNumber);
         Goto(&do_fadd);
       }
 
@@ -69,6 +95,7 @@ TNode<Object> BinaryOpAssembler::Generate_AddWithFeedback(
       // Not overflowed.
       {
         var_type_feedback = SmiConstant(BinaryOperationFeedback::kSignedSmall);
+        feedback_updater(var_type_feedback.value());
         var_result = smi_result;
         Goto(&end);
       }
@@ -77,6 +104,10 @@ TNode<Object> BinaryOpAssembler::Generate_AddWithFeedback(
       {
         var_fadd_lhs = SmiToFloat64(lhs_smi);
         var_fadd_rhs = SmiToFloat64(rhs_smi);
+        var_type_feedback =
+            SelectSmiConstant(IsAdditiveSafeIntegerFeedbackEnabled(),
+                              BinaryOperationFeedback::kAdditiveSafeInteger,
+                              BinaryOperationFeedback::kNumber);
         Goto(&do_fadd);
       }
     }
@@ -101,6 +132,13 @@ TNode<Object> BinaryOpAssembler::Generate_AddWithFeedback(
 
         var_fadd_lhs = LoadHeapNumberValue(lhs_heap_object);
         var_fadd_rhs = LoadHeapNumberValue(rhs_heap_object);
+        var_type_feedback = SmiConstant(BinaryOperationFeedback::kNumber);
+        GotoIfNot(IsAdditiveSafeIntegerFeedback(var_fadd_lhs.value()),
+                  &do_fadd);
+        GotoIfNot(IsAdditiveSafeIntegerFeedback(var_fadd_rhs.value()),
+                  &do_fadd);
+        var_type_feedback =
+            SmiConstant(BinaryOperationFeedback::kAdditiveSafeInteger);
         Goto(&do_fadd);
       }
 
@@ -109,17 +147,37 @@ TNode<Object> BinaryOpAssembler::Generate_AddWithFeedback(
     {
       var_fadd_lhs = LoadHeapNumberValue(lhs_heap_object);
       var_fadd_rhs = SmiToFloat64(CAST(rhs));
+      var_type_feedback =
+          SelectSmiConstant(IsAdditiveSafeIntegerFeedback(var_fadd_lhs.value()),
+                            BinaryOperationFeedback::kAdditiveSafeInteger,
+                            BinaryOperationFeedback::kNumber);
       Goto(&do_fadd);
     }
   }
 
   BIND(&do_fadd);
   {
-    var_type_feedback = SmiConstant(BinaryOperationFeedback::kNumber);
     TNode<Float64T> value =
         Float64Add(var_fadd_lhs.value(), var_fadd_rhs.value());
     TNode<HeapNumber> result = AllocateHeapNumberWithValue(value);
     var_result = result;
+
+    Label AdditiveSafeInteger_overflow_check_done(this);
+    GotoIfNot(IsAdditiveSafeIntegerFeedbackEnabled(),
+              &AdditiveSafeInteger_overflow_check_done);
+    {
+      GotoIfNot(
+          SmiEqual(var_type_feedback.value(),
+                   SmiConstant(BinaryOperationFeedback::kAdditiveSafeInteger)),
+          &AdditiveSafeInteger_overflow_check_done);
+      GotoIf(IsAdditiveSafeIntegerFeedback(value),
+             &AdditiveSafeInteger_overflow_check_done);
+      var_type_feedback = SmiConstant(BinaryOperationFeedback::kNumber);
+      Goto(&AdditiveSafeInteger_overflow_check_done);
+    }
+    BIND(&AdditiveSafeInteger_overflow_check_done);
+
+    feedback_updater(var_type_feedback.value());
     Goto(&end);
   }
 
@@ -154,25 +212,60 @@ TNode<Object> BinaryOpAssembler::Generate_AddWithFeedback(
       Goto(&call_with_any_feedback);
 
       BIND(&lhs_is_bigint);
-      Branch(IsBigInt(rhs_heap_object), &bigint, &call_with_any_feedback);
+      {
+        GotoIfNot(IsBigInt(rhs_heap_object), &call_with_any_feedback);
+        if (Is64()) {
+          GotoIfLargeBigInt(CAST(lhs), &bigint);
+          GotoIfLargeBigInt(CAST(rhs), &bigint);
+          Goto(&bigint64);
+        } else {
+          Goto(&bigint);
+        }
+      }
 
       BIND(&lhs_is_string);
       {
+        Label lhs_is_string_rhs_is_not_string(this);
+
         TNode<Uint16T> rhs_instance_type = LoadInstanceType(rhs_heap_object);
 
-        // Exit unless {rhs} is a string. Since {lhs} is a string we no longer
-        // need an Oddball check.
+        // Fast path where both {lhs} and {rhs} are strings. Since {lhs} is a
+        // string we no longer need an Oddball check.
         GotoIfNot(IsStringInstanceType(rhs_instance_type),
-                  &call_with_any_feedback);
+                  &lhs_is_string_rhs_is_not_string);
 
         var_type_feedback = SmiConstant(BinaryOperationFeedback::kString);
+        feedback_updater(var_type_feedback.value());
         var_result =
-            CallBuiltin(Builtins::kStringAdd_CheckNone, context, lhs, rhs);
+            CallBuiltin(Builtin::kStringAdd_NoMapCheck, context(), lhs, rhs);
 
+        Goto(&end);
+
+        BIND(&lhs_is_string_rhs_is_not_string);
+
+        GotoIfNot(IsStringWrapper(rhs_heap_object), &call_with_any_feedback);
+
+        // lhs is a string and rhs is a string wrapper.
+
+        TNode<PropertyCell> to_primitive_protector =
+            StringWrapperToPrimitiveProtectorConstant();
+        GotoIf(TaggedEqual(LoadObjectField(to_primitive_protector,
+                                           offsetof(PropertyCell, value_)),
+                           SmiConstant(Protectors::kProtectorInvalid)),
+               &call_with_any_feedback);
+
+        var_type_feedback =
+            SmiConstant(BinaryOperationFeedback::kStringOrStringWrapper);
+        feedback_updater(var_type_feedback.value());
+        TNode<String> rhs_string =
+            CAST(LoadJSPrimitiveWrapperValue(CAST(rhs_heap_object)));
+        var_result = CallBuiltin(Builtin::kStringAdd_NoMapCheck, context(), lhs,
+                                 rhs_string);
         Goto(&end);
       }
     }
   }
+  // TODO(v8:12199): Support "string wrapper + string" concatenation too.
 
   BIND(&check_rhsisoddball);
   {
@@ -185,23 +278,46 @@ TNode<Object> BinaryOpAssembler::Generate_AddWithFeedback(
     Goto(&call_with_any_feedback);
   }
 
+  if (Is64()) {
+    BIND(&bigint64);
+    {
+      // Both {lhs} and {rhs} are of BigInt type and can fit in 64-bit
+      // registers.
+      Label if_overflow(this);
+      TVARIABLE(UintPtrT, lhs_raw);
+      TVARIABLE(UintPtrT, rhs_raw);
+      BigIntToRawBytes(CAST(lhs), &lhs_raw, &lhs_raw);
+      BigIntToRawBytes(CAST(rhs), &rhs_raw, &rhs_raw);
+      var_result = BigIntFromInt64(
+          TryIntPtrAdd(UncheckedCast<IntPtrT>(lhs_raw.value()),
+                       UncheckedCast<IntPtrT>(rhs_raw.value()), &if_overflow));
+
+      var_type_feedback = SmiConstant(BinaryOperationFeedback::kBigInt64);
+      feedback_updater(var_type_feedback.value());
+      Goto(&end);
+
+      BIND(&if_overflow);
+      Goto(&bigint);
+    }
+  }
+
   BIND(&bigint);
   {
     // Both {lhs} and {rhs} are of BigInt type.
     Label bigint_too_big(this);
-    var_result = CallBuiltin(Builtins::kBigIntAddNoThrow, context, lhs, rhs);
+    var_result = CallBuiltin(Builtin::kBigIntAddNoThrow, context(), lhs, rhs);
     // Check for sentinel that signals BigIntTooBig exception.
     GotoIf(TaggedIsSmi(var_result.value()), &bigint_too_big);
 
     var_type_feedback = SmiConstant(BinaryOperationFeedback::kBigInt);
+    feedback_updater(var_type_feedback.value());
     Goto(&end);
 
     BIND(&bigint_too_big);
     {
       // Update feedback to prevent deopt loop.
-      UpdateFeedback(SmiConstant(BinaryOperationFeedback::kAny),
-                     maybe_feedback_vector, slot_id);
-      ThrowRangeError(context, MessageTemplate::kBigIntTooBig);
+      feedback_updater(SmiConstant(BinaryOperationFeedback::kAny));
+      ThrowRangeError(context(), MessageTemplate::kBigIntTooBig);
     }
   }
 
@@ -219,24 +335,158 @@ TNode<Object> BinaryOpAssembler::Generate_AddWithFeedback(
 
   BIND(&call_add_stub);
   {
-    var_result = CallBuiltin(Builtins::kAdd, context, lhs, rhs);
+    feedback_updater(var_type_feedback.value());
+    var_result = CallBuiltin(Builtin::kAdd, context(), lhs, rhs);
     Goto(&end);
   }
 
   BIND(&end);
-  UpdateFeedback(var_type_feedback.value(), maybe_feedback_vector, slot_id);
+  return var_result.value();
+}
+
+TNode<Object>
+BinaryOpAssembler::Generate_AddLhsIsStringConstantInternalizeWithFeedback(
+    const LazyNode<Context>& context, TNode<Object> lhs, TNode<Object> rhs,
+    TNode<UintPtrT> slot_id, const LazyNode<HeapObject>& maybe_feedback_vector,
+    UpdateFeedbackMode update_feedback_mode, bool rhs_known_smi) {
+  return Generate_AddStringConstantInternalizeWithFeedback(
+      context, lhs, rhs, slot_id, maybe_feedback_vector, update_feedback_mode,
+      rhs_known_smi,
+      AddStringConstantAndInternalizeVariant::kLhsIsStringConstant);
+}
+
+TNode<Object>
+BinaryOpAssembler::Generate_AddRhsIsStringConstantInternalizeWithFeedback(
+    const LazyNode<Context>& context, TNode<Object> lhs, TNode<Object> rhs,
+    TNode<UintPtrT> slot_id, const LazyNode<HeapObject>& maybe_feedback_vector,
+    UpdateFeedbackMode update_feedback_mode, bool rhs_known_smi) {
+  return Generate_AddStringConstantInternalizeWithFeedback(
+      context, lhs, rhs, slot_id, maybe_feedback_vector, update_feedback_mode,
+      rhs_known_smi,
+      AddStringConstantAndInternalizeVariant::kRhsIsStringConstant);
+}
+TNode<Object>
+BinaryOpAssembler::Generate_AddStringConstantInternalizeWithFeedback(
+    const LazyNode<Context>& context, TNode<Object> lhs, TNode<Object> rhs,
+    TNode<UintPtrT> slot_id, const LazyNode<HeapObject>& maybe_feedback_vector,
+    UpdateFeedbackMode update_feedback_mode, bool rhs_known_smi,
+    AddStringConstantAndInternalizeVariant as_variant) {
+  using ASVariant = AddStringConstantAndInternalizeVariant;
+  Label call_with_any_feedback(this), call_add_stub(this),
+      slow(this, Label::kDeferred), end(this);
+  TVARIABLE(Smi, var_type_feedback, SmiConstant(BinaryOperationFeedback::kAny));
+  TVARIABLE(Object, var_result);
+
+  TNode<Object> const_str_operand =
+      as_variant == ASVariant::kLhsIsStringConstant ? lhs : rhs;
+  TNode<Object> other_operand =
+      as_variant == ASVariant::kLhsIsStringConstant ? rhs : lhs;
+
+  // Either lhs or rhs is an internalized string constant. Since our cache is
+  // stored in the feedback vector and is thus specific to a particular
+  // bytecode, we can ignore the constant and use the other parameter as the
+  // cache key instead. This is our optimization:
+  //
+  //   Instead of: return Internalize(lhs + rhs)
+  //   .. we do:   return cache[rhs]  // .. (or lhs) if possible.
+  USE(const_str_operand);
+  CSA_DCHECK(this, Word32BinaryNot(TaggedIsSmi(const_str_operand)));
+  CSA_DCHECK(this, IsInternalizedStringInstanceType(
+                       LoadInstanceType(CAST(const_str_operand))));
+
+  // We need the cache slot for our optimization. Without it, delegate to the
+  // generic Add logic.
+  {
+    Label next(this);
+    GotoIfNot(IsUndefined(maybe_feedback_vector()), &next);
+    // TODO(jgruber): This could be a builtin call. Add a builtin that expects
+    // a possibly-undefined feedback vector.
+    var_result = Generate_AddWithFeedback(context, lhs, rhs, slot_id,
+                                          maybe_feedback_vector,
+                                          update_feedback_mode, rhs_known_smi);
+    Goto(&end);
+    BIND(&next);
+  }
+  TNode<FeedbackVector> fv = CAST(maybe_feedback_vector());
+
+  // Ensure other_operand is internalized so we can query the cache.
+  // TODO(jgruber): We could TryInternalize in CSA.
+  {
+    Label set_feedback_to_any_then_slow(this), next(this);
+    GotoIf(TaggedIsSmi(other_operand), &set_feedback_to_any_then_slow);
+    TNode<Uint16T> itype = LoadInstanceType(CAST(other_operand));
+    GotoIfNot(IsStringInstanceType(itype), &set_feedback_to_any_then_slow);
+
+    var_type_feedback = SmiConstant(BinaryOperationFeedback::kString);
+    UpdateFeedback(var_type_feedback.value(), maybe_feedback_vector(), slot_id,
+                   update_feedback_mode);
+    GotoIfNot(IsInternalizedStringInstanceType(itype), &slow);
+    Goto(&next);
+
+    BIND(&set_feedback_to_any_then_slow);
+    var_type_feedback = SmiConstant(BinaryOperationFeedback::kAny);
+    UpdateFeedback(var_type_feedback.value(), maybe_feedback_vector(), slot_id,
+                   update_feedback_mode);
+    Goto(&slow);
+
+    BIND(&next);
+  }
+  TNode<String> other_operand_internalized = CAST(other_operand);
+
+  // Get or create the cache object.
+  TNode<SimpleNameDictionary> cache;
+  {
+    Label next(this);
+    static constexpr int kSlotOffset =
+        kAdd_StringConstant_Internalize_CacheSlotOffset;
+    TVARIABLE(Object, var_maybe_cache);
+    var_maybe_cache = CAST(LoadFeedbackVectorSlot(
+        fv, UintPtrAdd(slot_id, UintPtrConstant(kSlotOffset))));
+    GotoIf(
+        TaggedNotEqual(var_maybe_cache.value(), UninitializedSymbolConstant()),
+        &next);
+    var_maybe_cache = AllocateSimpleNameDictionary(1);
+    Goto(&next);
+    BIND(&next);
+    cache = CAST(var_maybe_cache.value());
+  }
+
+  {
+    // TODO(jgruber): Fill the cache in CSA.
+    TVARIABLE(IntPtrT, var_entry);
+    Label index_found(this, {&var_entry});
+    NameDictionaryLookup<SimpleNameDictionary>(
+        cache, other_operand_internalized, &index_found, &var_entry, &slow,
+        LookupMode::kFindExisting);
+    BIND(&index_found);
+    var_result =
+        LoadValueByKeyIndex<SimpleNameDictionary>(cache, var_entry.value());
+    Goto(&end);
+  }
+
+  BIND(&slow);
+  {
+    auto target = as_variant == ASVariant::kLhsIsStringConstant
+                      ? Runtime::kStringAdd_LhsIsStringConstant_Internalize
+                      : Runtime::kStringAdd_RhsIsStringConstant_Internalize;
+    var_result =
+        CallRuntime(target, context(), lhs, rhs, maybe_feedback_vector(),
+                    IntPtrToTaggedIndex(Signed(slot_id)));
+    Goto(&end);
+  }
+
+  BIND(&end);
   return var_result.value();
 }
 
 TNode<Object> BinaryOpAssembler::Generate_BinaryOperationWithFeedback(
-    TNode<Context> context, TNode<Object> lhs, TNode<Object> rhs,
-    TNode<UintPtrT> slot_id, TNode<HeapObject> maybe_feedback_vector,
-    const SmiOperation& smiOperation, const FloatOperation& floatOperation,
-    Operation op, bool rhs_known_smi) {
+    const LazyNode<Context>& context, TNode<Object> lhs, TNode<Object> rhs,
+    const FeedbackUpdater& feedback_updater, const SmiOperation& smiOperation,
+    const FloatOperation& floatOperation, Operation op, bool rhs_known_smi) {
   Label do_float_operation(this), end(this), call_stub(this),
       check_rhsisoddball(this, Label::kDeferred), call_with_any_feedback(this),
       if_lhsisnotnumber(this, Label::kDeferred),
-      if_bigint(this, Label::kDeferred);
+      if_both_bigint(this, Label::kDeferred), if_both_bigint64(this);
   TVARIABLE(Float64T, var_float_lhs);
   TVARIABLE(Float64T, var_float_rhs);
   TVARIABLE(Smi, var_type_feedback);
@@ -279,6 +529,7 @@ TNode<Object> BinaryOpAssembler::Generate_BinaryOperationWithFeedback(
     {
       Comment("perform smi operation");
       var_result = smiOperation(lhs_smi, CAST(rhs), &var_type_feedback);
+      feedback_updater(var_type_feedback.value());
       Goto(&end);
     }
   }
@@ -321,6 +572,7 @@ TNode<Object> BinaryOpAssembler::Generate_BinaryOperationWithFeedback(
   BIND(&do_float_operation);
   {
     var_type_feedback = SmiConstant(BinaryOperationFeedback::kNumber);
+    feedback_updater(var_type_feedback.value());
     TNode<Float64T> lhs_value = var_float_lhs.value();
     TNode<Float64T> rhs_value = var_float_rhs.value();
     TNode<Float64T> value = floatOperation(lhs_value, rhs_value);
@@ -364,7 +616,14 @@ TNode<Object> BinaryOpAssembler::Generate_BinaryOperationWithFeedback(
     BIND(&if_left_bigint);
     {
       GotoIf(TaggedIsSmi(rhs), &call_with_any_feedback);
-      Branch(IsBigInt(CAST(rhs)), &if_bigint, &call_with_any_feedback);
+      GotoIfNot(IsBigInt(CAST(rhs)), &call_with_any_feedback);
+      if (IsBigInt64OpSupported(this, op)) {
+        GotoIfLargeBigInt(CAST(lhs), &if_both_bigint);
+        GotoIfLargeBigInt(CAST(rhs), &if_both_bigint);
+        Goto(&if_both_bigint64);
+      } else {
+        Goto(&if_both_bigint);
+      }
     }
   }
 
@@ -373,7 +632,6 @@ TNode<Object> BinaryOpAssembler::Generate_BinaryOperationWithFeedback(
     // Check if rhs is an oddball. At this point we know lhs is either a
     // Smi or number or oddball and rhs is not a number or Smi.
     TNode<Uint16T> rhs_instance_type = LoadInstanceType(CAST(rhs));
-    GotoIf(IsBigIntInstanceType(rhs_instance_type), &if_bigint);
     TNode<BoolT> rhs_is_oddball =
         InstanceTypeEqual(rhs_instance_type, ODDBALL_TYPE);
     GotoIfNot(rhs_is_oddball, &call_with_any_feedback);
@@ -382,17 +640,155 @@ TNode<Object> BinaryOpAssembler::Generate_BinaryOperationWithFeedback(
     Goto(&call_stub);
   }
 
-  // This handles the case where at least one input is a BigInt.
-  BIND(&if_bigint);
+  if (IsBigInt64OpSupported(this, op)) {
+    BIND(&if_both_bigint64);
+    var_type_feedback = SmiConstant(BinaryOperationFeedback::kBigInt64);
+    feedback_updater(var_type_feedback.value());
+
+    TVARIABLE(UintPtrT, lhs_raw);
+    TVARIABLE(UintPtrT, rhs_raw);
+    BigIntToRawBytes(CAST(lhs), &lhs_raw, &lhs_raw);
+    BigIntToRawBytes(CAST(rhs), &rhs_raw, &rhs_raw);
+
+    switch (op) {
+      case Operation::kSubtract: {
+        var_result = BigIntFromInt64(TryIntPtrSub(
+            UncheckedCast<IntPtrT>(lhs_raw.value()),
+            UncheckedCast<IntPtrT>(rhs_raw.value()), &if_both_bigint));
+        Goto(&end);
+        break;
+      }
+      case Operation::kMultiply: {
+        var_result = BigIntFromInt64(TryIntPtrMul(
+            UncheckedCast<IntPtrT>(lhs_raw.value()),
+            UncheckedCast<IntPtrT>(rhs_raw.value()), &if_both_bigint));
+        Goto(&end);
+        break;
+      }
+      case Operation::kDivide: {
+        // No need to check overflow because INT_MIN is excluded
+        // from the range of small BigInts.
+        Label if_div_zero(this);
+        var_result = BigIntFromInt64(TryIntPtrDiv(
+            UncheckedCast<IntPtrT>(lhs_raw.value()),
+            UncheckedCast<IntPtrT>(rhs_raw.value()), &if_div_zero));
+        Goto(&end);
+
+        BIND(&if_div_zero);
+        {
+          // Update feedback to prevent deopt loop.
+          feedback_updater(SmiConstant(BinaryOperationFeedback::kAny));
+          ThrowRangeError(context(), MessageTemplate::kBigIntDivZero);
+        }
+        break;
+      }
+      case Operation::kModulus: {
+        Label if_div_zero(this);
+        var_result = BigIntFromInt64(TryIntPtrMod(
+            UncheckedCast<IntPtrT>(lhs_raw.value()),
+            UncheckedCast<IntPtrT>(rhs_raw.value()), &if_div_zero));
+        Goto(&end);
+
+        BIND(&if_div_zero);
+        {
+          // Update feedback to prevent deopt loop.
+          feedback_updater(SmiConstant(BinaryOperationFeedback::kAny));
+          ThrowRangeError(context(), MessageTemplate::kBigIntDivZero);
+        }
+        break;
+      }
+      default:
+        UNREACHABLE();
+    }
+  }
+
+  BIND(&if_both_bigint);
   {
     var_type_feedback = SmiConstant(BinaryOperationFeedback::kBigInt);
-    if (op == Operation::kAdd) {
-      var_result = CallBuiltin(Builtins::kBigIntAdd, context, lhs, rhs);
-    } else {
-      var_result = CallRuntime(Runtime::kBigIntBinaryOp, context, lhs, rhs,
-                               SmiConstant(op));
+    feedback_updater(var_type_feedback.value());
+    switch (op) {
+      case Operation::kSubtract: {
+        var_result =
+            CallBuiltin(Builtin::kBigIntSubtractNoThrow, context(), lhs, rhs);
+
+        // Check for sentinel that signals BigIntTooBig exception.
+        GotoIfNot(TaggedIsSmi(var_result.value()), &end);
+
+        // Update feedback to prevent deopt loop.
+        feedback_updater(SmiConstant(BinaryOperationFeedback::kAny));
+        ThrowRangeError(context(), MessageTemplate::kBigIntTooBig);
+        break;
+      }
+      case Operation::kMultiply: {
+        Label termination_requested(this, Label::kDeferred);
+        var_result =
+            CallBuiltin(Builtin::kBigIntMultiplyNoThrow, context(), lhs, rhs);
+
+        GotoIfNot(TaggedIsSmi(var_result.value()), &end);
+
+        // Check for sentinel that signals TerminationRequested exception.
+        GotoIf(TaggedEqual(var_result.value(), SmiConstant(1)),
+               &termination_requested);
+
+        // Handles BigIntTooBig exception.
+        // Update feedback to prevent deopt loop.
+        feedback_updater(SmiConstant(BinaryOperationFeedback::kAny));
+        ThrowRangeError(context(), MessageTemplate::kBigIntTooBig);
+
+        BIND(&termination_requested);
+        TerminateExecution(context());
+        break;
+      }
+      case Operation::kDivide: {
+        Label termination_requested(this, Label::kDeferred);
+        var_result =
+            CallBuiltin(Builtin::kBigIntDivideNoThrow, context(), lhs, rhs);
+
+        GotoIfNot(TaggedIsSmi(var_result.value()), &end);
+
+        // Check for sentinel that signals TerminationRequested exception.
+        GotoIf(TaggedEqual(var_result.value(), SmiConstant(1)),
+               &termination_requested);
+
+        // Handles BigIntDivZero exception.
+        // Update feedback to prevent deopt loop.
+        feedback_updater(SmiConstant(BinaryOperationFeedback::kAny));
+        ThrowRangeError(context(), MessageTemplate::kBigIntDivZero);
+
+        BIND(&termination_requested);
+        TerminateExecution(context());
+        break;
+      }
+      case Operation::kModulus: {
+        Label termination_requested(this, Label::kDeferred);
+        var_result =
+            CallBuiltin(Builtin::kBigIntModulusNoThrow, context(), lhs, rhs);
+
+        GotoIfNot(TaggedIsSmi(var_result.value()), &end);
+
+        // Check for sentinel that signals TerminationRequested exception.
+        GotoIf(TaggedEqual(var_result.value(), SmiConstant(1)),
+               &termination_requested);
+
+        // Handles BigIntDivZero exception.
+        // Update feedback to prevent deopt loop.
+        feedback_updater(SmiConstant(BinaryOperationFeedback::kAny));
+        ThrowRangeError(context(), MessageTemplate::kBigIntDivZero);
+
+        BIND(&termination_requested);
+        TerminateExecution(context());
+        break;
+      }
+      case Operation::kExponentiate: {
+        // TODO(panq): replace the runtime with builtin once it is implemented.
+        var_result =
+            CallRuntime(Runtime::kBigIntExponentiate, context(), lhs, rhs);
+        Goto(&end);
+        break;
+      }
+      default:
+        UNREACHABLE();
     }
-    Goto(&end);
   }
 
   BIND(&call_with_any_feedback);
@@ -403,19 +799,23 @@ TNode<Object> BinaryOpAssembler::Generate_BinaryOperationWithFeedback(
 
   BIND(&call_stub);
   {
+    feedback_updater(var_type_feedback.value());
     TNode<Object> result;
     switch (op) {
       case Operation::kSubtract:
-        result = CallBuiltin(Builtins::kSubtract, context, lhs, rhs);
+        result = CallBuiltin(Builtin::kSubtract, context(), lhs, rhs);
         break;
       case Operation::kMultiply:
-        result = CallBuiltin(Builtins::kMultiply, context, lhs, rhs);
+        result = CallBuiltin(Builtin::kMultiply, context(), lhs, rhs);
         break;
       case Operation::kDivide:
-        result = CallBuiltin(Builtins::kDivide, context, lhs, rhs);
+        result = CallBuiltin(Builtin::kDivide, context(), lhs, rhs);
         break;
       case Operation::kModulus:
-        result = CallBuiltin(Builtins::kModulus, context, lhs, rhs);
+        result = CallBuiltin(Builtin::kModulus, context(), lhs, rhs);
+        break;
+      case Operation::kExponentiate:
+        result = CallBuiltin(Builtin::kExponentiate, context(), lhs, rhs);
         break;
       default:
         UNREACHABLE();
@@ -425,16 +825,14 @@ TNode<Object> BinaryOpAssembler::Generate_BinaryOperationWithFeedback(
   }
 
   BIND(&end);
-  UpdateFeedback(var_type_feedback.value(), maybe_feedback_vector, slot_id);
   return var_result.value();
 }
 
 TNode<Object> BinaryOpAssembler::Generate_SubtractWithFeedback(
-    TNode<Context> context, TNode<Object> lhs, TNode<Object> rhs,
-    TNode<UintPtrT> slot_id, TNode<HeapObject> maybe_feedback_vector,
-    bool rhs_known_smi) {
-  auto smiFunction = [=](TNode<Smi> lhs, TNode<Smi> rhs,
-                         TVariable<Smi>* var_type_feedback) {
+    const LazyNode<Context>& context, TNode<Object> lhs, TNode<Object> rhs,
+    const FeedbackUpdater& feedback_updater, bool rhs_known_smi) {
+  auto smiFunction = [=, this](TNode<Smi> lhs, TNode<Smi> rhs,
+                               TVariable<Smi>* var_type_feedback) {
     Label end(this);
     TVARIABLE(Number, var_result);
     // If rhs is known to be an Smi (for SubSmi) we want to fast path Smi
@@ -457,40 +855,39 @@ TNode<Object> BinaryOpAssembler::Generate_SubtractWithFeedback(
     BIND(&end);
     return var_result.value();
   };
-  auto floatFunction = [=](TNode<Float64T> lhs, TNode<Float64T> rhs) {
+  auto floatFunction = [=, this](TNode<Float64T> lhs, TNode<Float64T> rhs) {
     return Float64Sub(lhs, rhs);
   };
   return Generate_BinaryOperationWithFeedback(
-      context, lhs, rhs, slot_id, maybe_feedback_vector, smiFunction,
-      floatFunction, Operation::kSubtract, rhs_known_smi);
+      context, lhs, rhs, feedback_updater, smiFunction, floatFunction,
+      Operation::kSubtract, rhs_known_smi);
 }
 
 TNode<Object> BinaryOpAssembler::Generate_MultiplyWithFeedback(
-    TNode<Context> context, TNode<Object> lhs, TNode<Object> rhs,
-    TNode<UintPtrT> slot_id, TNode<HeapObject> maybe_feedback_vector,
-    bool rhs_known_smi) {
-  auto smiFunction = [=](TNode<Smi> lhs, TNode<Smi> rhs,
-                         TVariable<Smi>* var_type_feedback) {
+    const LazyNode<Context>& context, TNode<Object> lhs, TNode<Object> rhs,
+    const FeedbackUpdater& feedback_updater, bool rhs_known_smi) {
+  auto smiFunction = [=, this](TNode<Smi> lhs, TNode<Smi> rhs,
+                               TVariable<Smi>* var_type_feedback) {
     TNode<Number> result = SmiMul(lhs, rhs);
     *var_type_feedback = SelectSmiConstant(
         TaggedIsSmi(result), BinaryOperationFeedback::kSignedSmall,
         BinaryOperationFeedback::kNumber);
     return result;
   };
-  auto floatFunction = [=](TNode<Float64T> lhs, TNode<Float64T> rhs) {
+  auto floatFunction = [=, this](TNode<Float64T> lhs, TNode<Float64T> rhs) {
     return Float64Mul(lhs, rhs);
   };
   return Generate_BinaryOperationWithFeedback(
-      context, lhs, rhs, slot_id, maybe_feedback_vector, smiFunction,
-      floatFunction, Operation::kMultiply, rhs_known_smi);
+      context, lhs, rhs, feedback_updater, smiFunction, floatFunction,
+      Operation::kMultiply, rhs_known_smi);
 }
 
 TNode<Object> BinaryOpAssembler::Generate_DivideWithFeedback(
-    TNode<Context> context, TNode<Object> dividend, TNode<Object> divisor,
-    TNode<UintPtrT> slot_id, TNode<HeapObject> maybe_feedback_vector,
+    const LazyNode<Context>& context, TNode<Object> dividend,
+    TNode<Object> divisor, const FeedbackUpdater& feedback_updater,
     bool rhs_known_smi) {
-  auto smiFunction = [=](TNode<Smi> lhs, TNode<Smi> rhs,
-                         TVariable<Smi>* var_type_feedback) {
+  auto smiFunction = [=, this](TNode<Smi> lhs, TNode<Smi> rhs,
+                               TVariable<Smi>* var_type_feedback) {
     TVARIABLE(Object, var_result);
     // If rhs is known to be an Smi (for DivSmi) we want to fast path Smi
     // operation. For the normal Div operation, we want to fast path both
@@ -513,43 +910,346 @@ TNode<Object> BinaryOpAssembler::Generate_DivideWithFeedback(
     BIND(&end);
     return var_result.value();
   };
-  auto floatFunction = [=](TNode<Float64T> lhs, TNode<Float64T> rhs) {
+  auto floatFunction = [=, this](TNode<Float64T> lhs, TNode<Float64T> rhs) {
     return Float64Div(lhs, rhs);
   };
   return Generate_BinaryOperationWithFeedback(
-      context, dividend, divisor, slot_id, maybe_feedback_vector, smiFunction,
-      floatFunction, Operation::kDivide, rhs_known_smi);
+      context, dividend, divisor, feedback_updater, smiFunction, floatFunction,
+      Operation::kDivide, rhs_known_smi);
 }
 
 TNode<Object> BinaryOpAssembler::Generate_ModulusWithFeedback(
-    TNode<Context> context, TNode<Object> dividend, TNode<Object> divisor,
-    TNode<UintPtrT> slot_id, TNode<HeapObject> maybe_feedback_vector,
+    const LazyNode<Context>& context, TNode<Object> dividend,
+    TNode<Object> divisor, const FeedbackUpdater& feedback_updater,
     bool rhs_known_smi) {
-  auto smiFunction = [=](TNode<Smi> lhs, TNode<Smi> rhs,
-                         TVariable<Smi>* var_type_feedback) {
+  auto smiFunction = [=, this](TNode<Smi> lhs, TNode<Smi> rhs,
+                               TVariable<Smi>* var_type_feedback) {
     TNode<Number> result = SmiMod(lhs, rhs);
     *var_type_feedback = SelectSmiConstant(
         TaggedIsSmi(result), BinaryOperationFeedback::kSignedSmall,
         BinaryOperationFeedback::kNumber);
     return result;
   };
-  auto floatFunction = [=](TNode<Float64T> lhs, TNode<Float64T> rhs) {
+  auto floatFunction = [=, this](TNode<Float64T> lhs, TNode<Float64T> rhs) {
     return Float64Mod(lhs, rhs);
   };
   return Generate_BinaryOperationWithFeedback(
-      context, dividend, divisor, slot_id, maybe_feedback_vector, smiFunction,
-      floatFunction, Operation::kModulus, rhs_known_smi);
+      context, dividend, divisor, feedback_updater, smiFunction, floatFunction,
+      Operation::kModulus, rhs_known_smi);
 }
 
 TNode<Object> BinaryOpAssembler::Generate_ExponentiateWithFeedback(
-    TNode<Context> context, TNode<Object> base, TNode<Object> exponent,
-    TNode<UintPtrT> slot_id, TNode<HeapObject> maybe_feedback_vector,
+    const LazyNode<Context>& context, TNode<Object> base,
+    TNode<Object> exponent, const FeedbackUpdater& feedback_updater,
     bool rhs_known_smi) {
-  // We currently don't optimize exponentiation based on feedback.
-  TNode<Smi> dummy_feedback = SmiConstant(BinaryOperationFeedback::kAny);
-  UpdateFeedback(dummy_feedback, maybe_feedback_vector, slot_id);
-  return CallBuiltin(Builtins::kExponentiate, context, base, exponent);
+  auto smiFunction = [=, this](TNode<Smi> base, TNode<Smi> exponent,
+                               TVariable<Smi>* var_type_feedback) {
+    *var_type_feedback = SmiConstant(BinaryOperationFeedback::kNumber);
+    return AllocateHeapNumberWithValue(
+        Float64Pow(SmiToFloat64(base), SmiToFloat64(exponent)));
+  };
+  auto floatFunction = [=, this](TNode<Float64T> base,
+                                 TNode<Float64T> exponent) {
+    return Float64Pow(base, exponent);
+  };
+  return Generate_BinaryOperationWithFeedback(
+      context, base, exponent, feedback_updater, smiFunction, floatFunction,
+      Operation::kExponentiate, rhs_known_smi);
 }
+
+TNode<Object> BinaryOpAssembler::Generate_BitwiseBinaryOpWithOptionalFeedback(
+    Operation bitwise_op, TNode<Object> left, TNode<Object> right,
+    const LazyNode<Context>& context, const FeedbackUpdater* feedback_updater) {
+  TVARIABLE(Object, result);
+  TVARIABLE(Smi, var_left_feedback);
+  TVARIABLE(Smi, var_right_feedback);
+  TVARIABLE(Word32T, var_left_word32);
+  TVARIABLE(Word32T, var_right_word32);
+  TVARIABLE(BigInt, var_left_bigint);
+  Label done(this);
+  Label if_left_number(this), do_number_op(this);
+  Label if_left_bigint(this), if_left_bigint64(this);
+  Label if_left_number_right_bigint(this, Label::kDeferred);
+
+  FeedbackValues feedback_values =
+      feedback_updater
+          ? FeedbackValues{&var_left_feedback, nullptr, nullptr,
+                           UpdateFeedbackMode::kNoFeedback, feedback_updater}
+          : FeedbackValues();
+
+  TaggedToWord32OrBigIntWithFeedback(
+      context(), left, &if_left_number, &var_left_word32, &if_left_bigint,
+      IsBigInt64OpSupported(this, bitwise_op) ? &if_left_bigint64 : nullptr,
+      &var_left_bigint, feedback_values);
+
+  BIND(&if_left_number);
+  feedback_values.var_feedback =
+      feedback_updater ? &var_right_feedback : nullptr;
+  TaggedToWord32OrBigIntWithFeedback(
+      context(), right, &do_number_op, &var_right_word32,
+      &if_left_number_right_bigint, nullptr, nullptr, feedback_values);
+
+  BIND(&if_left_number_right_bigint);
+  {
+    if (feedback_updater) {
+      // Ensure that the feedback is updated before we throw.
+      (*feedback_updater)(SmiConstant(BinaryOperationFeedback::kAny));
+    }
+    ThrowTypeError(context(), MessageTemplate::kBigIntMixedTypes);
+  }
+
+  BIND(&do_number_op);
+  {
+    result = BitwiseOp(var_left_word32.value(), var_right_word32.value(),
+                       bitwise_op);
+
+    if (feedback_updater) {
+      TNode<Smi> result_type = SelectSmiConstant(
+          TaggedIsSmi(result.value()), BinaryOperationFeedback::kSignedSmall,
+          BinaryOperationFeedback::kNumber);
+      TNode<Smi> input_feedback =
+          SmiOr(var_left_feedback.value(), var_right_feedback.value());
+      TNode<Smi> feedback = SmiOr(result_type, input_feedback);
+      (*feedback_updater)(feedback);
+    }
+    Goto(&done);
+  }
+
+  // BigInt cases.
+  {
+    TVARIABLE(BigInt, var_right_bigint);
+    Label if_both_bigint(this), if_both_bigint64(this);
+    Label if_bigint_mix(this, Label::kDeferred);
+
+    BIND(&if_left_bigint);
+    TaggedToBigInt(context(), right, &if_bigint_mix, &if_both_bigint, nullptr,
+                   &var_right_bigint,
+                   feedback_updater ? &var_right_feedback : nullptr);
+
+    if (IsBigInt64OpSupported(this, bitwise_op)) {
+      BIND(&if_left_bigint64);
+      TaggedToBigInt(context(), right, &if_bigint_mix, &if_both_bigint,
+                     &if_both_bigint64, &var_right_bigint,
+                     feedback_updater ? &var_right_feedback : nullptr);
+
+      BIND(&if_both_bigint64);
+      if (feedback_updater) {
+        // {feedback} is Any if {left} or {right} is non-number.
+        TNode<Smi> feedback =
+            SmiOr(var_left_feedback.value(), var_right_feedback.value());
+        (*feedback_updater)(feedback);
+      }
+
+      TVARIABLE(UintPtrT, left_raw);
+      TVARIABLE(UintPtrT, right_raw);
+      BigIntToRawBytes(var_left_bigint.value(), &left_raw, &left_raw);
+      BigIntToRawBytes(var_right_bigint.value(), &right_raw, &right_raw);
+
+      switch (bitwise_op) {
+        case Operation::kBitwiseAnd: {
+          result = BigIntFromInt64(UncheckedCast<IntPtrT>(
+              WordAnd(left_raw.value(), right_raw.value())));
+          Goto(&done);
+          break;
+        }
+        case Operation::kBitwiseOr: {
+          result = BigIntFromInt64(UncheckedCast<IntPtrT>(
+              WordOr(left_raw.value(), right_raw.value())));
+          Goto(&done);
+          break;
+        }
+        case Operation::kBitwiseXor: {
+          result = BigIntFromInt64(UncheckedCast<IntPtrT>(
+              WordXor(left_raw.value(), right_raw.value())));
+          Goto(&done);
+          break;
+        }
+        default:
+          UNREACHABLE();
+      }
+    }
+
+    BIND(&if_both_bigint);
+    {
+      if (feedback_updater) {
+        // Ensure that the feedback is updated even if the runtime call below
+        // would throw.
+        TNode<Smi> feedback =
+            SmiOr(var_left_feedback.value(), var_right_feedback.value());
+        (*feedback_updater)(feedback);
+      }
+
+      switch (bitwise_op) {
+        case Operation::kBitwiseAnd: {
+          result =
+              CallBuiltin(Builtin::kBigIntBitwiseAndNoThrow, context(),
+                          var_left_bigint.value(), var_right_bigint.value());
+          // Check for sentinel that signals BigIntTooBig exception.
+          GotoIfNot(TaggedIsSmi(result.value()), &done);
+
+          if (feedback_updater) {
+            // Update feedback to prevent deopt loop.
+            (*feedback_updater)(SmiConstant(BinaryOperationFeedback::kAny));
+          }
+          ThrowRangeError(context(), MessageTemplate::kBigIntTooBig);
+          break;
+        }
+        case Operation::kBitwiseOr: {
+          result =
+              CallBuiltin(Builtin::kBigIntBitwiseOrNoThrow, context(),
+                          var_left_bigint.value(), var_right_bigint.value());
+          // Check for sentinel that signals BigIntTooBig exception.
+          GotoIfNot(TaggedIsSmi(result.value()), &done);
+
+          if (feedback_updater) {
+            // Update feedback to prevent deopt loop.
+            (*feedback_updater)(SmiConstant(BinaryOperationFeedback::kAny));
+          }
+          ThrowRangeError(context(), MessageTemplate::kBigIntTooBig);
+          break;
+        }
+        case Operation::kBitwiseXor: {
+          result =
+              CallBuiltin(Builtin::kBigIntBitwiseXorNoThrow, context(),
+                          var_left_bigint.value(), var_right_bigint.value());
+          // Check for sentinel that signals BigIntTooBig exception.
+          GotoIfNot(TaggedIsSmi(result.value()), &done);
+
+          if (feedback_updater) {
+            // Update feedback to prevent deopt loop.
+            (*feedback_updater)(SmiConstant(BinaryOperationFeedback::kAny));
+          }
+          ThrowRangeError(context(), MessageTemplate::kBigIntTooBig);
+          break;
+        }
+        case Operation::kShiftLeft: {
+          result =
+              CallBuiltin(Builtin::kBigIntShiftLeftNoThrow, context(),
+                          var_left_bigint.value(), var_right_bigint.value());
+          // Check for sentinel that signals BigIntTooBig exception.
+          GotoIfNot(TaggedIsSmi(result.value()), &done);
+
+          if (feedback_updater) {
+            // Update feedback to prevent deopt loop.
+            (*feedback_updater)(SmiConstant(BinaryOperationFeedback::kAny));
+          }
+          ThrowRangeError(context(), MessageTemplate::kBigIntTooBig);
+          break;
+        }
+        case Operation::kShiftRight: {
+          result =
+              CallBuiltin(Builtin::kBigIntShiftRightNoThrow, context(),
+                          var_left_bigint.value(), var_right_bigint.value());
+          // Check for sentinel that signals BigIntTooBig exception.
+          GotoIfNot(TaggedIsSmi(result.value()), &done);
+
+          if (feedback_updater) {
+            // Update feedback to prevent deopt loop.
+            (*feedback_updater)(SmiConstant(BinaryOperationFeedback::kAny));
+          }
+          ThrowRangeError(context(), MessageTemplate::kBigIntTooBig);
+          break;
+        }
+        case Operation::kShiftRightLogical: {
+          if (feedback_updater) {
+            // Ensure that the feedback is updated before we throw.
+            (*feedback_updater)(SmiConstant(BinaryOperationFeedback::kAny));
+          }
+          // BigInt does not support logical right shift.
+          ThrowTypeError(context(), MessageTemplate::kBigIntShr);
+          break;
+        }
+        default:
+          UNREACHABLE();
+      }
+    }
+
+    BIND(&if_bigint_mix);
+    {
+      if (feedback_updater) {
+        // Ensure that the feedback is updated before we throw.
+        (*feedback_updater)(SmiConstant(BinaryOperationFeedback::kAny));
+      }
+      ThrowTypeError(context(), MessageTemplate::kBigIntMixedTypes);
+    }
+  }
+
+  BIND(&done);
+  return result.value();
+}
+
+TNode<Object>
+BinaryOpAssembler::Generate_BitwiseBinaryOpWithSmiOperandAndOptionalFeedback(
+    Operation bitwise_op, TNode<Object> left, TNode<Object> right,
+    const LazyNode<Context>& context, const FeedbackUpdater* feedback_updater) {
+  TNode<Smi> right_smi = CAST(right);
+  TVARIABLE(Object, result);
+  TVARIABLE(Smi, var_left_feedback);
+  TVARIABLE(Word32T, var_left_word32);
+  TVARIABLE(BigInt, var_left_bigint);
+  TVARIABLE(Smi, feedback);
+  // Check if the {lhs} is a Smi or a HeapObject.
+  Label if_lhsissmi(this), if_lhsisnotsmi(this, Label::kDeferred);
+  Label do_number_op(this), if_bigint_mix(this), done(this);
+
+  Branch(TaggedIsSmi(left), &if_lhsissmi, &if_lhsisnotsmi);
+
+  BIND(&if_lhsissmi);
+  {
+    TNode<Smi> left_smi = CAST(left);
+    result = BitwiseSmiOp(left_smi, right_smi, bitwise_op);
+    if (feedback_updater) {
+      if (IsBitwiseOutputKnownSmi(bitwise_op)) {
+        feedback = SmiConstant(BinaryOperationFeedback::kSignedSmall);
+      } else {
+        feedback = SelectSmiConstant(TaggedIsSmi(result.value()),
+                                     BinaryOperationFeedback::kSignedSmall,
+                                     BinaryOperationFeedback::kNumber);
+      }
+    }
+    Goto(&done);
+  }
+
+  BIND(&if_lhsisnotsmi);
+  {
+    TNode<HeapObject> left_pointer = CAST(left);
+    FeedbackValues feedback_values{&var_left_feedback, nullptr, nullptr,
+                                   UpdateFeedbackMode::kNoFeedback,
+                                   feedback_updater};
+    TaggedPointerToWord32OrBigIntWithFeedback(
+        context(), left_pointer, &do_number_op, &var_left_word32,
+        &if_bigint_mix, nullptr, &var_left_bigint, feedback_values);
+    BIND(&do_number_op);
+    {
+      result =
+          BitwiseOp(var_left_word32.value(), SmiToInt32(right_smi), bitwise_op);
+      if (feedback_updater) {
+        TNode<Smi> result_type = SelectSmiConstant(
+            TaggedIsSmi(result.value()), BinaryOperationFeedback::kSignedSmall,
+            BinaryOperationFeedback::kNumber);
+        feedback = SmiOr(result_type, var_left_feedback.value());
+      }
+      Goto(&done);
+    }
+
+    BIND(&if_bigint_mix);
+    {
+      if (feedback_updater) {
+        // Ensure that the feedback is updated before we throw.
+        (*feedback_updater)(SmiConstant(BinaryOperationFeedback::kAny));
+      }
+      ThrowTypeError(context(), MessageTemplate::kBigIntMixedTypes);
+    }
+  }
+
+  BIND(&done);
+  if (feedback_updater) {
+    (*feedback_updater)(feedback.value());
+  }
+  return result.value();
+}
+
+#include "src/codegen/undef-code-stub-assembler-macros.inc"
 
 }  // namespace internal
 }  // namespace v8

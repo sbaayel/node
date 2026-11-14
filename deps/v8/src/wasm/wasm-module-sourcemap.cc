@@ -6,16 +6,24 @@
 
 #include <algorithm>
 
-#include "include/v8.h"
-#include "src/api/api.h"
+#include "include/v8-context.h"
+#include "include/v8-json.h"
+#include "include/v8-local-handle.h"
+#include "include/v8-object.h"
+#include "include/v8-primitive.h"
 #include "src/base/vlq-base64.h"
+#include "src/wasm/std-object-sizes.h"
 
 namespace v8 {
+
+class String;
+
 namespace internal {
 namespace wasm {
 
 WasmModuleSourceMap::WasmModuleSourceMap(v8::Isolate* v8_isolate,
                                          v8::Local<v8::String> src_map_str) {
+  if (src_map_str.IsEmpty()) return;
   v8::HandleScope scope(v8_isolate);
   v8::Local<v8::Context> context = v8::Context::New(v8_isolate);
 
@@ -27,19 +35,18 @@ WasmModuleSourceMap::WasmModuleSourceMap(v8::Isolate* v8_isolate,
   v8::Local<v8::Value> version_value, sources_value, mappings_value;
   bool has_valid_version =
       src_map_obj
-          ->Get(context,
-                v8::String::NewFromUtf8(v8_isolate, "version").ToLocalChecked())
+          ->Get(context, v8::String::NewFromUtf8Literal(v8_isolate, "version"))
           .ToLocal(&version_value) &&
       version_value->IsUint32();
   uint32_t version = 0;
   if (!has_valid_version || !version_value->Uint32Value(context).To(&version) ||
-      version != 3u)
+      version != 3u) {
     return;
+  }
 
   bool has_valid_sources =
       src_map_obj
-          ->Get(context,
-                v8::String::NewFromUtf8(v8_isolate, "sources").ToLocalChecked())
+          ->Get(context, v8::String::NewFromUtf8Literal(v8_isolate, "sources"))
           .ToLocal(&sources_value) &&
       sources_value->IsArray();
   if (!has_valid_sources) return;
@@ -48,41 +55,40 @@ WasmModuleSourceMap::WasmModuleSourceMap(v8::Isolate* v8_isolate,
       v8::Local<v8::Object>::Cast(sources_value);
   v8::Local<v8::Value> sources_len_value;
   if (!sources_arr
-           ->Get(context,
-                 v8::String::NewFromUtf8(v8_isolate, "length").ToLocalChecked())
-           .ToLocal(&sources_len_value))
+           ->Get(context, v8::String::NewFromUtf8Literal(v8_isolate, "length"))
+           .ToLocal(&sources_len_value)) {
     return;
+  }
   uint32_t sources_len = 0;
   if (!sources_len_value->Uint32Value(context).To(&sources_len)) return;
 
   for (uint32_t i = 0; i < sources_len; ++i) {
     v8::Local<v8::Value> file_name_value;
     if (!sources_arr->Get(context, i).ToLocal(&file_name_value) ||
-        !file_name_value->IsString())
+        !file_name_value->IsString()) {
       return;
+    }
     v8::Local<v8::String> file_name =
         v8::Local<v8::String>::Cast(file_name_value);
-    auto file_name_sz = file_name->Utf8Length(v8_isolate);
-    std::unique_ptr<char[]> file_name_buf(new char[file_name_sz + 1]);
-    file_name->WriteUtf8(v8_isolate, file_name_buf.get());
-    file_name_buf.get()[file_name_sz] = '\0';
+    size_t file_name_sz = file_name->Utf8Length(v8_isolate) + 1;
+    std::unique_ptr<char[]> file_name_buf(new char[file_name_sz]);
+    file_name->WriteUtf8(v8_isolate, file_name_buf.get(), file_name_sz,
+                         v8::String::WriteFlags::kNullTerminate);
     filenames.emplace_back(file_name_buf.get());
   }
 
   bool has_valid_mappings =
       src_map_obj
-          ->Get(
-              context,
-              v8::String::NewFromUtf8(v8_isolate, "mappings").ToLocalChecked())
+          ->Get(context, v8::String::NewFromUtf8Literal(v8_isolate, "mappings"))
           .ToLocal(&mappings_value) &&
       mappings_value->IsString();
   if (!has_valid_mappings) return;
 
   v8::Local<v8::String> mappings = v8::Local<v8::String>::Cast(mappings_value);
-  int mappings_sz = mappings->Utf8Length(v8_isolate);
-  std::unique_ptr<char[]> mappings_buf(new char[mappings_sz + 1]);
-  mappings->WriteUtf8(v8_isolate, mappings_buf.get());
-  mappings_buf.get()[mappings_sz] = '\0';
+  size_t mappings_sz = mappings->Utf8Length(v8_isolate) + 1;
+  std::unique_ptr<char[]> mappings_buf(new char[mappings_sz]);
+  mappings->WriteUtf8(v8_isolate, mappings_buf.get(), mappings_sz,
+                      v8::String::WriteFlags::kNullTerminate);
 
   valid_ = DecodeMapping(mappings_buf.get());
 }
@@ -129,22 +135,26 @@ bool WasmModuleSourceMap::DecodeMapping(const std::string& s) {
       continue;
     }
     if ((qnt = base::VLQBase64Decode(s.c_str(), s.size(), &pos)) ==
-        std::numeric_limits<int32_t>::min())
+        std::numeric_limits<int32_t>::min()) {
       return false;
+    }
     gen_col += qnt;
     if ((qnt = base::VLQBase64Decode(s.c_str(), s.size(), &pos)) ==
-        std::numeric_limits<int32_t>::min())
+        std::numeric_limits<int32_t>::min()) {
       return false;
+    }
     file_idx += qnt;
     if ((qnt = base::VLQBase64Decode(s.c_str(), s.size(), &pos)) ==
-        std::numeric_limits<int32_t>::min())
+        std::numeric_limits<int32_t>::min()) {
       return false;
+    }
     ori_line += qnt;
     // Column number in source file is always 0 in source map generated by
     // Emscripten. We just decode this value without further usage of it.
     if ((qnt = base::VLQBase64Decode(s.c_str(), s.size(), &pos)) ==
-        std::numeric_limits<int32_t>::min())
+        std::numeric_limits<int32_t>::min()) {
       return false;
+    }
 
     if (pos < s.size() && s[pos] != ',') return false;
     pos++;
@@ -154,6 +164,19 @@ bool WasmModuleSourceMap::DecodeMapping(const std::string& s) {
     offsets.push_back(gen_col);
   }
   return true;
+}
+
+size_t WasmModuleSourceMap::EstimateCurrentMemoryConsumption() const {
+  UPDATE_WHEN_CLASS_CHANGES(WasmModuleSourceMap, 104);
+  size_t result = sizeof(WasmModuleSourceMap);
+  result += ContentSize(offsets);
+  result += ContentSize(filenames);
+  for (const std::string& s : filenames) {
+    result += s.length();
+  }
+  result += ContentSize(file_idxs);
+  result += ContentSize(source_row);
+  return result;
 }
 
 }  // namespace wasm

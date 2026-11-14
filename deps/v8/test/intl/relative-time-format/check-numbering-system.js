@@ -19,7 +19,7 @@ let illFormedNumberingSystem = [
   "abc-ab",
 ];
 
-// https://tc39.github.io/ecma402/#table-numbering-system-digits
+// https://tc39.es/ecma402/#table-numbering-system-digits
 let validNumberingSystem= [
   "arab",
   "arabext",
@@ -73,7 +73,7 @@ validNumberingSystem.forEach(function(numberingSystem) {
   locales.forEach(function(base) {
     let l = base + "-u-nu-" + numberingSystem;
     let nf = new Intl.RelativeTimeFormat([base], {numberingSystem});
-    assertEquals(l, nf.resolvedOptions().locale);
+    assertEquals(base, nf.resolvedOptions().locale);
     assertEquals(numberingSystem, nf.resolvedOptions().numberingSystem);
 
     // Test the formatting result is the same as passing in via u-nu-

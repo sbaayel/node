@@ -11,281 +11,146 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <utility>
 
 #include "src/execution/isolate.h"
 #include "src/heap/factory.h"
 #include "src/objects/intl-objects.h"
 #include "src/objects/js-segment-iterator-inl.h"
-#include "src/objects/managed.h"
+#include "src/objects/js-segments.h"
+#include "src/objects/managed-inl.h"
 #include "src/objects/objects-inl.h"
 #include "unicode/brkiter.h"
 
 namespace v8 {
 namespace internal {
 
-MaybeHandle<String> JSSegmentIterator::GetSegment(Isolate* isolate,
-                                                  int32_t start,
-                                                  int32_t end) const {
-  return Intl::ToString(isolate, *(unicode_string().raw()), start, end);
+Handle<String> JSSegmentIterator::GranularityAsString(Isolate* isolate) const {
+  return JSSegmenter::GetGranularityString(isolate, granularity());
 }
 
-Handle<String> JSSegmentIterator::GranularityAsString() const {
-  switch (granularity()) {
-    case JSSegmenter::Granularity::GRAPHEME:
-      return GetReadOnlyRoots().grapheme_string_handle();
-    case JSSegmenter::Granularity::WORD:
-      return GetReadOnlyRoots().word_string_handle();
-    case JSSegmenter::Granularity::SENTENCE:
-      return GetReadOnlyRoots().sentence_string_handle();
-  }
-  UNREACHABLE();
-}
+// https://tc39.es/ecma402/#sec-createsegmentiterator
+MaybeDirectHandle<JSSegmentIterator> JSSegmentIterator::Create(
+    Isolate* isolate, DirectHandle<String> input_string,
+    const icu::BreakIterator& incoming_break_iterator,
+    JSSegmenter::Granularity granularity) {
+  // Clone a copy for both the ownership and not sharing with containing and
+  // other calls to the iterator because icu::BreakIterator keep the iteration
+  // position internally and cannot be shared across multiple calls to
+  // JSSegmentIterator::Create and JSSegments::Containing.
+  std::unique_ptr<icu::BreakIterator> cloned_iterator{
+      incoming_break_iterator.clone()};
+  auto iterator_with_text = std::make_shared<IcuBreakIteratorWithText>(
+      isolate, std::move(cloned_iterator), input_string);
+  DirectHandle<CppGCManaged<IcuBreakIteratorWithText>> managed =
+      CppGCManaged<IcuBreakIteratorWithText>::Create(isolate, 0,
+                                                     iterator_with_text);
 
-MaybeHandle<JSSegmentIterator> JSSegmentIterator::Create(
-    Isolate* isolate, icu::BreakIterator* break_iterator,
-    JSSegmenter::Granularity granularity, Handle<String> text) {
-  CHECK_NOT_NULL(break_iterator);
-  // 1. Let iterator be ObjectCreate(%SegmentIteratorPrototype%).
-  Handle<Map> map = Handle<Map>(
-      isolate->native_context()->intl_segment_iterator_map(), isolate);
+  // 5. Set iterator.[[IteratedStringNextSegmentCodeUnitIndex]] to 0.
+  iterator_with_text->iterator()->first();
 
-  Handle<Managed<icu::BreakIterator>> managed_break_iterator =
-      Managed<icu::BreakIterator>::FromRawPtr(isolate, 0, break_iterator);
-  Handle<Managed<icu::UnicodeString>> unicode_string =
-      Intl::SetTextToBreakIterator(isolate, text, break_iterator);
+  DirectHandle<Map> map(isolate->native_context()->intl_segment_iterator_map(),
+                        isolate);
 
   // Now all properties are ready, so we can allocate the result object.
-  Handle<JSObject> result = isolate->factory()->NewJSObjectFromMap(map);
-  DisallowHeapAllocation no_gc;
-  Handle<JSSegmentIterator> segment_iterator =
-      Handle<JSSegmentIterator>::cast(result);
+  DirectHandle<JSObject> result = isolate->factory()->NewJSObjectFromMap(map);
+  DisallowGarbageCollection no_gc;
+  DirectHandle<JSSegmentIterator> segment_iterator =
+      Cast<JSSegmentIterator>(result);
 
   segment_iterator->set_flags(0);
   segment_iterator->set_granularity(granularity);
-  // 2. Let iterator.[[SegmentIteratorSegmenter]] be segmenter.
-  segment_iterator->set_icu_break_iterator(*managed_break_iterator);
-
-  // 3. Let iterator.[[SegmentIteratorString]] be string.
-  segment_iterator->set_unicode_string(*unicode_string);
-
-  // 4. Let iterator.[[SegmentIteratorIndex]] be 0.
-  // step 4 is stored inside break_iterator.
-
-  // 5. Let iterator.[[SegmentIteratorBreakType]] be undefined.
-  segment_iterator->set_is_break_type_set(false);
+  segment_iterator->set_icu_iterator_with_text(*managed);
+  segment_iterator->set_raw_string(*input_string);
 
   return segment_iterator;
 }
 
-// ecma402 #sec-segment-iterator-prototype-breakType
-Handle<Object> JSSegmentIterator::BreakType() const {
-  if (!is_break_type_set()) {
-    return GetReadOnlyRoots().undefined_value_handle();
-  }
-  icu::BreakIterator* break_iterator = icu_break_iterator().raw();
-  int32_t rule_status = break_iterator->getRuleStatus();
-  switch (granularity()) {
-    case JSSegmenter::Granularity::GRAPHEME:
-      return GetReadOnlyRoots().undefined_value_handle();
-    case JSSegmenter::Granularity::WORD:
-      if (rule_status >= UBRK_WORD_NONE && rule_status < UBRK_WORD_NONE_LIMIT) {
-        // "words" that do not fit into any of other categories. Includes spaces
-        // and most punctuation.
-        return GetReadOnlyRoots().none_string_handle();
-      }
-      if ((rule_status >= UBRK_WORD_NUMBER &&
-           rule_status < UBRK_WORD_NUMBER_LIMIT) ||
-          (rule_status >= UBRK_WORD_LETTER &&
-           rule_status < UBRK_WORD_LETTER_LIMIT) ||
-          (rule_status >= UBRK_WORD_KANA &&
-           rule_status < UBRK_WORD_KANA_LIMIT) ||
-          (rule_status >= UBRK_WORD_IDEO &&
-           rule_status < UBRK_WORD_IDEO_LIMIT)) {
-        // words that appear to be numbers, letters, kana characters,
-        // ideographic characters, etc
-        return GetReadOnlyRoots().word_string_handle();
-      }
-      return GetReadOnlyRoots().undefined_value_handle();
-    case JSSegmenter::Granularity::SENTENCE:
-      if (rule_status >= UBRK_SENTENCE_TERM &&
-          rule_status < UBRK_SENTENCE_TERM_LIMIT) {
-        // sentences ending with a sentence terminator ('.', '?', '!', etc.)
-        // character, possibly followed by a hard separator (CR, LF, PS, etc.)
-        return GetReadOnlyRoots().term_string_handle();
-      }
-      if ((rule_status >= UBRK_SENTENCE_SEP &&
-           rule_status < UBRK_SENTENCE_SEP_LIMIT)) {
-        // sentences that do not contain an ending sentence terminator ('.',
-        // '?', '!', etc.) character, but are ended only by a hard separator
-        // (CR, LF, PS, etc.) hard, or mandatory line breaks
-        return GetReadOnlyRoots().sep_string_handle();
-      }
-      return GetReadOnlyRoots().undefined_value_handle();
-  }
-  UNREACHABLE();
-}
+// https://tc39.es/ecma402/#sec-%segmentiteratorprototype%.next
+MaybeDirectHandle<JSReceiver> JSSegmentIterator::Next(
+    Isolate* isolate, DirectHandle<JSSegmentIterator> segment_iterator) {
+  // Sketches of ideas for future performance improvements, roughly in order
+  // of difficulty:
+  // - Add a fast path for grapheme segmentation of one-byte strings that
+  //   entirely skips calling into ICU.
+  // - When we enter this function, perform a batch of calls into ICU and
+  //   stash away the results, so the next couple of invocations can access
+  //   them from a (Torque?) builtin without calling into C++.
+  // - Implement compiler support for escape-analyzing the JSSegmentDataObject
+  //   and avoid allocating it when possible.
 
-// ecma402 #sec-segment-iterator-prototype-index
-Handle<Object> JSSegmentIterator::Index(
-    Isolate* isolate, Handle<JSSegmentIterator> segment_iterator) {
-  icu::BreakIterator* icu_break_iterator =
-      segment_iterator->icu_break_iterator().raw();
-  CHECK_NOT_NULL(icu_break_iterator);
-  return isolate->factory()->NewNumberFromInt(icu_break_iterator->current());
-}
+  // TODO(v8:14681): We StackCheck here to break execution in the event of an
+  // interrupt. Ordinarily in JS loops, this stack check should already be
+  // occurring, however some loops implemented within CodeStubAssembler and
+  // Torque builtins do not currently implement these checks. A preferable
+  // solution which would benefit other iterators implemented in C++ include:
+  //   1) Performing the stack check in CEntry, which would provide a solution
+  //   for all methods implemented in C++.
+  //
+  //   2) Rewriting the loop to include an outer loop, which performs periodic
+  //   stack checks every N loop bodies (where N is some arbitrary heuristic
+  //   selected to allow short loop counts to run with few interruptions).
+  STACK_CHECK(isolate, MaybeDirectHandle<JSReceiver>());
 
-// ecma402 #sec-segment-iterator-prototype-next
-MaybeHandle<JSReceiver> JSSegmentIterator::Next(
-    Isolate* isolate, Handle<JSSegmentIterator> segment_iterator) {
   Factory* factory = isolate->factory();
-  icu::BreakIterator* icu_break_iterator =
-      segment_iterator->icu_break_iterator().raw();
-  // 3. Let _previousIndex be iterator.[[SegmentIteratorIndex]].
-  int32_t prev = icu_break_iterator->current();
-  // 4. Let done be AdvanceSegmentIterator(iterator, forwards).
-  int32_t index = icu_break_iterator->next();
-  segment_iterator->set_is_break_type_set(true);
-  if (index == icu::BreakIterator::DONE) {
-    // 5. If done is true, return CreateIterResultObject(undefined, true).
+  CppGCManaged<IcuBreakIteratorWithText>::Ptr iterator_with_text =
+      segment_iterator->icu_iterator_with_text()->ptr();
+  icu::BreakIterator* const icu_break_iterator = iterator_with_text->iterator();
+
+  // 5. Let startIndex be iterator.[[IteratedStringNextSegmentCodeUnitIndex]].
+  int32_t start_index = icu_break_iterator->current();
+  // 6. Let endIndex be ! FindBoundary(segmenter, string, startIndex, after).
+  int32_t end_index = icu_break_iterator->next();
+
+  // 7. If endIndex is not finite, then
+  if (end_index == icu::BreakIterator::DONE) {
+    // a. Return ! CreateIterResultObject(undefined, true).
     return factory->NewJSIteratorResult(isolate->factory()->undefined_value(),
                                         true);
   }
-  // 6. Let newIndex be iterator.[[SegmentIteratorIndex]].
-  Handle<Object> new_index = factory->NewNumberFromInt(index);
 
-  // 8. Let segment be the substring of string from previousIndex to
-  // newIndex, inclusive of previousIndex and exclusive of newIndex.
-  Handle<String> segment;
-  ASSIGN_RETURN_ON_EXCEPTION(isolate, segment,
-                             segment_iterator->GetSegment(isolate, prev, index),
-                             JSReceiver);
+  // 8. Set iterator.[[IteratedStringNextSegmentCodeUnitIndex]] to endIndex.
 
-  // 9. Let breakType be iterator.[[SegmentIteratorBreakType]].
-  Handle<Object> break_type = segment_iterator->BreakType();
+  // 9. Let segmentData be ! CreateSegmentDataObject(segmenter, string,
+  // startIndex, endIndex).
 
-  // 10. Let result be ! ObjectCreate(%ObjectPrototype%).
-  Handle<JSObject> result = factory->NewJSObject(isolate->object_function());
-
-  // 11. Perform ! CreateDataProperty(result "segment", segment).
-  CHECK(JSReceiver::CreateDataProperty(isolate, result,
-                                       factory->segment_string(), segment,
-                                       Just(kDontThrow))
-            .FromJust());
-
-  // 12. Perform ! CreateDataProperty(result, "breakType", breakType).
-  CHECK(JSReceiver::CreateDataProperty(isolate, result,
-                                       factory->breakType_string(), break_type,
-                                       Just(kDontThrow))
-            .FromJust());
-
-  // 13. Perform ! CreateDataProperty(result, "index", newIndex).
-  CHECK(JSReceiver::CreateDataProperty(isolate, result, factory->index_string(),
-                                       new_index, Just(kDontThrow))
-            .FromJust());
-
-  // 14. Return CreateIterResultObject(result, false).
-  return factory->NewJSIteratorResult(result, false);
-}
-
-// ecma402 #sec-segment-iterator-prototype-following
-Maybe<bool> JSSegmentIterator::Following(
-    Isolate* isolate, Handle<JSSegmentIterator> segment_iterator,
-    Handle<Object> from_obj) {
-  Factory* factory = isolate->factory();
-  icu::BreakIterator* icu_break_iterator =
-      segment_iterator->icu_break_iterator().raw();
-  // 3. If from is not undefined,
-  if (!from_obj->IsUndefined()) {
-    // a. Let from be ? ToIndex(from).
-    uint32_t from;
-    Handle<Object> index;
-    ASSIGN_RETURN_ON_EXCEPTION_VALUE(
-        isolate, index,
-        Object::ToIndex(isolate, from_obj, MessageTemplate::kInvalidIndex),
-        Nothing<bool>());
-    if (!index->ToArrayIndex(&from)) {
-      THROW_NEW_ERROR_RETURN_VALUE(
-          isolate,
-          NewRangeError(MessageTemplate::kParameterOfFunctionOutOfRange,
-                        factory->from_string(),
-                        factory->NewStringFromStaticChars("following"), index),
-          Nothing<bool>());
+  DirectHandle<JSSegmentDataObject> segment_data;
+  if (segment_iterator->granularity() == JSSegmenter::Granularity::GRAPHEME &&
+      start_index == end_index - 1) {
+    // Fast path: use cached segment string and skip avoidable handle creations.
+    DirectHandle<String> segment;
+    uint16_t code = segment_iterator->raw_string()->Get(start_index);
+    if (code > unibrow::Latin1::kMaxChar) {
+      segment = factory->LookupSingleCharacterStringFromCode(code);
     }
-    // b. Let length be the length of iterator.[[SegmentIteratorString]].
-    uint32_t length =
-        static_cast<uint32_t>(icu_break_iterator->getText().getLength());
-
-    // c. If from ≥ length, throw a RangeError exception.
-    if (from >= length) {
-      THROW_NEW_ERROR_RETURN_VALUE(
-          isolate,
-          NewRangeError(MessageTemplate::kParameterOfFunctionOutOfRange,
-                        factory->from_string(),
-                        factory->NewStringFromStaticChars("following"),
-                        from_obj),
-          Nothing<bool>());
-    }
-
-    // d. Let iterator.[[SegmentIteratorPosition]] be from.
-    segment_iterator->set_is_break_type_set(true);
-    icu_break_iterator->following(from);
-    return Just(false);
+    DirectHandle<Number> index;
+    if (!Smi::IsValid(start_index)) index = factory->NewHeapNumber(start_index);
+    DirectHandle<Map> map(
+        isolate->native_context()->intl_segment_data_object_map(), isolate);
+    segment_data = Cast<JSSegmentDataObject>(factory->NewJSObjectFromMap(map));
+    Tagged<JSSegmentDataObject> raw = *segment_data;
+    DisallowHeapAllocation no_gc;
+    // We can skip write barriers because {segment_data} is the last object
+    // that was allocated.
+    raw->set_segment(code <= unibrow::Latin1::kMaxChar
+                         ? ReadOnlyRoots(isolate).single_character_string(code)
+                         : *segment,
+                     SKIP_WRITE_BARRIER);
+    raw->set_index(
+        Smi::IsValid(start_index) ? Smi::FromInt(start_index) : *index,
+        SKIP_WRITE_BARRIER);
+    raw->set_input(segment_iterator->raw_string(), SKIP_WRITE_BARRIER);
+  } else {
+    ASSIGN_RETURN_ON_EXCEPTION(
+        isolate, segment_data,
+        JSSegments::CreateSegmentDataObject(
+            isolate, segment_iterator->granularity(), icu_break_iterator,
+            direct_handle(segment_iterator->raw_string(), isolate),
+            *iterator_with_text->text(), start_index, end_index));
   }
-  // 4. return AdvanceSegmentIterator(iterator, forward).
-  // 4. .... or if direction is backwards and position is 0, return true.
-  // 4. If direction is forwards and position is the length of string ... return
-  // true.
-  segment_iterator->set_is_break_type_set(true);
-  return Just(icu_break_iterator->next() == icu::BreakIterator::DONE);
-}
 
-// ecma402 #sec-segment-iterator-prototype-preceding
-Maybe<bool> JSSegmentIterator::Preceding(
-    Isolate* isolate, Handle<JSSegmentIterator> segment_iterator,
-    Handle<Object> from_obj) {
-  Factory* factory = isolate->factory();
-  icu::BreakIterator* icu_break_iterator =
-      segment_iterator->icu_break_iterator().raw();
-  // 3. If from is not undefined,
-  if (!from_obj->IsUndefined()) {
-    // a. Let from be ? ToIndex(from).
-    uint32_t from;
-    Handle<Object> index;
-    ASSIGN_RETURN_ON_EXCEPTION_VALUE(
-        isolate, index,
-        Object::ToIndex(isolate, from_obj, MessageTemplate::kInvalidIndex),
-        Nothing<bool>());
-
-    if (!index->ToArrayIndex(&from)) {
-      THROW_NEW_ERROR_RETURN_VALUE(
-          isolate,
-          NewRangeError(MessageTemplate::kParameterOfFunctionOutOfRange,
-                        factory->from_string(),
-                        factory->NewStringFromStaticChars("preceding"), index),
-          Nothing<bool>());
-    }
-    // b. Let length be the length of iterator.[[SegmentIteratorString]].
-    uint32_t length =
-        static_cast<uint32_t>(icu_break_iterator->getText().getLength());
-    // c. If from > length or from = 0, throw a RangeError exception.
-    if (from > length || from == 0) {
-      THROW_NEW_ERROR_RETURN_VALUE(
-          isolate,
-          NewRangeError(MessageTemplate::kParameterOfFunctionOutOfRange,
-                        factory->from_string(),
-                        factory->NewStringFromStaticChars("preceding"),
-                        from_obj),
-          Nothing<bool>());
-    }
-    // d. Let iterator.[[SegmentIteratorIndex]] be from.
-    segment_iterator->set_is_break_type_set(true);
-    icu_break_iterator->preceding(from);
-    return Just(false);
-  }
-  // 4. return AdvanceSegmentIterator(iterator, backwards).
-  // 4. .... or if direction is backwards and position is 0, return true.
-  segment_iterator->set_is_break_type_set(true);
-  return Just(icu_break_iterator->previous() == icu::BreakIterator::DONE);
+  // 10. Return ! CreateIterResultObject(segmentData, false).
+  return factory->NewJSIteratorResult(segment_data, false);
 }
 
 }  // namespace internal

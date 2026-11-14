@@ -6,6 +6,7 @@
 #define V8_BUILTINS_BUILTINS_UTILS_INL_H_
 
 #include "src/builtins/builtins-utils.h"
+// Include the non-inl header before the rest of the headers.
 
 #include "src/execution/arguments-inl.h"
 
@@ -20,14 +21,16 @@ Handle<Object> BuiltinArguments::atOrUndefined(Isolate* isolate,
   return at<Object>(index);
 }
 
-Handle<Object> BuiltinArguments::receiver() const { return at<Object>(0); }
+Handle<JSAny> BuiltinArguments::receiver() const {
+  return Handle<JSAny>(address_of_arg_at(kReceiverIndex));
+}
 
 Handle<JSFunction> BuiltinArguments::target() const {
-  return Arguments::at<JSFunction>(Arguments::length() - 1 - kTargetOffset);
+  return Handle<JSFunction>(address_of_arg_at(kTargetIndex));
 }
 
 Handle<HeapObject> BuiltinArguments::new_target() const {
-  return Arguments::at<HeapObject>(Arguments::length() - 1 - kNewTargetOffset);
+  return Handle<JSFunction>(address_of_arg_at(kNewTargetIndex));
 }
 
 }  // namespace internal

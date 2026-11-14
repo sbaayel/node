@@ -1,0 +1,26 @@
+'use strict';
+
+const os = require('node:os');
+
+// On AIX, V8's OS::DecommitPages() has an inherent race condition caused by
+// AIX's non-POSIX MAP_FIXED behavior. The implementation must munmap() then
+// mmap(), and another thread can steal the address range in between. The
+// Blob.arrayBuffer() tests trigger this by creating enough GC pressure
+// (especially the concurrent reads test) to hit the race window.
+// See deps/v8/src/base/platform/platform-aix.cc, lines 168-203.
+const isAIX = os.type() === 'AIX';
+
+const conditionalSkips = {};
+
+if (isAIX) {
+  conditionalSkips['Blob-array-buffer.any.js'] = {
+    skip: 'V8 DecommitPages race condition on AIX (munmap/mmap non-atomic)',
+  };
+}
+
+module.exports = {
+  ...conditionalSkips,
+  'Blob-constructor-dom.window.js': {
+    skip: 'Depends on DOM API',
+  },
+};

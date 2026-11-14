@@ -4,7 +4,7 @@ const common = require('../common.js');
 
 const bench = common.createBenchmark(main, {
   method: ['normal', 'destructureObject'],
-  n: [1e8]
+  n: [1e8],
 });
 
 function runNormal(n) {
@@ -33,8 +33,6 @@ function runDestructured(n) {
 
 function main({ n, method }) {
   switch (method) {
-    case '':
-      // Empty string falls through to next line as default, mostly for tests.
     case 'normal':
       runNormal(n);
       break;

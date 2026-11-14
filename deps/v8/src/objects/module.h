@@ -5,11 +5,11 @@
 #ifndef V8_OBJECTS_MODULE_H_
 #define V8_OBJECTS_MODULE_H_
 
-#include "src/objects/fixed-array.h"
+#include "include/v8-script.h"
+#include "include/v8-template.h"
 #include "src/objects/js-objects.h"
 #include "src/objects/objects.h"
 #include "src/objects/struct.h"
-#include "torque-generated/field-offsets-tq.h"
 
 // Has to be the last include (doesn't have include guards):
 #include "src/objects/object-macros.h"
@@ -17,51 +17,53 @@
 namespace v8 {
 namespace internal {
 
-template <typename T>
-class Handle;
-class Isolate;
 class JSModuleNamespace;
 class SourceTextModuleDescriptor;
 class SourceTextModuleInfo;
 class SourceTextModuleInfoEntry;
-class String;
 class Zone;
+template <typename T>
+class ZoneForwardList;
 
 // Module is the base class for ECMAScript module types, roughly corresponding
 // to Abstract Module Record.
-// https://tc39.github.io/ecma262/#sec-abstract-module-records
-class Module : public HeapObject {
+// https://tc39.es/ecma262/#sec-abstract-module-records
+V8_OBJECT class Module : public HeapObject {
+  V8_IT_ABSTRACT;
+
  public:
-  NEVER_READ_ONLY_SPACE
-  DECL_CAST(Module)
   DECL_VERIFIER(Module)
   DECL_PRINTER(Module)
 
-  // The complete export table, mapping an export name to its cell.
-  DECL_ACCESSORS(exports, ObjectHashTable)
-
-  // Hash for this object (a random non-zero Smi).
-  DECL_INT_ACCESSORS(hash)
-
-  // Status.
-  DECL_INT_ACCESSORS(status)
   enum Status {
     // Order matters!
-    kUninstantiated,
-    kPreInstantiating,
-    kInstantiating,
-    kInstantiated,
+    kUnlinked,
+    kPreLinking,
+    kLinking,
+    kLinked,
     kEvaluating,
+    kEvaluatingAsync,
     kEvaluated,
     kErrored
   };
 
-  // The namespace object (or undefined).
-  DECL_ACCESSORS(module_namespace, HeapObject)
+#ifdef DEBUG
+  static const char* StatusString(Module::Status status);
+#endif  // DEBUG
 
   // The exception in the case {status} is kErrored.
-  Object GetException();
-  DECL_ACCESSORS(exception, Object)
+  Tagged<Object> GetException();
+
+  // Returns if this module or any transitively requested module is [[Async]],
+  // i.e. has a top-level await.
+  V8_WARN_UNUSED_RESULT bool IsGraphAsync(Isolate* isolate) const;
+
+  struct UserResolveCallbacks {
+    v8::Module::ResolveModuleCallback module_callback = nullptr;
+    v8::Module::ResolveSourceCallback source_callback = nullptr;
+    v8::Module::ResolveModuleByIndexCallback module_callback_by_index = nullptr;
+    v8::Module::ResolveSourceByIndexCallback source_callback_by_index = nullptr;
+  };
 
   // Implementation of spec operation ModuleDeclarationInstantiation.
   // Returns false if an exception occurred during instantiation, true
@@ -69,23 +71,56 @@ class Module : public HeapObject {
   // exception is propagated.)
   static V8_WARN_UNUSED_RESULT bool Instantiate(
       Isolate* isolate, Handle<Module> module, v8::Local<v8::Context> context,
-      v8::Module::ResolveCallback callback);
+      const UserResolveCallbacks& callbacks);
 
   // Implementation of spec operation ModuleEvaluation.
-  static V8_WARN_UNUSED_RESULT MaybeHandle<Object> Evaluate(
+  static V8_WARN_UNUSED_RESULT MaybeDirectHandle<JSPromise> Evaluate(
       Isolate* isolate, Handle<Module> module);
 
   // Get the namespace object for [module].  If it doesn't exist yet, it is
   // created.
-  static Handle<JSModuleNamespace> GetModuleNamespace(Isolate* isolate,
-                                                      Handle<Module> module);
+  static Handle<Cell> GetModuleNamespaceCell(
+      Isolate* isolate, Handle<Module> module,
+      ModuleImportPhase phase = ModuleImportPhase::kEvaluation);
+  static DirectHandle<JSModuleNamespace> GetModuleNamespace(
+      Isolate* isolate, Handle<Module> module,
+      ModuleImportPhase phase = ModuleImportPhase::kEvaluation);
 
-// Layout description.
-  DEFINE_FIELD_OFFSET_CONSTANTS(Struct::kHeaderSize,
-                                TORQUE_GENERATED_MODULE_FIELDS)
+  inline Tagged<ObjectHashTable> exports() const;
+  inline void set_exports(Tagged<ObjectHashTable> value,
+                          WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
 
-  using BodyDescriptor =
-      FixedBodyDescriptor<kExportsOffset, kHeaderSize, kHeaderSize>;
+  inline int hash() const;
+  inline void set_hash(int value);
+
+  inline int status() const;
+  inline void set_status(int value);
+
+  inline Tagged<UnionOf<Cell, Undefined>> module_namespace() const;
+  inline void set_module_namespace(
+      Tagged<UnionOf<Cell, Undefined>> value,
+      WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
+
+  inline Tagged<UnionOf<Cell, Undefined>> deferred_module_namespace() const;
+  inline void set_deferred_module_namespace(
+      Tagged<UnionOf<Cell, Undefined>> value,
+      WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
+
+  inline Tagged<Object> exception() const;
+  inline void set_exception(Tagged<Object> value,
+                            WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
+
+  // Once a module namespace (normal or deferred) has been created in
+  // GetModuleNamespace, all star exports have been fetched and {exports} is
+  // finalized (must not be mutated or rehashed as ICs index into it).
+  inline bool ExportsFinalized() const;
+
+  inline Tagged<UnionOf<JSPromise, Undefined>> top_level_capability() const;
+  inline void set_top_level_capability(
+      Tagged<UnionOf<JSPromise, Undefined>> value,
+      WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
+
+  struct Hash;
 
  protected:
   friend class Factory;
@@ -100,54 +135,73 @@ class Module : public HeapObject {
   // exception (so check manually!).
   class ResolveSet;
   static V8_WARN_UNUSED_RESULT MaybeHandle<Cell> ResolveExport(
-      Isolate* isolate, Handle<Module> module, Handle<String> module_specifier,
-      Handle<String> export_name, MessageLocation loc, bool must_resolve,
-      ResolveSet* resolve_set);
+      Isolate* isolate, Handle<Module> module,
+      DirectHandle<String> module_specifier, Handle<String> export_name,
+      MessageLocation loc, bool must_resolve, ResolveSet* resolve_set);
 
   static V8_WARN_UNUSED_RESULT bool PrepareInstantiate(
-      Isolate* isolate, Handle<Module> module, v8::Local<v8::Context> context,
-      v8::Module::ResolveCallback callback);
+      Isolate* isolate, DirectHandle<Module> module,
+      v8::Local<v8::Context> context, const UserResolveCallbacks& callbacks);
   static V8_WARN_UNUSED_RESULT bool FinishInstantiate(
       Isolate* isolate, Handle<Module> module,
       ZoneForwardList<Handle<SourceTextModule>>* stack, unsigned* dfs_index,
-      Zone* zone);
+      Zone* zone, unsigned depth, unsigned* max_depth);
 
-  static V8_WARN_UNUSED_RESULT MaybeHandle<Object> InnerEvaluate(
-      Isolate* isolate, Handle<Module> module);
-
-  // Set module's status back to kUninstantiated and reset other internal state.
+  // Set module's status back to kUnlinked and reset other internal state.
   // This is used when instantiation fails.
-  static void Reset(Isolate* isolate, Handle<Module> module);
-  static void ResetGraph(Isolate* isolate, Handle<Module> module);
+  static void Reset(Isolate* isolate, DirectHandle<Module> module);
+  static void ResetGraph(Isolate* isolate, DirectHandle<Module> module);
 
-  // To set status to kErrored, RecordError or RecordErrorUsingPendingException
-  // should be used.
+  // To set status to kErrored, RecordError should be used.
   void SetStatus(Status status);
-  void RecordErrorUsingPendingException(Isolate* isolate);
-  void RecordError(Isolate* isolate, Handle<Object> error);
+  void RecordError(Isolate* isolate, Tagged<Object> error);
 
-#ifdef DEBUG
-  // For --trace-module-status.
-  void PrintStatusTransition(Status new_status);
-#endif  // DEBUG
+ public:
+  TaggedMember<ObjectHashTable> exports_;
+  TaggedMember<Smi> hash_;
+  TaggedMember<Smi> status_;
+  TaggedMember<UnionOf<Cell, Undefined>> module_namespace_;
+  TaggedMember<UnionOf<Cell, Undefined>> deferred_module_namespace_;
+  TaggedMember<Object> exception_;
+  TaggedMember<UnionOf<JSPromise, Undefined>> top_level_capability_;
+} V8_OBJECT_END;
 
-  OBJECT_CONSTRUCTORS(Module, HeapObject);
+template <>
+struct ObjectTraits<Module> {
+  using BodyDescriptor = FixedBodyDescriptor<offsetof(Module, exports_),
+                                             sizeof(Module), sizeof(Module)>;
 };
 
 // When importing a module namespace (import * as foo from "bar"), a
 // JSModuleNamespace object (representing module "bar") is created and bound to
 // the declared variable (foo).  A module can have at most one namespace object.
-class JSModuleNamespace
-    : public TorqueGeneratedJSModuleNamespace<JSModuleNamespace,
-                                              JSSpecialObject> {
+V8_OBJECT class JSModuleNamespace : public JSSpecialObject {
+  V8_IT_OWN_TYPE;
+
  public:
+  inline Tagged<Module> module() const;
+  inline void set_module(Tagged<Module> value,
+                         WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
+
   DECL_PRINTER(JSModuleNamespace)
+  DECL_VERIFIER(JSModuleNamespace)
 
   // Retrieve the value exported by [module] under the given [name]. If there is
   // no such export, return Just(undefined). If the export is uninitialized,
   // schedule an exception and return Nothing.
-  V8_WARN_UNUSED_RESULT MaybeHandle<Object> GetExport(Isolate* isolate,
-                                                      Handle<String> name);
+  V8_WARN_UNUSED_RESULT MaybeDirectHandle<Object> GetExport(
+      Isolate* isolate, DirectHandle<String> name);
+
+  bool HasExport(Isolate* isolate, DirectHandle<String> name);
+
+  // Counts an access to a missing `default` export on the namespace [it] starts
+  // at, when that module has an `export * from '...'` statement. Such a
+  // `default` is absent today because `export *` skips it, but would resolve to
+  // the star-exported default (if it exists) under the export-star-default
+  // proposal (https://github.com/tc39/proposal-export-star-default).
+  // Called from [[Get]] and [[HasProperty]]. Only valid while [it] is in the
+  // LookupIterator::MODULE_NAMESPACE state.
+  static void MaybeCountMissingDefaultWithStarExport(LookupIterator* it);
 
   // Return the (constant) property attributes for the referenced property,
   // which is assumed to correspond to an export. If the export is
@@ -155,19 +209,69 @@ class JSModuleNamespace
   static V8_WARN_UNUSED_RESULT Maybe<PropertyAttributes> GetPropertyAttributes(
       LookupIterator* it);
 
-  // In-object fields.
+  static V8_WARN_UNUSED_RESULT Maybe<bool> DefineOwnProperty(
+      Isolate* isolate, DirectHandle<JSModuleNamespace> o,
+      DirectHandle<Object> key, PropertyDescriptor* desc,
+      Maybe<ShouldThrow> should_throw);
+
+  // In-object fields. These indices represent both the in-object field index,
+  // as well as the descriptor index.
   enum {
-    kToStringTagFieldIndex,
+    kToStringTagIndex,
     kInObjectFieldCount,
   };
 
+  static const int kHeaderSize;
   // We need to include in-object fields
   // TODO(v8:8944): improve handling of in-object fields
-  static constexpr int kSize =
-      kHeaderSize + (kTaggedSize * kInObjectFieldCount);
+  static const int kSize;
 
-  TQ_OBJECT_CONSTRUCTORS(JSModuleNamespace)
-};
+ public:
+  TaggedMember<Module> module_;
+} V8_OBJECT_END;
+
+inline constexpr int JSModuleNamespace::kHeaderSize = sizeof(JSModuleNamespace);
+inline constexpr int JSModuleNamespace::kSize =
+    JSModuleNamespace::kHeaderSize + (kTaggedSize * kInObjectFieldCount);
+
+V8_OBJECT class JSDeferredModuleNamespace : public JSModuleNamespace {
+ public:
+  DECL_PRINTER(JSDeferredModuleNamespace)
+  DECL_VERIFIER(JSDeferredModuleNamespace)
+
+  static void EvaluateModuleSync(
+      Isolate* isolate, DirectHandle<JSDeferredModuleNamespace> holder);
+  static bool TriggersEvaluation(LookupIterator* it);
+
+  // We need to include in-object fields
+  // TODO(v8:8944): improve handling of in-object fields
+  static const int kSize;
+} V8_OBJECT_END;
+
+inline constexpr int JSDeferredModuleNamespace::kSize =
+    sizeof(JSDeferredModuleNamespace) + (kTaggedSize * kInObjectFieldCount);
+
+V8_OBJECT class ScriptOrModule : public Struct {
+ public:
+  inline Tagged<Object> resource_name() const;
+  inline void set_resource_name(Tagged<Object> value,
+                                WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
+
+  inline Tagged<FixedArray> host_defined_options() const;
+  inline void set_host_defined_options(
+      Tagged<FixedArray> value, WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
+
+  DECL_PRINTER(ScriptOrModule)
+  DECL_VERIFIER(ScriptOrModule)
+
+  using BodyDescriptor = StructBodyDescriptor;
+
+ private:
+  friend class TorqueGeneratedScriptOrModuleAsserts;
+
+  TaggedMember<Object> resource_name_;
+  TaggedMember<FixedArray> host_defined_options_;
+} V8_OBJECT_END;
 
 }  // namespace internal
 }  // namespace v8

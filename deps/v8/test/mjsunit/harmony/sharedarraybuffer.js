@@ -25,8 +25,7 @@
 // (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-// Flags: --harmony-sharedarraybuffer
-
+// Flags: --allow-natives-syntax
 
 // SharedArrayBuffer
 
@@ -48,7 +47,8 @@ function TestArrayBufferCreation() {
   assertThrows(function() { new SharedArrayBuffer(-2.567); }, RangeError);
 
   assertThrows(function() {
-    var ab1 = new SharedArrayBuffer(0xFFFFFFFFFFFF)
+    let kArrayBufferByteLengthLimit = %ArrayBufferMaxByteLength() + 1;
+    var ab1 = new SharedArrayBuffer(kArrayBufferByteLengthLimit);
   }, RangeError);
 
   var sab = new SharedArrayBuffer();
@@ -416,8 +416,10 @@ function TestTypedArraySet() {
   assertThrows(function() { a.set.call({}) }, TypeError);
   assertThrows(function() { a.set.call([]) }, TypeError);
 
-  assertThrows(function() { a.set(0); }, TypeError);
-  assertThrows(function() { a.set(0, 1); }, TypeError);
+  a.set(0);
+  assertArrayPrefix(expected, a);
+  a.set(0, 1);
+  assertArrayPrefix(expected, a);
 }
 
 TestTypedArraySet();

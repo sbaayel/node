@@ -21,14 +21,15 @@
 
 'use strict';
 const common = require('../common');
-if (!common.hasCrypto)
+if (!common.hasCrypto) {
   common.skip('missing crypto');
+}
 
 const assert = require('assert');
 const stream = require('stream');
 const crypto = require('crypto');
 
-if (!common.hasFipsCrypto) {
+if (!crypto.getFips()) {
   // Small stream to buffer converter
   class Stream2buffer extends stream.Writable {
     constructor(callback) {
@@ -72,10 +73,9 @@ const decipher = crypto.createDecipheriv('aes-128-cbc', badkey, iv);
 
 cipher.pipe(decipher)
   .on('error', common.expectsError({
-    message: /bad decrypt/,
-    function: 'EVP_DecryptFinal_ex',
-    library: 'digital envelope routines',
-    reason: 'bad decrypt',
+    message: /bad[\s_]decrypt/i,
+    library: /Provider routines|Cipher functions/,
+    reason: /bad[\s_]decrypt/i,
   }));
 
 cipher.end('Papaya!');  // Should not cause an unhandled exception.

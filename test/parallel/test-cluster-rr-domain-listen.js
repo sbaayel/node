@@ -32,9 +32,9 @@ if (cluster.isWorker) {
   d.run(() => {});
 
   const http = require('http');
-  http.Server(() => {}).listen(0, '127.0.0.1');
+  new http.Server(() => {}).listen(0, '127.0.0.1');
 
-} else if (cluster.isMaster) {
+} else if (cluster.isPrimary) {
 
   // Kill worker when listening
   cluster.on('listening', function() {

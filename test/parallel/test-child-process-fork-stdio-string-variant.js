@@ -15,7 +15,7 @@ const payload = { hello: 'world' };
 
 assert.throws(
   () => fork(childScript, malFormedOpts),
-  { code: 'ERR_INVALID_OPT_VALUE', name: 'TypeError' });
+  { code: 'ERR_INVALID_ARG_VALUE', name: 'TypeError' });
 
 function test(stringVariant) {
   const child = fork(childScript, { stdio: stringVariant });
@@ -29,4 +29,7 @@ function test(stringVariant) {
   child.on('exit', common.mustCall((code) => assert.strictEqual(code, 0)));
 }
 
-['pipe', 'inherit', 'ignore'].forEach(test);
+const testCases = ['pipe', 'inherit', 'ignore'];
+for (const value of testCases) {
+  test(value);
+}

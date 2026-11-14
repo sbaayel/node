@@ -5,13 +5,13 @@
 #include "src/compiler/backend/code-generator.h"
 #include "src/compiler/backend/instruction.h"
 #include "src/compiler/common-operator.h"
-#include "src/compiler/graph.h"
 #include "src/compiler/linkage.h"
 #include "src/compiler/machine-operator.h"
 #include "src/compiler/node.h"
 #include "src/compiler/operator.h"
 #include "src/compiler/schedule.h"
 #include "src/compiler/scheduler.h"
+#include "src/compiler/turbofan-graph.h"
 #include "src/objects/objects-inl.h"
 #include "test/cctest/cctest.h"
 
@@ -32,7 +32,7 @@ class InstructionTester : public HandleAndZoneScope {
         machine(zone()),
         code(nullptr) {}
 
-  Graph graph;
+  TFGraph graph;
   Schedule schedule;
   CommonOperatorBuilder common;
   MachineOperatorBuilder machine;
@@ -48,8 +48,8 @@ class InstructionTester : public HandleAndZoneScope {
     }
     InstructionBlocks* instruction_blocks =
         TestInstrSeq::InstructionBlocksFor(main_zone(), &schedule);
-    code = new (main_zone())
-        TestInstrSeq(main_isolate(), main_zone(), instruction_blocks);
+    code = main_zone()->New<TestInstrSeq>(main_isolate(), main_zone(),
+                                          instruction_blocks);
   }
 
   Node* Int32Constant(int32_t val) {

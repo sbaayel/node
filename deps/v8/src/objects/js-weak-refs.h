@@ -5,8 +5,10 @@
 #ifndef V8_OBJECTS_JS_WEAK_REFS_H_
 #define V8_OBJECTS_JS_WEAK_REFS_H_
 
+#include "src/base/bit-field.h"
 #include "src/objects/js-objects.h"
-#include "src/objects/microtask.h"
+#include "src/objects/tagged-field.h"
+#include "src/objects/union.h"
 
 // Has to be the last include (doesn't have include guards):
 #include "src/objects/object-macros.h"
@@ -17,104 +19,213 @@ namespace internal {
 class NativeContext;
 class WeakCell;
 
-// FinalizationGroup object from the JS Weak Refs spec proposal:
+// FinalizationRegistry object from the JS Weak Refs spec proposal:
 // https://github.com/tc39/proposal-weakrefs
-class JSFinalizationGroup : public JSObject {
+V8_OBJECT class JSFinalizationRegistry : public JSObject {
  public:
-  DECL_PRINTER(JSFinalizationGroup)
-  EXPORT_DECL_VERIFIER(JSFinalizationGroup)
-  DECL_CAST(JSFinalizationGroup)
+  inline Tagged<NativeContext> native_context() const;
+  inline void set_native_context(Tagged<NativeContext> value,
+                                 WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
 
-  DECL_ACCESSORS(native_context, NativeContext)
-  DECL_ACCESSORS(cleanup, Object)
+  inline Tagged<JSReceiver> cleanup() const;
+  inline void set_cleanup(Tagged<JSReceiver> value,
+                          WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
 
-  DECL_ACCESSORS(active_cells, HeapObject)
-  DECL_ACCESSORS(cleared_cells, HeapObject)
-  DECL_ACCESSORS(key_map, Object)
+  inline Tagged<UnionOf<WeakCell, Undefined>> active_cells() const;
+  inline void set_active_cells(Tagged<UnionOf<WeakCell, Undefined>> value,
+                               WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
 
-  // For storing a list of JSFinalizationGroup objects in NativeContext.
-  DECL_ACCESSORS(next, Object)
+  inline Tagged<UnionOf<WeakCell, Undefined>> cleared_cells() const;
+  inline void set_cleared_cells(Tagged<UnionOf<WeakCell, Undefined>> value,
+                                WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
 
-  DECL_INT_ACCESSORS(flags)
+  inline Tagged<Object> key_map() const;
+  inline void set_key_map(Tagged<Object> value,
+                          WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
 
-  inline static void Register(Handle<JSFinalizationGroup> finalization_group,
-                              Handle<JSReceiver> target,
-                              Handle<Object> holdings, Handle<Object> key,
-                              Isolate* isolate);
-  inline static bool Unregister(Handle<JSFinalizationGroup> finalization_group,
-                                Handle<JSReceiver> unregister_token,
-                                Isolate* isolate);
+  inline Tagged<UnionOf<JSFinalizationRegistry, Undefined>> next_dirty() const;
+  inline void set_next_dirty(
+      Tagged<UnionOf<JSFinalizationRegistry, Undefined>> value,
+      WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
+
+  inline int flags() const;
+  inline void set_flags(int value);
+
+  DECL_PRINTER(JSFinalizationRegistry)
+  EXPORT_DECL_VERIFIER(JSFinalizationRegistry)
+
+  DECL_BOOLEAN_ACCESSORS(scheduled_for_cleanup)
+
+  class BodyDescriptor;
+
+  inline static void RegisterWeakCellWithUnregisterToken(
+      DirectHandle<JSFinalizationRegistry> finalization_registry,
+      DirectHandle<WeakCell> weak_cell, Isolate* isolate);
+  inline static bool Unregister(
+      DirectHandle<JSFinalizationRegistry> finalization_registry,
+      DirectHandle<HeapObject> unregister_token, Isolate* isolate);
+
+  // RemoveUnregisterToken is called from both Unregister and during GC. Since
+  // it modifies slots in key_map and WeakCells and the normal write barrier is
+  // disabled during GC, we need to tell the GC about the modified slots via the
+  // gc_notify_updated_slot function.
+  enum RemoveUnregisterTokenMode {
+    kRemoveMatchedCellsFromRegistry,
+    kKeepMatchedCellsInRegistry
+  };
+  template <typename GCNotifyUpdatedSlotCallback>
+  inline bool RemoveUnregisterToken(
+      Tagged<HeapObject> unregister_token, Isolate* isolate,
+      RemoveUnregisterTokenMode removal_mode,
+      GCNotifyUpdatedSlotCallback gc_notify_updated_slot,
+      WriteBarrierMode write_barrier_mode = UPDATE_WRITE_BARRIER);
 
   // Returns true if the cleared_cells list is non-empty.
   inline bool NeedsCleanup() const;
 
-  inline bool scheduled_for_cleanup() const;
-  inline void set_scheduled_for_cleanup(bool scheduled_for_cleanup);
+  V8_EXPORT_PRIVATE Tagged<WeakCell> PopClearedCell(
+      Isolate* isolate, bool* key_map_may_need_shrink);
 
-  // Remove the first cleared WeakCell from the cleared_cells
-  // list (assumes there is one) and return its holdings.
-  inline static Object PopClearedCellHoldings(
-      Handle<JSFinalizationGroup> finalization_group, Isolate* isolate);
+  static void ShrinkKeyMap(
+      Isolate* isolate,
+      DirectHandle<JSFinalizationRegistry> finalization_registry);
 
-  // Constructs an iterator for the WeakCells in the cleared_cells list and
-  // calls the user's cleanup function.
-  //
-  // Returns Nothing<bool> if exception occurs, otherwise returns Just(true).
-  static V8_WARN_UNUSED_RESULT Maybe<bool> Cleanup(
-      Isolate* isolate, Handle<JSFinalizationGroup> finalization_group,
-      Handle<Object> callback);
+  // Pop cleared cells and call their finalizers.
+  static Maybe<bool> Cleanup(
+      Isolate* isolate,
+      DirectHandle<JSFinalizationRegistry> finalization_registry);
 
-  // Layout description.
-  DEFINE_FIELD_OFFSET_CONSTANTS(JSObject::kHeaderSize,
-                                TORQUE_GENERATED_JS_FINALIZATION_GROUP_FIELDS)
+  // Remove the already-popped weak_cell from its unregister token linked list,
+  // as well as removing the entry from the key map if it is the only WeakCell
+  // with its unregister token. This method cannot GC and does not shrink the
+  // key map. Asserts that weak_cell has a non-undefined unregister token.
+  V8_EXPORT_PRIVATE void RemoveCellFromUnregisterTokenMap(
+      Isolate* isolate, Tagged<WeakCell> weak_cell);
 
   // Bitfields in flags.
-  using ScheduledForCleanupField = BitField<bool, 0, 1>;
+  using ScheduledForCleanupBit = base::BitField<bool, 0, 1, uint32_t>;
+  enum Flag : uint32_t {
+    kNone = 0,
+    kScheduledForCleanup = ScheduledForCleanupBit::kMask,
+  };
+  using Flags = base::Flags<Flag>;
+  static constexpr int kFlagCount = 1;
 
-  OBJECT_CONSTRUCTORS(JSFinalizationGroup, JSObject);
-};
+  static const int kHeaderSize;
 
-// Internal object for storing weak references in JSFinalizationGroup.
-class WeakCell : public TorqueGeneratedWeakCell<WeakCell, HeapObject> {
  public:
-  DECL_PRINTER(WeakCell)
+  TaggedMember<NativeContext> native_context_;
+  TaggedMember<JSReceiver> cleanup_;
+  TaggedMember<UnionOf<WeakCell, Undefined>> active_cells_;
+  TaggedMember<UnionOf<WeakCell, Undefined>> cleared_cells_;
+  TaggedMember<Object> key_map_;
+  TaggedMember<UnionOf<JSFinalizationRegistry, Undefined>> next_dirty_;
+  TaggedMember<Smi> flags_;
+
+  friend class Heap;
+  friend class TorqueGeneratedJSFinalizationRegistryAsserts;
+} V8_OBJECT_END;
+
+inline constexpr int JSFinalizationRegistry::kHeaderSize =
+    sizeof(JSFinalizationRegistry);
+
+// Internal object for storing weak references in JSFinalizationRegistry.
+V8_OBJECT class WeakCell : public HeapObject {
+ public:
+  inline Tagged<JSFinalizationRegistry> finalization_registry() const;
+  inline void set_finalization_registry(
+      Tagged<JSFinalizationRegistry> value,
+      WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
+
+  inline Tagged<JSAny> holdings() const;
+  inline void set_holdings(Tagged<JSAny> value,
+                           WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
+
+  inline Tagged<UnionOf<Symbol, JSReceiver, Undefined>> target() const;
+
+  inline Tagged<UnionOf<Symbol, JSReceiver, Undefined>> unregister_token()
+      const;
+
+  inline Tagged<UnionOf<WeakCell, Undefined>> prev() const;
+  inline void set_prev(Tagged<UnionOf<WeakCell, Undefined>> value,
+                       WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
+
+  inline Tagged<UnionOf<WeakCell, Undefined>> next() const;
+  inline void set_next(Tagged<UnionOf<WeakCell, Undefined>> value,
+                       WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
+
+  inline Tagged<UnionOf<WeakCell, Undefined>> key_list_prev() const;
+  inline void set_key_list_prev(Tagged<UnionOf<WeakCell, Undefined>> value,
+                                WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
+
+  inline Tagged<UnionOf<WeakCell, Undefined>> key_list_next() const;
+  inline void set_key_list_next(Tagged<UnionOf<WeakCell, Undefined>> value,
+                                WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
+
   EXPORT_DECL_VERIFIER(WeakCell)
+
+  DECL_PRINTER(WeakCell)
 
   class BodyDescriptor;
 
+  // Provide relaxed load access to target field.
+  inline Tagged<HeapObject> relaxed_target() const;
+
+  // Provide relaxed load access to the unregister token field.
+  inline Tagged<HeapObject> relaxed_unregister_token() const;
+
   // Nullify is called during GC and it modifies the pointers in WeakCell and
-  // JSFinalizationGroup. Thus we need to tell the GC about the modified slots
-  // via the gc_notify_updated_slot function. The normal write barrier is not
-  // enough, since it's disabled before GC.
-  inline void Nullify(
-      Isolate* isolate,
-      std::function<void(HeapObject object, ObjectSlot slot, Object target)>
-          gc_notify_updated_slot);
+  // JSFinalizationRegistry. Thus we need to tell the GC about the modified
+  // slots via the gc_notify_updated_slot function. The normal write barrier is
+  // not enough, since it's disabled before GC.
+  template <typename GCNotifyUpdatedSlotCallback>
+  inline void Nullify(Isolate* isolate,
+                      GCNotifyUpdatedSlotCallback gc_notify_updated_slot);
 
-  inline void RemoveFromFinalizationGroupCells(Isolate* isolate);
+  inline void RemoveFromFinalizationRegistryCells(Isolate* isolate);
 
-  TQ_OBJECT_CONSTRUCTORS(WeakCell)
-};
+ private:
+  inline void set_target(Tagged<UnionOf<Symbol, JSReceiver, Undefined>> value,
+                         WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
+  inline void set_unregister_token(
+      Tagged<UnionOf<Symbol, JSReceiver, Undefined>> value,
+      WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
 
-class JSWeakRef : public TorqueGeneratedJSWeakRef<JSWeakRef, JSObject> {
+  TaggedMember<JSFinalizationRegistry> finalization_registry_;
+  TaggedMember<JSAny> holdings_;
+  TaggedMember<UnionOf<Symbol, JSReceiver, Undefined>> target_;
+  TaggedMember<UnionOf<Symbol, JSReceiver, Undefined>> unregister_token_;
+  TaggedMember<UnionOf<WeakCell, Undefined>> prev_;
+  TaggedMember<UnionOf<WeakCell, Undefined>> next_;
+  TaggedMember<UnionOf<WeakCell, Undefined>> key_list_prev_;
+  TaggedMember<UnionOf<WeakCell, Undefined>> key_list_next_;
+
+  friend class JSFinalizationRegistry;
+  friend class MarkCompactCollector;
+  template <typename ConcreteVisitor>
+  friend class MarkingVisitorBase;
+  // `Scavenger and `ScavengerCollector` for accessing `set_target` and
+  // `set_unregister_token` for updating references during GC.
+  friend class Scavenger;
+  friend class ScavengerWeakObjectsProcessor;
+  friend class TorqueGeneratedWeakCellAsserts;
+  friend class V8HeapExplorer;
+} V8_OBJECT_END;
+
+V8_OBJECT class JSWeakRef : public JSObject {
  public:
+  inline Tagged<UnionOf<Symbol, JSReceiver, Undefined>> target() const;
+  inline void set_target(Tagged<UnionOf<Symbol, JSReceiver, Undefined>> value,
+                         WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
+
   DECL_PRINTER(JSWeakRef)
   EXPORT_DECL_VERIFIER(JSWeakRef)
 
   class BodyDescriptor;
 
-  TQ_OBJECT_CONSTRUCTORS(JSWeakRef)
-};
-
-class JSFinalizationGroupCleanupIterator
-    : public TorqueGeneratedJSFinalizationGroupCleanupIterator<
-          JSFinalizationGroupCleanupIterator, JSObject> {
  public:
-  DECL_PRINTER(JSFinalizationGroupCleanupIterator)
-  DECL_VERIFIER(JSFinalizationGroupCleanupIterator)
-
-  TQ_OBJECT_CONSTRUCTORS(JSFinalizationGroupCleanupIterator)
-};
+  TaggedMember<UnionOf<Symbol, JSReceiver, Undefined>> target_;
+} V8_OBJECT_END;
 
 }  // namespace internal
 }  // namespace v8

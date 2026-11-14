@@ -16,7 +16,20 @@ Data types
 
     Loop data type.
 
-.. c:type:: uv_run_mode
+.. c:enum:: uv_loop_option
+
+    Additional loop options.
+    See :c:func:`uv_loop_configure`.
+
+    ::
+
+        typedef enum {
+            UV_LOOP_BLOCK_SIGNAL = 0,
+            UV_METRICS_IDLE_TIME,
+            UV_LOOP_USE_IO_URING_SQPOLL
+        } uv_loop_option;
+
+.. c:enum:: uv_run_mode
 
     Mode used to run the loop with :c:func:`uv_run`.
 
@@ -67,6 +80,18 @@ API
       This operation is currently only implemented for SIGPROF signals,
       to suppress unnecessary wakeups when using a sampling profiler.
       Requesting other signals will fail with UV_EINVAL.
+
+    - UV_METRICS_IDLE_TIME: Accumulate the amount of idle time the event loop
+      spends in the event provider.
+
+      This option is necessary to use :c:func:`uv_metrics_idle_time`.
+
+    - UV_LOOP_USE_IO_URING_SQPOLL: Enable SQPOLL io_uring instance to handle
+      asynchronous file system operations.
+
+    .. versionchanged:: 1.39.0 added the UV_METRICS_IDLE_TIME option.
+
+    .. versionchanged:: 1.49.0 added the UV_LOOP_USE_IO_URING_SQPOLL option.
 
 .. c:function:: int uv_loop_close(uv_loop_t* loop)
 
@@ -231,7 +256,7 @@ API
 
     .. versionadded:: 1.19.0
 
-.. c:function:: void* uv_loop_set_data(uv_loop_t* loop, void* data)
+.. c:function:: void uv_loop_set_data(uv_loop_t* loop, void* data)
 
     Sets `loop->data` to `data`.
 

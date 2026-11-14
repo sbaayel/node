@@ -3,9 +3,11 @@
 // found in the LICENSE file.
 
 // Flags: --wasm-max-mem-pages=49152
+// Save some memory on Linux; other platforms ignore this flag.
+// Flags: --multi-mapped-mock-allocator
 
 // This test makes sure things don't break once we support >2GB wasm memories.
-load("test/mjsunit/wasm/wasm-module-builder.js");
+d8.file.execute("test/mjsunit/wasm/wasm-module-builder.js");
 
 (function testHugeMemory() {
   print(arguments.callee.name);
@@ -13,7 +15,7 @@ load("test/mjsunit/wasm/wasm-module-builder.js");
 
   const num_pages = 49152;  // 3GB
 
-  builder.addMemory(num_pages, num_pages, true);
+  builder.addMemory(num_pages, num_pages);
   builder.addFunction("geti", kSig_i_ii)
     .addBody([
       kExprLocalGet, 0,
@@ -38,7 +40,7 @@ load("test/mjsunit/wasm/wasm-module-builder.js");
 
   const num_pages = 49152;  // 3GB
 
-  builder.addMemory(num_pages, num_pages, true);
+  builder.addMemory(num_pages, num_pages);
   builder.addFunction("geti", kSig_i_v)
     .addBody([
       kExprI32Const, 0x80, 0x80, 0x80, 0x80, 0x7A, // 0xA0000000, 2.5GB
@@ -59,7 +61,7 @@ load("test/mjsunit/wasm/wasm-module-builder.js");
 
   const num_pages = 49152;  // 3GB
 
-  builder.addMemory(num_pages, num_pages, true);
+  builder.addMemory(num_pages, num_pages);
   builder.addFunction("geti", kSig_i_v)
     .addBody([
       kExprI32Const, 0x80, 0x80, 0x80, 0x80, 0x7E, // 0xE0000000, 3.5GB

@@ -4,13 +4,13 @@
 
 #include "src/compiler/backend/register-allocator-verifier.h"
 
+#include <optional>
+
 #include "src/compiler/backend/instruction.h"
 #include "src/utils/bit-vector.h"
 #include "src/utils/ostreams.h"
 
-namespace v8 {
-namespace internal {
-namespace compiler {
+namespace v8::internal::compiler {
 
 namespace {
 
@@ -44,27 +44,42 @@ void VerifyAllocatedGaps(const Instruction* instr, const char* caller_info) {
   }
 }
 
+int GetValue(const ImmediateOperand* imm) {
+  switch (imm->type()) {
+    case ImmediateOperand::INLINE_INT32:
+      return imm->inline_int32_value();
+    case ImmediateOperand::INLINE_INT64:
+      return static_cast<int>(imm->inline_int64_value());
+    case ImmediateOperand::INDEXED_RPO:
+    case ImmediateOperand::INDEXED_IMM:
+      return imm->indexed_value();
+  }
+  UNREACHABLE();
+}
+
 }  // namespace
 
 RegisterAllocatorVerifier::RegisterAllocatorVerifier(
     Zone* zone, const RegisterConfiguration* config,
-    const InstructionSequence* sequence)
+    const InstructionSequence* sequence, const Frame* frame)
     : zone_(zone),
       config_(config),
       sequence_(sequence),
       constraints_(zone),
       assessments_(zone),
-      outstanding_assessments_(zone) {
+      outstanding_assessments_(zone),
+      spill_slot_delta_(frame->GetTotalFrameSlotCount() -
+                        frame->GetSpillSlotCount()) {
   constraints_.reserve(sequence->instructions().size());
   // TODO(dcarney): model unique constraints.
   // Construct OperandConstraints for all InstructionOperands, eliminating
-  // kSameAsFirst along the way.
+  // kSameAsInput along the way.
   for (const Instruction* instr : sequence->instructions()) {
     // All gaps should be totally unallocated at this point.
     VerifyEmptyGaps(instr);
     const size_t operand_count = OperandCount(instr);
     OperandConstraint* op_constraints =
-        zone->NewArray<OperandConstraint>(operand_count);
+        zone->AllocateArray<OperandConstraint>(operand_count);
     size_t count = 0;
     for (size_t i = 0; i < instr->InputCount(); ++i, ++count) {
       BuildConstraint(instr->InputAt(i), &op_constraints[count]);
@@ -76,10 +91,11 @@ RegisterAllocatorVerifier::RegisterAllocatorVerifier(
     }
     for (size_t i = 0; i < instr->OutputCount(); ++i, ++count) {
       BuildConstraint(instr->OutputAt(i), &op_constraints[count]);
-      if (op_constraints[count].type_ == kSameAsFirst) {
-        CHECK_LT(0, instr->InputCount());
-        op_constraints[count].type_ = op_constraints[0].type_;
-        op_constraints[count].value_ = op_constraints[0].value_;
+      if (op_constraints[count].type_ == kSameAsInput) {
+        int input_index = op_constraints[count].value_;
+        CHECK_LT(input_index, instr->InputCount());
+        op_constraints[count].type_ = op_constraints[input_index].type_;
+        op_constraints[count].value_ = op_constraints[input_index].value_;
       }
       VerifyOutput(op_constraints[count]);
     }
@@ -91,7 +107,7 @@ RegisterAllocatorVerifier::RegisterAllocatorVerifier(
 
 void RegisterAllocatorVerifier::VerifyInput(
     const OperandConstraint& constraint) {
-  CHECK_NE(kSameAsFirst, constraint.type_);
+  CHECK_NE(kSameAsInput, constraint.type_);
   if (constraint.type_ != kImmediate) {
     CHECK_NE(InstructionOperand::kInvalidVirtualRegister,
              constraint.virtual_register_);
@@ -100,7 +116,7 @@ void RegisterAllocatorVerifier::VerifyInput(
 
 void RegisterAllocatorVerifier::VerifyTemp(
     const OperandConstraint& constraint) {
-  CHECK_NE(kSameAsFirst, constraint.type_);
+  CHECK_NE(kSameAsInput, constraint.type_);
   CHECK_NE(kImmediate, constraint.type_);
   CHECK_NE(kConstant, constraint.type_);
 }
@@ -149,10 +165,8 @@ void RegisterAllocatorVerifier::BuildConstraint(const InstructionOperand* op,
     constraint->virtual_register_ = constraint->value_;
   } else if (op->IsImmediate()) {
     const ImmediateOperand* imm = ImmediateOperand::cast(op);
-    int value = imm->type() == ImmediateOperand::INLINE ? imm->inline_value()
-                                                        : imm->indexed_value();
     constraint->type_ = kImmediate;
-    constraint->value_ = value;
+    constraint->value_ = GetValue(imm);
   } else {
     CHECK(op->IsUnallocated());
     const UnallocatedOperand* unallocated = UnallocatedOperand::cast(op);
@@ -200,8 +214,9 @@ void RegisterAllocatorVerifier::BuildConstraint(const InstructionOperand* op,
           constraint->value_ =
               ElementSizeLog2Of(sequence()->GetRepresentation(vreg));
           break;
-        case UnallocatedOperand::SAME_AS_FIRST_INPUT:
-          constraint->type_ = kSameAsFirst;
+        case UnallocatedOperand::SAME_AS_INPUT:
+          constraint->type_ = kSameAsInput;
+          constraint->value_ = unallocated->input_index();
           break;
       }
     }
@@ -219,9 +234,7 @@ void RegisterAllocatorVerifier::CheckConstraint(
     case kImmediate: {
       CHECK_WITH_MSG(op->IsImmediate(), caller_info_);
       const ImmediateOperand* imm = ImmediateOperand::cast(op);
-      int value = imm->type() == ImmediateOperand::INLINE
-                      ? imm->inline_value()
-                      : imm->indexed_value();
+      int value = GetValue(imm);
       CHECK_EQ(value, constraint->value_);
       return;
     }
@@ -259,10 +272,11 @@ void RegisterAllocatorVerifier::CheckConstraint(
       CHECK_WITH_MSG(op->IsRegister() || op->IsStackSlot() || op->IsConstant(),
                      caller_info_);
       return;
-    case kSameAsFirst:
+    case kSameAsInput:
       CHECK_WITH_MSG(false, caller_info_);
       return;
   }
+  UNREACHABLE();
 }
 
 void BlockAssessments::PerformMoves(const Instruction* instruction) {
@@ -286,11 +300,20 @@ void BlockAssessments::PerformParallelMoves(const ParallelMove* moves) {
     // The LHS of a parallel move should not have been assigned in this
     // parallel move.
     CHECK(map_for_moves_.find(move->destination()) == map_for_moves_.end());
+    // The RHS of a parallel move should not be a stale reference.
+    CHECK(!IsStaleReferenceStackSlot(move->source()));
     // Copy the assessment to the destination.
     map_for_moves_[move->destination()] = it->second;
   }
   for (auto pair : map_for_moves_) {
-    map_[pair.first] = pair.second;
+    // Re-insert the existing key for the new assignment so that it has the
+    // correct representation (which is ignored by the canonicalizing map
+    // comparator).
+    InstructionOperand op = pair.first;
+    map_.erase(op);
+    map_.insert(pair);
+    // Destination is no longer a stale reference.
+    stale_ref_stack_slots().erase(op);
   }
   map_for_moves_.clear();
 }
@@ -304,9 +327,46 @@ void BlockAssessments::DropRegisters() {
   }
 }
 
+void BlockAssessments::CheckReferenceMap(const ReferenceMap* reference_map) {
+  // First mark all existing reference stack spill slots as stale.
+  for (auto pair : map()) {
+    InstructionOperand op = pair.first;
+    if (op.IsStackSlot()) {
+      const LocationOperand* loc_op = LocationOperand::cast(&op);
+      // Only mark arguments that are spill slots as stale, the reference map
+      // doesn't track arguments or fixed stack slots, which are implicitly
+      // tracked by the GC.
+      if (CanBeTaggedOrCompressedPointer(loc_op->representation()) &&
+          loc_op->index() >= spill_slot_delta()) {
+        stale_ref_stack_slots().insert(op);
+      }
+    }
+  }
+
+  // Now remove any stack spill slots in the reference map from the list of
+  // stale slots.
+  for (auto ref_map_operand : reference_map->reference_operands()) {
+    if (ref_map_operand.IsStackSlot()) {
+      auto pair = map().find(ref_map_operand);
+      CHECK(pair != map().end());
+      stale_ref_stack_slots().erase(pair->first);
+    }
+  }
+}
+
+bool BlockAssessments::IsStaleReferenceStackSlot(InstructionOperand op,
+                                                 std::optional<int> vreg) {
+  if (!op.IsStackSlot()) return false;
+  if (vreg.has_value() && !sequence_->IsReference(*vreg)) return false;
+
+  const LocationOperand* loc_op = LocationOperand::cast(&op);
+  return CanBeTaggedOrCompressedPointer(loc_op->representation()) &&
+         stale_ref_stack_slots().find(op) != stale_ref_stack_slots().end();
+}
+
 void BlockAssessments::Print() const {
   StdoutStream os;
-  for (const auto pair : map()) {
+  for (const auto& pair : map()) {
     const InstructionOperand op = pair.first;
     const Assessment* assessment = pair.second;
     // Use operator<< so we can write the assessment on the same
@@ -317,6 +377,9 @@ void BlockAssessments::Print() const {
     } else {
       os << "P";
     }
+    if (stale_ref_stack_slots().find(op) != stale_ref_stack_slots().end()) {
+      os << " (stale reference)";
+    }
     os << std::endl;
   }
   os << std::endl;
@@ -326,7 +389,8 @@ BlockAssessments* RegisterAllocatorVerifier::CreateForBlock(
     const InstructionBlock* block) {
   RpoNumber current_block_id = block->rpo_number();
 
-  BlockAssessments* ret = new (zone()) BlockAssessments(zone());
+  BlockAssessments* ret =
+      zone()->New<BlockAssessments>(zone(), spill_slot_delta(), sequence_);
   if (block->PredecessorCount() == 0) {
     // TODO(mtrofin): the following check should hold, however, in certain
     // unit tests it is invalidated by the last block. Investigate and
@@ -334,7 +398,7 @@ BlockAssessments* RegisterAllocatorVerifier::CreateForBlock(
     // CHECK_EQ(0, current_block_id.ToInt());
     // The phi size test below is because we can, technically, have phi
     // instructions with one argument. Some tests expose that, too.
-  } else if (block->PredecessorCount() == 1 && block->phis().size() == 0) {
+  } else if (block->PredecessorCount() == 1 && block->phis().empty()) {
     const BlockAssessments* prev_block = assessments_[block->predecessors()[0]];
     ret->CopyFrom(prev_block);
   } else {
@@ -357,14 +421,21 @@ BlockAssessments* RegisterAllocatorVerifier::CreateForBlock(
         InstructionOperand operand = pair.first;
         if (ret->map().find(operand) == ret->map().end()) {
           ret->map().insert(std::make_pair(
-              operand, new (zone()) PendingAssessment(zone(), block, operand)));
+              operand, zone()->New<PendingAssessment>(zone(), block, operand)));
         }
       }
+
+      // Any references stack slots that became stale in predecessors will be
+      // stale here.
+      ret->stale_ref_stack_slots().insert(
+          pred_assessments->stale_ref_stack_slots().begin(),
+          pred_assessments->stale_ref_stack_slots().end());
     }
   }
   return ret;
 }
 
+V8_CLANG_NO_SANITIZE("coverage")
 void RegisterAllocatorVerifier::ValidatePendingAssessment(
     RpoNumber block_id, InstructionOperand op,
     const BlockAssessments* current_assessments,
@@ -389,7 +460,7 @@ void RegisterAllocatorVerifier::ValidatePendingAssessment(
     worklist.pop();
 
     const InstructionBlock* origin = current_assessment->origin();
-    CHECK(origin->PredecessorCount() > 1 || origin->phis().size() > 0);
+    CHECK(origin->PredecessorCount() > 1 || !origin->phis().empty());
 
     // Check if the virtual register is a phi first, instead of relying on
     // the incoming assessments. In particular, this handles the case
@@ -413,13 +484,10 @@ void RegisterAllocatorVerifier::ValidatePendingAssessment(
       auto pred_assignment = assessments_.find(pred);
       if (pred_assignment == assessments_.end()) {
         CHECK(origin->IsLoopHeader());
-        auto todo_iter = outstanding_assessments_.find(pred);
-        DelayedAssessments* set = nullptr;
-        if (todo_iter == outstanding_assessments_.end()) {
-          set = new (zone()) DelayedAssessments(zone());
-          outstanding_assessments_.insert(std::make_pair(pred, set));
-        } else {
-          set = todo_iter->second;
+        auto [todo_iter, inserted] = outstanding_assessments_.try_emplace(pred);
+        DelayedAssessments*& set = todo_iter->second;
+        if (inserted) {
+          set = zone()->New<DelayedAssessments>(zone());
         }
         set->AddDelayedAssessment(current_operand, expected);
         continue;
@@ -439,9 +507,9 @@ void RegisterAllocatorVerifier::ValidatePendingAssessment(
           // This happens if we have a diamond feeding into another one, and
           // the inner one never being used - other than for carrying the value.
           const PendingAssessment* next = PendingAssessment::cast(contribution);
-          if (seen.find(pred) == seen.end()) {
+          auto [it, inserted] = seen.insert(pred);
+          if (inserted) {
             worklist.push({next, expected});
-            seen.insert(pred);
           }
           // Note that we do not want to finalize pending assessments at the
           // beginning of a block - which is the information we'd have
@@ -455,6 +523,7 @@ void RegisterAllocatorVerifier::ValidatePendingAssessment(
   assessment->AddAlias(virtual_register);
 }
 
+V8_CLANG_NO_SANITIZE("coverage")
 void RegisterAllocatorVerifier::ValidateUse(
     RpoNumber block_id, BlockAssessments* current_assessments,
     InstructionOperand op, int virtual_register) {
@@ -462,6 +531,9 @@ void RegisterAllocatorVerifier::ValidateUse(
   // We should have seen this operand before.
   CHECK(iterator != current_assessments->map().end());
   Assessment* assessment = iterator->second;
+
+  // The operand shouldn't be a stale reference stack slot.
+  CHECK(!current_assessments->IsStaleReferenceStackSlot(op, virtual_register));
 
   switch (assessment->kind()) {
     case Final:
@@ -477,6 +549,10 @@ void RegisterAllocatorVerifier::ValidateUse(
   }
 }
 
+// Disable coverage tracing for `VerifyGapMoves` and methods called from this.
+// This speeds up many large fuzzer test cases, and coverage of these
+// verification methods is not helpful for covering the code better.
+V8_CLANG_NO_SANITIZE("coverage")
 void RegisterAllocatorVerifier::VerifyGapMoves() {
   CHECK(assessments_.empty());
   CHECK(outstanding_assessments_.empty());
@@ -510,6 +586,9 @@ void RegisterAllocatorVerifier::VerifyGapMoves() {
       if (instr->IsCall()) {
         block_assessments->DropRegisters();
       }
+      if (instr->HasReferenceMap()) {
+        block_assessments->CheckReferenceMap(instr->reference_map());
+      }
       for (size_t i = 0; i < instr->OutputCount(); ++i, ++count) {
         int virtual_register = op_constraints[count].virtual_register_;
         block_assessments->AddDefinition(*instr->OutputAt(i), virtual_register);
@@ -536,6 +615,9 @@ void RegisterAllocatorVerifier::VerifyGapMoves() {
       int vreg = pair.second;
       auto found_op = block_assessments->map().find(op);
       CHECK(found_op != block_assessments->map().end());
+      // This block is a jump back to the loop header, ensure that the op hasn't
+      // become a stale reference during the blocks in the loop.
+      CHECK(!block_assessments->IsStaleReferenceStackSlot(op, vreg));
       switch (found_op->second->kind()) {
         case Final:
           CHECK_EQ(FinalAssessment::cast(found_op->second)->virtual_register(),
@@ -551,6 +633,4 @@ void RegisterAllocatorVerifier::VerifyGapMoves() {
   }
 }
 
-}  // namespace compiler
-}  // namespace internal
-}  // namespace v8
+}  // namespace v8::internal::compiler

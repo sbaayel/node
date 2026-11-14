@@ -10,6 +10,9 @@
     foreach $define (@{$target{defines}}) {
       $OUT .= "      '$define',\n";
     }
+    foreach $define (@{lib_defines}) {
+      $OUT .= "      '$define',\n";
+    }
     foreach $define (@{$config{lib_defines}}) {
   $OUT .= "      '$define',\n";
 } -%%    ],
@@ -22,8 +25,12 @@
     ],
     'openssl_cli_srcs_%%-$arch-%%': [
 %%- foreach $src (@apps_openssl_srcs) {
-  unless ($src eq "apps/openssl.rc") {
-    $OUT .= "      'openssl/$src',\n";
+  if ($src eq 'apps/progs.c') {
+    $OUT .= "      './config/archs/$arch/$asm/$src',\n";
+  } else {
+    unless ($src eq "apps/openssl.rc") {
+      $OUT .= "      'openssl/$src',\n";
+    }
   }
 }
 foreach $src (@libapps_srcs) {
@@ -33,6 +40,7 @@ foreach $src (@libapps_srcs) {
   'defines': ['<@(openssl_defines_%%-$arch-%%)'],
   'include_dirs': [
     './include',
+    './apps/include',
   ],
 %%- if (!$is_win) {
   $OUT = "  'cflags' : ['<@(openssl_cflags_$arch)'],

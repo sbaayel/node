@@ -17,11 +17,14 @@ async function runTest() {
   const oldStyleSession = await child.connectInspectorSession();
   await oldStyleSession.send([
     { method: 'Runtime.enable' }]);
+  await session.send({ method: 'NodeRuntime.enable' });
+  await session.waitForNotification('NodeRuntime.waitingForDebugger');
   await session.send([
     { method: 'Runtime.enable' },
     { method: 'NodeRuntime.notifyWhenWaitingForDisconnect',
       params: { enabled: true } },
     { method: 'Runtime.runIfWaitingForDebugger' }]);
+  await session.send({ method: 'NodeRuntime.disable' });
   await session.waitForNotification((notification) => {
     return notification.method === 'NodeRuntime.waitingForDisconnect';
   });
@@ -41,4 +44,4 @@ async function runTest() {
   assert.strictEqual((await child.expectShutdown()).exitCode, 55);
 }
 
-runTest();
+runTest().then(common.mustCall());

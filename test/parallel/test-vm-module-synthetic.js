@@ -2,7 +2,7 @@
 
 // Flags: --experimental-vm-modules
 
-require('../common');
+const common = require('../common');
 const { SyntheticModule, SourceTextModule } = require('vm');
 const assert = require('assert');
 
@@ -26,6 +26,17 @@ const assert = require('assert');
     assert.strictEqual(m.namespace.getX(), 42);
   }
 
+  {
+    const s = new SyntheticModule([], () => {
+      const p = Promise.reject();
+      p.catch(() => {});
+      return p;
+    });
+
+    await s.link(common.mustNotCall());
+    assert.strictEqual(await s.evaluate(), undefined);
+  }
+
   for (const invalidName of [1, Symbol.iterator, {}, [], null, true, 0]) {
     const s = new SyntheticModule([], () => {});
     await s.link(() => {});
@@ -47,11 +58,16 @@ const assert = require('assert');
   }
 
   {
-    const s = new SyntheticModule([], () => {});
-    assert.throws(() => {
-      s.setExport('name', 'value');
-    }, {
-      code: 'ERR_VM_MODULE_STATUS',
-    });
+    const s = new SyntheticModule(['name'], () => {});
+    // Exports of SyntheticModule can be immediately set after creation.
+    // No link is required.
+    s.setExport('name', 'value');
   }
-})();
+
+  for (const value of [null, {}, SyntheticModule.prototype]) {
+    assert.throws(() => {
+      SyntheticModule.prototype.setExport.call(value, 'foo');
+    }, { code: 'ERR_INVALID_THIS' });
+  }
+
+})().then(common.mustCall());

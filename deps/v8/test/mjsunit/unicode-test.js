@@ -5903,7 +5903,7 @@ var source =
 "    assert(prev_inuse(p));\n" +
 "    assert (next == av->top || inuse(next));\n" +
 "\n" +
-"    /* ... and has minimally sane links */\n" +
+"    /* ... and has minimally sensible links */\n" +
 "    assert(p->fd->bk == p);\n" +
 "    assert(p->bk->fd == p);\n" +
 "  }\n" +
@@ -5995,7 +5995,7 @@ var source =
 "    always true of any allocated chunk; i.e., that each allocated\n" +
 "    chunk borders either a previously allocated and still in-use\n" +
 "    chunk, or the base of its memory arena. This is ensured\n" +
-"    by making all allocations from the the `lowest' part of any found\n" +
+"    by making all allocations from the `lowest' part of any found\n" +
 "    chunk.  This does not necessarily hold however for chunks\n" +
 "    recycled via fastbins.\n" +
 "  */\n" +

@@ -10,6 +10,11 @@
 namespace v8 {
 namespace internal {
 
+namespace regexp {
+class BytecodeGenerator;
+class BytecodeWriter;
+}  // namespace regexp
+
 // -----------------------------------------------------------------------------
 // Labels represent pc locations; they are typically jump or call targets.
 // After declaration, a label can be freely used to denote known or (yet)
@@ -24,6 +29,11 @@ class Label {
   };
 
   Label() = default;
+
+  // Disallow copy construction and assignment, but allow move construction and
+  // move assignment on selected platforms (see below).
+  Label(const Label&) = delete;
+  Label& operator=(const Label&) = delete;
 
 // On ARM64, the Assembler keeps track of pointers to Labels to resolve
 // branches to distant targets. Copying labels would confuse the Assembler.
@@ -99,11 +109,8 @@ class Label {
 
   friend class Assembler;
   friend class Displacement;
-  friend class RegExpBytecodeGenerator;
-
-  // Disallow copy construction and assignment, but allow move construction and
-  // move assignment on selected platforms (see above).
-  DISALLOW_COPY_AND_ASSIGN(Label);
+  friend class regexp::BytecodeGenerator;
+  friend class regexp::BytecodeWriter;
 };
 
 }  // namespace internal

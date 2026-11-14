@@ -11,12 +11,12 @@
 #if defined(USE_SIMULATOR)
 
 #include <stdarg.h>
+
 #include <vector>
 
 #include "src/base/compiler-specific.h"
 #include "src/codegen/arm64/assembler-arm64.h"
 #include "src/codegen/arm64/decoder-arm64.h"
-#include "src/codegen/arm64/instrument-arm64.h"
 #include "src/codegen/assembler.h"
 #include "src/diagnostics/arm64/disasm-arm64.h"
 #include "src/execution/simulator-base.h"
@@ -48,8 +48,7 @@ T FPRound(int64_t sign, int64_t exponent, uint64_t mantissa,
                 "destination type T not large enough");
   static_assert(sizeof(T) <= sizeof(uint64_t),
                 "maximum size of destination type T is 64 bits");
-  static_assert(std::is_unsigned<T>::value,
-                "destination type T must be unsigned");
+  static_assert(std::is_unsigned_v<T>, "destination type T must be unsigned");
 
   DCHECK((sign == 0) || (sign == 1));
 
@@ -235,31 +234,28 @@ class CachePage {
 // Representation of memory, with typed getters and setters for access.
 class SimMemory {
  public:
-  template <typename T>
-  static T AddressUntag(T address) {
-    // Cast the address using a C-style cast. A reinterpret_cast would be
-    // appropriate, but it can't cast one integral type to another.
-    uint64_t bits = (uint64_t)address;
-    return (T)(bits & ~kAddressTagMask);
+  template <typename A>
+  static A AddressUntag(A address) {
+    if (!v8_flags.sim_arm64_tbi) return address;
+    uint64_t bits = base::bit_cast<uint64_t>(address);
+    return base::bit_cast<A>(bits & ~kAddressTagMask);
   }
 
   template <typename T, typename A>
+    requires(sizeof(T) == 1 || sizeof(T) == 2 || sizeof(T) == 4 ||
+             sizeof(T) == 8 || sizeof(T) == 16)
   static T Read(A address) {
     T value;
     address = AddressUntag(address);
-    DCHECK((sizeof(value) == 1) || (sizeof(value) == 2) ||
-           (sizeof(value) == 4) || (sizeof(value) == 8) ||
-           (sizeof(value) == 16));
     memcpy(&value, reinterpret_cast<const char*>(address), sizeof(value));
     return value;
   }
 
   template <typename T, typename A>
+    requires(sizeof(T) == 1 || sizeof(T) == 2 || sizeof(T) == 4 ||
+             sizeof(T) == 8 || sizeof(T) == 16)
   static void Write(A address, T value) {
     address = AddressUntag(address);
-    DCHECK((sizeof(value) == 1) || (sizeof(value) == 2) ||
-           (sizeof(value) == 4) || (sizeof(value) == 8) ||
-           (sizeof(value) == 16));
     memcpy(reinterpret_cast<char*>(address), &value, sizeof(value));
   }
 };
@@ -371,6 +367,8 @@ class SimRegisterBase {
 
 using SimRegister = SimRegisterBase<kXRegSize>;   // r0-r31
 using SimVRegister = SimRegisterBase<kQRegSize>;  // v0-v31
+
+using sim_uint128_t = std::pair<uint64_t, uint64_t>;
 
 // Representation of a vector register, with typed getters and setters for lanes
 // and additional information to represent lane state.
@@ -486,6 +484,16 @@ class LogicVRegister {
         UNREACHABLE();
         return;
     }
+  }
+
+  void SetUint(VectorFormat vform, int index, sim_uint128_t value) const {
+    if (LaneSizeInBitsFromFormat(vform) <= 64) {
+      SetUint(vform, index, value.second);
+      return;
+    }
+    DCHECK((vform == kFormat1Q) && (index == 0));
+    SetUint(kFormat2D, 0, value.second);
+    SetUint(kFormat2D, 1, value.first);
   }
 
   void SetUintArray(VectorFormat vform, const uint64_t* src) const {
@@ -629,6 +637,8 @@ class LogicVRegister {
     return *this;
   }
 
+  bool Is(const LogicVRegister& r) const { return &register_ == &r.register_; }
+
  private:
   SimVRegister& register_;
 
@@ -684,9 +694,6 @@ class Simulator : public DecoderVisitor, public SimulatorBase {
     }
 
     explicit CallArgument(float argument) {
-      // TODO(all): CallArgument(float) is untested, remove this check once
-      //            tested.
-      UNIMPLEMENTED();
       // Make the D register a NaN to try to trap errors if the callee expects a
       // double. If it expects a float, the callee should ignore the top word.
       DCHECK(sizeof(kFP64SignallingNaN) == sizeof(bits_));
@@ -729,18 +736,32 @@ class Simulator : public DecoderVisitor, public SimulatorBase {
   // Start the debugging command line.
   void Debug();
 
+  // Executes a single debug command. Takes ownership of the command (so that it
+  // can store it for repeat executions), and returns true if the debugger
+  // should resume execution after this command completes.
+  bool ExecDebugCommand(ArrayUniquePtr<char> command);
+
   bool GetValue(const char* desc, int64_t* value);
 
   bool PrintValue(const char* desc);
 
   // Push an address onto the JS stack.
-  uintptr_t PushAddress(uintptr_t address);
+  V8_EXPORT_PRIVATE uintptr_t PushAddress(uintptr_t address);
 
   // Pop an address from the JS stack.
-  uintptr_t PopAddress();
+  V8_EXPORT_PRIVATE uintptr_t PopAddress();
 
-  // Accessor to the internal simulator stack area.
+  // Accessor to the internal simulator stack area. Adds a safety
+  // margin to prevent overflows (kAdditionalStackMargin).
   uintptr_t StackLimit(uintptr_t c_limit) const;
+  uintptr_t StackBase() const;
+  void SetStackLimit(uintptr_t limit);
+  // Return central stack view, without additional safety margins.
+  // Users, for example wasm::StackMemory, can add their own.
+  base::Vector<uint8_t> GetCentralStackView() const;
+  static constexpr int JSStackLimitMargin() { return kAdditionalStackMargin; }
+
+  void IterateRegistersAndStack(::heap::base::StackVisitor* visitor);
 
   V8_EXPORT_PRIVATE void ResetState();
 
@@ -755,11 +776,12 @@ class Simulator : public DecoderVisitor, public SimulatorBase {
   // Simulation helpers.
   template <typename T>
   void set_pc(T new_pc) {
-    DCHECK(sizeof(T) == sizeof(pc_));
+    static_assert(sizeof(T) == sizeof(pc_));
     memcpy(&pc_, &new_pc, sizeof(T));
     pc_modified_ = true;
   }
   Instruction* pc() { return pc_; }
+  Instruction* last_instr() { return last_instr_; }
 
   void increment_pc() {
     if (!pc_modified_) {
@@ -771,10 +793,188 @@ class Simulator : public DecoderVisitor, public SimulatorBase {
 
   virtual void Decode(Instruction* instr) { decoder_->Decode(instr); }
 
+  // Branch Target Identification (BTI)
+  //
+  // Executing an instruction updates PSTATE.BTYPE, as described in the table
+  // below. Execution of an instruction on a guarded page is allowed if either:
+  // * PSTATE.BTYPE is 00, or
+  // * it is a BTI or PACI[AB]SP instruction that accepts the current value of
+  //   PSTATE.BTYPE (as described in the table below), or
+  // * it is BRK or HLT instruction that causes some higher-priority exception.
+  //
+  //  --------------------------------------------------------------------------
+  //  | Last-executed instruction    | Sets     | Accepted by                  |
+  //  |                              | BTYPE to | BTI | BTI j | BTI c | BTI jc |
+  //  --------------------------------------------------------------------------
+  //  | - BR from an unguarded page. |          |     |       |       |        |
+  //  | - BR from guarded page,      |          |     |       |       |        |
+  //  |   to x16 or x17.             |    01    |     |   X   |   X   |   X    |
+  //  --------------------------------------------------------------------------
+  //  | BR from guarded page,        |          |     |       |       |        |
+  //  | not to x16 or x17.           |    11    |     |   X   |       |   X    |
+  //  --------------------------------------------------------------------------
+  //  | BLR                          |    10    |     |       |   X   |   X    |
+  //  --------------------------------------------------------------------------
+  //  | Any other instruction        |          |     |       |       |        |
+  //  |(including RET).              |    00    |  X  |   X   |   X   |   X    |
+  //  --------------------------------------------------------------------------
+  //
+  // PACI[AB]SP is treated either like "BTI c" or "BTI jc", according to the
+  // value of SCTLR_EL1.BT0. Details available in ARM DDI 0487E.a, D5-2580.
+
+  enum BType {
+    // Set when executing any instruction, except those cases listed below.
+    DefaultBType = 0,
+
+    // Set when an indirect branch is taken from an unguarded page, or from a
+    // guarded page to ip0 or ip1 (x16 or x17), eg "br ip0".
+    BranchFromUnguardedOrToIP = 1,
+
+    // Set when an indirect branch and link (call) is taken, eg. "blr x0".
+    BranchAndLink = 2,
+
+    // Set when an indirect branch is taken from a guarded page to a register
+    // that is not ip0 or ip1 (x16 or x17), eg, "br x0".
+    BranchFromGuardedNotToIP = 3
+  };
+
+  BType btype() const { return btype_; }
+  void ResetBType() { btype_ = DefaultBType; }
+  void set_btype(BType btype) { btype_ = btype; }
+
+  // Helper function to determine BType for branches.
+  BType GetBTypeFromInstruction(const Instruction* instr) const;
+
+  bool PcIsInGuardedPage() const { return guard_pages_; }
+  void SetGuardedPages(bool guard_pages) { guard_pages_ = guard_pages; }
+
+  void CheckBTypeForPAuth() {
+    DCHECK(pc_->IsPAuth());
+    Instr instr = pc_->Mask(SystemPAuthMask);
+    // Only PACI[AB]SP allowed here, and we only support PACIBSP.
+    CHECK(instr == PACIBSP);
+    // Check BType allows PACI[AB]SP instructions.
+    switch (btype()) {
+      case BranchFromGuardedNotToIP:
+        // This case depends on the value of SCTLR_EL1.BT0, which we assume
+        // here to be set. This makes PACI[AB]SP behave like "BTI c",
+        // disallowing its execution when BTYPE is BranchFromGuardedNotToIP
+        // (0b11).
+        FATAL("Executing PACIBSP with wrong BType.");
+      case BranchFromUnguardedOrToIP:
+      case BranchAndLink:
+        break;
+      case DefaultBType:
+        UNREACHABLE();
+    }
+  }
+
+  void CheckBTypeForBti() {
+    DCHECK(pc_->IsBti());
+    switch (pc_->ImmHint()) {
+      case BTI_jc:
+        break;
+      case BTI: {
+        DCHECK(btype() != DefaultBType);
+        FATAL("Executing BTI with wrong BType (expected 0, got %d).", btype());
+        break;
+      }
+      case BTI_c:
+        if (btype() == BranchFromGuardedNotToIP) {
+          FATAL("Executing BTI c with wrong BType (3).");
+        }
+        break;
+      case BTI_j:
+        if (btype() == BranchAndLink) {
+          FATAL("Executing BTI j with wrong BType (2).");
+        }
+        break;
+      default:
+        UNIMPLEMENTED();
+    }
+  }
+
+  void CheckBType() {
+    // On guarded pages, if BType is not zero, take an exception on any
+    // instruction other than BTI, PACI[AB]SP, HLT or BRK.
+    if (PcIsInGuardedPage() && (btype() != DefaultBType)) {
+      if (pc_->IsPAuth()) {
+        CheckBTypeForPAuth();
+      } else if (pc_->IsBti()) {
+        CheckBTypeForBti();
+      } else if (!pc_->IsException()) {
+        FATAL("Executing non-BTI instruction with wrong BType.");
+      }
+    }
+  }
+
+  // MOPS
+  void VisitCpyP(Instruction* instr);
+  void VisitCpyM(Instruction* instr);
+  void VisitCpyE(Instruction* instr);
+  void VisitSetP(Instruction* instr);
+  void VisitSetM(Instruction* instr);
+  void VisitSetE(Instruction* instr);
+  template <Instruction::MemOp mem_op>
+  void MOPSPHelper(Instruction* instr) {
+    DCHECK(instr->IsConsistentMOPSTriplet<mem_op>());
+
+    int d = instr->Rd();
+    int n = instr->Rn();
+    int s = instr->Rs();
+
+    // Aliased registers and xzr are disallowed for Xd and Xn.
+    if ((d == n) || (d == s) || (n == s) || (d == 31) || (n == 31)) {
+      VisitUnallocated(instr);
+    }
+
+    // Additionally, Xs may not be xzr for cpy.
+    if (mem_op == Instruction::MemOp::kCPY && s == 31) {
+      VisitUnallocated(instr);
+    }
+
+    // Bits 31 and 30 must be zero.
+    if (instr->Bits(31, 30) != 0) {
+      VisitUnallocated(instr);
+    }
+
+    // Saturate copy count.
+    uint64_t xn = xreg(n);
+    constexpr int saturation_bits =
+        mem_op == Instruction::MemOp::kCPY ? 55 : 63;
+    if ((xn >> saturation_bits) != 0) {
+      xn = (UINT64_C(1) << saturation_bits) - 1;
+      set_xreg(n, xn);
+    }
+
+    nzcv().SetN(0);
+    nzcv().SetZ(0);
+    nzcv().SetC(1);  // Indicates "option B" implementation.
+    nzcv().SetV(0);
+  }
+
   void ExecuteInstruction() {
     DCHECK(IsAligned(reinterpret_cast<uintptr_t>(pc_), kInstrSize));
+#ifdef V8_USE_ADDRESS_SANITIZER
+    if (V8_ENABLE_SANDBOX_BOOL) {
+      uintptr_t current_pc = reinterpret_cast<uintptr_t>(pc_);
+      // Check if PC falls into non-canonical address range or kernel range.
+      if (current_pc >= 0x1'0000'0000'0000ULL) [[unlikely]] {
+        // Trigger SEGFAULT by accessing memory exactly at PC address.
+        // This is necessary because regular access to current instruction
+        // below would trigger SEGFAULT at corresponding ASan's shadow memory
+        // address which might produce false positive "sandbox violation"
+        // report if the shadow memory address falls into canonical address
+        // range.
+        NoSanitizeProbeMemory(current_pc);
+      }
+    }
+#endif  // V8_USE_ADDRESS_SANITIZER
+    CheckBType();
+    ResetBType();
     CheckBreakNext();
     Decode(pc_);
+    last_instr_ = pc_;
     increment_pc();
     LogAllWrittenRegisters();
     CheckBreakpoints();
@@ -784,6 +984,8 @@ class Simulator : public DecoderVisitor, public SimulatorBase {
 #define DECLARE(A) void Visit##A(Instruction* instr);
   VISITOR_LIST(DECLARE)
 #undef DECLARE
+  void VisitNEON3SameFP(NEON3SameOp op, VectorFormat vf, SimVRegister& rd,
+                        SimVRegister& rn, SimVRegister& rm);
 
   bool IsZeroRegister(unsigned code, Reg31Mode r31mode) const {
     return ((code == 31) && (r31mode == Reg31IsZeroRegister));
@@ -991,7 +1193,7 @@ class Simulator : public DecoderVisitor, public SimulatorBase {
   // As above, but don't automatically log the register update.
   template <typename T>
   void set_vreg_no_log(unsigned code, T value) {
-    STATIC_ASSERT((sizeof(value) == kBRegSize) ||
+    static_assert((sizeof(value) == kBRegSize) ||
                   (sizeof(value) == kHRegSize) ||
                   (sizeof(value) == kSRegSize) ||
                   (sizeof(value) == kDRegSize) || (sizeof(value) == kQRegSize));
@@ -1281,7 +1483,7 @@ class Simulator : public DecoderVisitor, public SimulatorBase {
     int number;
   };
 
-  static const PACKey kPACKeyIA;
+  static V8_EXPORT_PRIVATE const PACKey kPACKeyIB;
 
   // Current implementation is that all pointers are tagged.
   static bool HasTBI(uint64_t ptr, PointerType type) {
@@ -1304,13 +1506,16 @@ class Simulator : public DecoderVisitor, public SimulatorBase {
   }
 
   // Armv8.3 Pointer authentication helpers.
-  static uint64_t CalculatePACMask(uint64_t ptr, PointerType type, int ext_bit);
-  static uint64_t ComputePAC(uint64_t data, uint64_t context, PACKey key);
-  static uint64_t AuthPAC(uint64_t ptr, uint64_t context, PACKey key,
-                          PointerType type);
-  static uint64_t AddPAC(uint64_t ptr, uint64_t context, PACKey key,
-                         PointerType type);
-  static uint64_t StripPAC(uint64_t ptr, PointerType type);
+  V8_EXPORT_PRIVATE static uint64_t CalculatePACMask(uint64_t ptr,
+                                                     PointerType type,
+                                                     int ext_bit);
+  V8_EXPORT_PRIVATE static uint64_t ComputePAC(uint64_t data, uint64_t context,
+                                               PACKey key);
+  V8_EXPORT_PRIVATE static uint64_t AuthPAC(uint64_t ptr, uint64_t context,
+                                            PACKey key, PointerType type);
+  V8_EXPORT_PRIVATE static uint64_t AddPAC(uint64_t ptr, uint64_t context,
+                                           PACKey key, PointerType type);
+  V8_EXPORT_PRIVATE static uint64_t StripPAC(uint64_t ptr, PointerType type);
 
  protected:
   // Simulation helpers ------------------------------------
@@ -1367,6 +1572,14 @@ class Simulator : public DecoderVisitor, public SimulatorBase {
   void ConditionalCompareHelper(Instruction* instr, T op2);
   void LoadStoreHelper(Instruction* instr, int64_t offset, AddrMode addrmode);
   void LoadStorePairHelper(Instruction* instr, AddrMode addrmode);
+  template <typename T>
+  void CompareAndSwapHelper(const Instruction* instr);
+  template <typename T>
+  void CompareAndSwapPairHelper(const Instruction* instr);
+  template <typename T>
+  void AtomicMemorySimpleHelper(const Instruction* instr);
+  template <typename T>
+  void AtomicMemorySwapHelper(const Instruction* instr);
   uintptr_t LoadStoreAddress(unsigned addr_reg, int64_t offset,
                              AddrMode addrmode);
   void LoadStoreWriteBack(unsigned addr_reg, int64_t offset, AddrMode addrmode);
@@ -1376,24 +1589,32 @@ class Simulator : public DecoderVisitor, public SimulatorBase {
                                        AddrMode addr_mode);
   void CheckMemoryAccess(uintptr_t address, uintptr_t stack);
 
+  // "Probe" if an address range can be read. This is currently implemented
+  // by doing a 1-byte read of the last accessed byte, since the assumption is
+  // that if the last byte is accessible, also all lower bytes are accessible
+  // (which holds true for Wasm).
+  // Returns true if the access was successful, false if the access raised a
+  // signal which was then handled by the trap handler (also see
+  // {trap_handler::ProbeMemory}). If the access raises a signal which is not
+  // handled by the trap handler (e.g. because the current PC is not registered
+  // as a trapping instruction), the signal will propagate and make the process
+  // crash. If no trap handler is available, this always returns true.
+  bool ProbeMemory(uintptr_t address, uintptr_t access_size);
+
   // Memory read helpers.
   template <typename T, typename A>
+    requires(sizeof(T) == 1 || sizeof(T) == 2 || sizeof(T) == 4 ||
+             sizeof(T) == 8 || sizeof(T) == 16)
   T MemoryRead(A address) {
-    T value;
-    STATIC_ASSERT((sizeof(value) == 1) || (sizeof(value) == 2) ||
-                  (sizeof(value) == 4) || (sizeof(value) == 8) ||
-                  (sizeof(value) == 16));
-    memcpy(&value, reinterpret_cast<const void*>(address), sizeof(value));
-    return value;
+    return SimMemory::Read<T>(address);
   }
 
   // Memory write helpers.
   template <typename T, typename A>
+    requires(sizeof(T) == 1 || sizeof(T) == 2 || sizeof(T) == 4 ||
+             sizeof(T) == 8 || sizeof(T) == 16)
   void MemoryWrite(A address, T value) {
-    STATIC_ASSERT((sizeof(value) == 1) || (sizeof(value) == 2) ||
-                  (sizeof(value) == 4) || (sizeof(value) == 8) ||
-                  (sizeof(value) == 16));
-    memcpy(reinterpret_cast<void*>(address), &value, sizeof(value));
+    SimMemory::Write<T>(address, value);
   }
 
   template <typename T>
@@ -1407,6 +1628,12 @@ class Simulator : public DecoderVisitor, public SimulatorBase {
   template <typename T>
   void BitfieldHelper(Instruction* instr);
   uint16_t PolynomialMult(uint8_t op1, uint8_t op2);
+  sim_uint128_t PolynomialMult128(uint64_t op1, uint64_t op2,
+                                  int lane_size_in_bits) const;
+  sim_uint128_t Lsl128(sim_uint128_t x, unsigned shift) const;
+  sim_uint128_t Eor128(sim_uint128_t x, sim_uint128_t y) const;
+  void SimulateSignedMinMax(const Instruction* instr);
+  void SimulateUnsignedMinMax(const Instruction* instr);
 
   void ld1(VectorFormat vform, LogicVRegister dst, uint64_t addr);
   void ld1(VectorFormat vform, LogicVRegister dst, int index, uint64_t addr);
@@ -1598,6 +1825,8 @@ class Simulator : public DecoderVisitor, public SimulatorBase {
                         const LogicVRegister& src);
   LogicVRegister uadalp(VectorFormat vform, LogicVRegister dst,
                         const LogicVRegister& src);
+  LogicVRegister ror(VectorFormat vform, LogicVRegister dst,
+                     const LogicVRegister& src, int rotation);
   LogicVRegister ext(VectorFormat vform, LogicVRegister dst,
                      const LogicVRegister& src1, const LogicVRegister& src2,
                      int index);
@@ -1851,6 +2080,11 @@ class Simulator : public DecoderVisitor, public SimulatorBase {
   LogicVRegister sqrdmulh(VectorFormat vform, LogicVRegister dst,
                           const LogicVRegister& src1,
                           const LogicVRegister& src2, bool round = true);
+  LogicVRegister dot(VectorFormat vform, LogicVRegister dst,
+                     const LogicVRegister& src1, const LogicVRegister& src2,
+                     bool is_src1_signed, bool is_src2_signed);
+  LogicVRegister sdot(VectorFormat vform, LogicVRegister dst,
+                      const LogicVRegister& src1, const LogicVRegister& src2);
   LogicVRegister sqdmulh(VectorFormat vform, LogicVRegister dst,
                          const LogicVRegister& src1,
                          const LogicVRegister& src2);
@@ -2034,6 +2268,10 @@ class Simulator : public DecoderVisitor, public SimulatorBase {
   LogicVRegister fmaxnmv(VectorFormat vform, LogicVRegister dst,
                          const LogicVRegister& src);
 
+  LogicVRegister bgrp(VectorFormat vform, LogicVRegister dst,
+                      const LogicVRegister& src1, const LogicVRegister& src2,
+                      bool do_bext = false);
+
   template <typename T>
   T FPRecipSqrtEstimate(T op);
   template <typename T>
@@ -2056,10 +2294,15 @@ class Simulator : public DecoderVisitor, public SimulatorBase {
   double UFixedToDouble(uint64_t src, int fbits, FPRounding round_mode);
   float FixedToFloat(int64_t src, int fbits, FPRounding round_mode);
   float UFixedToFloat(uint64_t src, int fbits, FPRounding round_mode);
+  float16 FixedToFloat16(int64_t src, int fbits, FPRounding round_mode);
+  float16 UFixedToFloat16(uint64_t src, int fbits, FPRounding round_mode);
+  int16_t FPToInt16(double value, FPRounding rmode);
   int32_t FPToInt32(double value, FPRounding rmode);
   int64_t FPToInt64(double value, FPRounding rmode);
+  uint16_t FPToUInt16(double value, FPRounding rmode);
   uint32_t FPToUInt32(double value, FPRounding rmode);
   uint64_t FPToUInt64(double value, FPRounding rmode);
+  int32_t FPToFixedJS(double value);
 
   template <typename T>
   T FPAdd(T op1, T op2);
@@ -2124,12 +2367,16 @@ class Simulator : public DecoderVisitor, public SimulatorBase {
       0x7ffbad007f8bad00UL;
 
   void CorruptRegisters(CPURegList* list,
-                        uint64_t value = kDefaultCPURegisterCorruptionValue);
+                        uint64_t value = kDefaultCPURegisterCorruptionValue,
+                        int lane = 0);
   void CorruptAllCallerSavedCPURegisters();
 #endif
 
   // Pseudo Printf instruction
   void DoPrintf(Instruction* instr);
+
+  // Pseudo instruction for switching stack limit
+  void DoSwitchStackLimit(Instruction* instr);
 
   // Processor state ---------------------------------------
 
@@ -2137,9 +2384,6 @@ class Simulator : public DecoderVisitor, public SimulatorBase {
   FILE* stream_;
   PrintDisassembler* print_disasm_;
   void PRINTF_FORMAT(2, 3) TraceSim(const char* format, ...);
-
-  // Instrumentation.
-  Instrument* instrument_;
 
   // General purpose registers. Register 31 is the stack pointer.
   SimRegister registers_[kNumberOfRegisters];
@@ -2181,9 +2425,15 @@ class Simulator : public DecoderVisitor, public SimulatorBase {
 
   // Stack
   uintptr_t stack_;
-  static const size_t stack_protection_size_ = KB;
-  size_t stack_size_;
+  static const size_t kStackProtectionSize = KB;
+  // This includes a protection margin at each end of the stack area.
+  static size_t AllocatedStackSize() {
+    return (v8_flags.sim_stack_size * KB) + (2 * kStackProtectionSize);
+  }
+  static size_t UsableStackSize() { return v8_flags.sim_stack_size * KB; }
   uintptr_t stack_limit_;
+  // Added in Simulator::StackLimit()
+  static const int kAdditionalStackMargin = 20 * KB;
 
   Decoder<DispatchingDecoderVisitor>* decoder_;
   Decoder<DispatchingDecoderVisitor>* disassembler_decoder_;
@@ -2192,6 +2442,14 @@ class Simulator : public DecoderVisitor, public SimulatorBase {
   // automatically incremented.
   bool pc_modified_;
   Instruction* pc_;
+  Instruction* last_instr_ = nullptr;
+
+  // Branch type register, used for branch target identification.
+  BType btype_;
+
+  // Global flag for enabling guarded pages.
+  // TODO(arm64): implement guarding at page granularity, rather than globally.
+  bool guard_pages_;
 
   static const char* xreg_names[];
   static const char* wreg_names[];
@@ -2200,12 +2458,11 @@ class Simulator : public DecoderVisitor, public SimulatorBase {
   static const char* vreg_names[];
 
   // Debugger input.
-  void set_last_debugger_input(char* input) {
-    DeleteArray(last_debugger_input_);
-    last_debugger_input_ = input;
+  void set_last_debugger_input(ArrayUniquePtr<char> input) {
+    last_debugger_input_ = std::move(input);
   }
-  char* last_debugger_input() { return last_debugger_input_; }
-  char* last_debugger_input_;
+  const char* last_debugger_input() { return last_debugger_input_.get(); }
+  ArrayUniquePtr<char> last_debugger_input_;
 
   // Synchronization primitives. See ARM DDI 0487A.a, B2.10. Pair types not
   // implemented.
@@ -2251,6 +2508,18 @@ class Simulator : public DecoderVisitor, public SimulatorBase {
 
   class GlobalMonitor {
    public:
+    class SimulatorMutex final {
+     public:
+      explicit SimulatorMutex(GlobalMonitor* global_monitor) {
+        if (!global_monitor->IsSingleThreaded()) {
+          guard.emplace(global_monitor->mutex_);
+        }
+      }
+
+     private:
+      std::optional<base::MutexGuard> guard;
+    };
+
     class Processor {
      public:
       Processor();
@@ -2276,47 +2545,53 @@ class Simulator : public DecoderVisitor, public SimulatorBase {
       int failure_counter_;
     };
 
-    // Exposed so it can be accessed by Simulator::{Read,Write}Ex*.
-    base::Mutex mutex;
-
     void NotifyLoadExcl_Locked(uintptr_t addr, Processor* processor);
     void NotifyStore_Locked(Processor* processor);
     bool NotifyStoreExcl_Locked(uintptr_t addr, Processor* processor);
 
+    // Called when the simulator is constructed.
+    void PrependProcessor(Processor* processor);
     // Called when the simulator is destroyed.
     void RemoveProcessor(Processor* processor);
 
     static GlobalMonitor* Get();
 
    private:
+    bool IsSingleThreaded() const { return num_processors_ == 1; }
+
     // Private constructor. Call {GlobalMonitor::Get()} to get the singleton.
     GlobalMonitor() = default;
     friend class base::LeakyObject<GlobalMonitor>;
 
-    bool IsProcessorInLinkedList_Locked(Processor* processor) const;
-    void PrependProcessor_Locked(Processor* processor);
-
     Processor* head_ = nullptr;
+    std::atomic<uint32_t> num_processors_ = 0;
+    base::Mutex mutex_;
   };
 
   LocalMonitor local_monitor_;
   GlobalMonitor::Processor global_monitor_processor_;
+  GlobalMonitor* global_monitor_;
 
  private:
   void Init(FILE* stream);
 
   V8_EXPORT_PRIVATE void CallImpl(Address entry, CallArgument* args);
 
+  void CallAnyCTypeFunction(Address target_address,
+                            const EncodedCSignature& signature);
+
   // Read floating point return values.
   template <typename T>
-  typename std::enable_if<std::is_floating_point<T>::value, T>::type
-  ReadReturn() {
+  T ReadReturn()
+    requires std::is_floating_point_v<T>
+  {
     return static_cast<T>(dreg(0));
   }
   // Read non-float return values.
   template <typename T>
-  typename std::enable_if<!std::is_floating_point<T>::value, T>::type
-  ReadReturn() {
+  T ReadReturn()
+    requires(!std::is_floating_point_v<T>)
+  {
     return ConvertReturn<T>(xreg(0));
   }
 
@@ -2369,7 +2644,10 @@ class Simulator : public DecoderVisitor, public SimulatorBase {
   }
 
   int log_parameters_;
+  // Instruction counter only valid if v8_flags.stop_sim_at isn't 0.
+  int icount_for_stop_sim_at_;
   Isolate* isolate_;
+  v8::internal::Builtins builtins_;
 };
 
 template <>
@@ -2380,6 +2658,11 @@ inline double Simulator::FPDefaultNaN<double>() {
 template <>
 inline float Simulator::FPDefaultNaN<float>() {
   return kFP32DefaultNaN;
+}
+
+template <>
+inline float16 Simulator::FPDefaultNaN<float16>() {
+  return kFP16DefaultNaN;
 }
 
 }  // namespace internal

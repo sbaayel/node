@@ -4,7 +4,9 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* API: https://github.com/WebAssembly/WASI/blob/master/phases/unstable/docs/wasi_unstable_preview0.md */
+/* API: https://github.com/WebAssembly/WASI/blob/main/phases/snapshot/docs.md */
+
+typedef uint32_t uvwasi_size_t;
 
 typedef uint8_t uvwasi_advice_t;
 #define UVWASI_ADVICE_NORMAL     0
@@ -16,7 +18,7 @@ typedef uint8_t uvwasi_advice_t;
 
 typedef struct uvwasi_ciovec_s {
   const void* buf;
-  size_t buf_len;
+  uvwasi_size_t buf_len;
 } uvwasi_ciovec_t;
 
 typedef uint32_t uvwasi_clockid_t;
@@ -152,7 +154,7 @@ typedef uint64_t uvwasi_inode_t;
 
 typedef struct uvwasi_iovec_s {
   void* buf;
-  size_t buf_len;
+  uvwasi_size_t buf_len;
 } uvwasi_iovec_t;
 
 typedef uint64_t uvwasi_linkcount_t;
@@ -173,7 +175,7 @@ typedef struct uvwasi_prestat_s {
   uvwasi_preopentype_t pr_type;
   union uvwasi_prestat_u {
     struct uvwasi_prestat_dir_t {
-      size_t pr_name_len;
+      uvwasi_size_t pr_name_len;
     } dir;
   } u;
 } uvwasi_prestat_t;
@@ -212,6 +214,7 @@ typedef uint64_t uvwasi_rights_t;                /* Bitfield */
 #define UVWASI_RIGHT_PATH_UNLINK_FILE        (1 << 26)
 #define UVWASI_RIGHT_POLL_FD_READWRITE       (1 << 27)
 #define UVWASI_RIGHT_SOCK_SHUTDOWN           (1 << 28)
+#define UVWASI_RIGHT_SOCK_ACCEPT             (1 << 29)
 
 typedef uint16_t uvwasi_roflags_t;               /* Bitfield */
 #define UVWASI_SOCK_RECV_DATA_TRUNCATED (1 << 0)
@@ -318,5 +321,11 @@ typedef uint8_t uvwasi_whence_t;
 #define UVWASI_WHENCE_SET 0
 #define UVWASI_WHENCE_CUR 1
 #define UVWASI_WHENCE_END 2
+
+#ifdef NEED_UVWASI_EXPORT
+  #define UVWASI_EXPORT __attribute__((visibility("default")))
+#else
+  #define UVWASI_EXPORT
+#endif /* NEED_UVWASI_EXPORT */
 
 #endif /* __UVWASI_WASI_TYPES_H__ */

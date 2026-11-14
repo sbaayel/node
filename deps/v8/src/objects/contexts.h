@@ -5,21 +5,40 @@
 #ifndef V8_OBJECTS_CONTEXTS_H_
 #define V8_OBJECTS_CONTEXTS_H_
 
+#include "include/v8-promise.h"
+#include "src/common/globals.h"
+#include "src/execution/frames.h"
+#include "src/handles/handles.h"
+#include "src/objects/cell.h"
+#include "src/objects/dependent-code.h"
 #include "src/objects/fixed-array.h"
 #include "src/objects/function-kind.h"
-#include "src/objects/osr-optimized-code-cache.h"
-#include "torque-generated/field-offsets-tq.h"
+#include "src/objects/ordered-hash-table.h"
+#include "src/objects/property-cell.h"
+
 // Has to be the last include (doesn't have include guards):
 #include "src/objects/object-macros.h"
 
 namespace v8 {
 namespace internal {
 
+namespace maglev {
+class MaglevGraphBuilder;
+class StoreSmiContextCell;
+class StoreInt32ContextCell;
+class StoreFloat64ContextCell;
+}  // namespace maglev
 class JSGlobalObject;
 class JSGlobalProxy;
 class MicrotaskQueue;
 class NativeContext;
 class RegExpMatchInfo;
+struct VariableLookupResult;
+namespace compiler {
+class ContextRef;
+}
+class V8HeapExplorer;
+class JavaScriptFrame;
 
 enum ContextLookupFlags {
   FOLLOW_CONTEXT_CHAIN = 1 << 0,
@@ -38,24 +57,30 @@ enum ContextLookupFlags {
 // must always be allocated via Heap::AllocateContext() or
 // Factory::NewContext.
 
-#define NATIVE_CONTEXT_INTRINSIC_FUNCTIONS(V)                     \
-  V(GENERATOR_NEXT_INTERNAL, JSFunction, generator_next_internal) \
-  V(ASYNC_MODULE_EVALUATE_INTERNAL, JSFunction,                   \
-    async_module_evaluate_internal)                               \
-  V(MAKE_ERROR_INDEX, JSFunction, make_error)                     \
-  V(MAKE_RANGE_ERROR_INDEX, JSFunction, make_range_error)         \
-  V(MAKE_SYNTAX_ERROR_INDEX, JSFunction, make_syntax_error)       \
-  V(MAKE_TYPE_ERROR_INDEX, JSFunction, make_type_error)           \
-  V(MAKE_URI_ERROR_INDEX, JSFunction, make_uri_error)             \
-  V(OBJECT_CREATE, JSFunction, object_create)                     \
-  V(REFLECT_APPLY_INDEX, JSFunction, reflect_apply)               \
-  V(REFLECT_CONSTRUCT_INDEX, JSFunction, reflect_construct)       \
-  V(MATH_FLOOR_INDEX, JSFunction, math_floor)                     \
-  V(MATH_POW_INDEX, JSFunction, math_pow)                         \
-  V(PROMISE_INTERNAL_CONSTRUCTOR_INDEX, JSFunction,               \
-    promise_internal_constructor)                                 \
-  V(IS_PROMISE_INDEX, JSFunction, is_promise)                     \
-  V(PROMISE_THEN_INDEX, JSFunction, promise_then)
+#ifdef V8_TEMPORAL_SUPPORT
+#define NATIVE_CONTEXT_FIELDS_TEMPORAL(V)                                      \
+  V(JS_TEMPORAL_DURATION_FUNCTION_INDEX, JSFunction,                           \
+    temporal_duration_function)                                                \
+  V(JS_TEMPORAL_INSTANT_FUNCTION_INDEX, JSFunction, temporal_instant_function) \
+  V(JS_TEMPORAL_PLAIN_DATE_FUNCTION_INDEX, JSFunction,                         \
+    temporal_plain_date_function)                                              \
+  V(JS_TEMPORAL_PLAIN_DATE_TIME_FUNCTION_INDEX, JSFunction,                    \
+    temporal_plain_date_time_function)                                         \
+  V(JS_TEMPORAL_PLAIN_MONTH_DAY_FUNCTION_INDEX, JSFunction,                    \
+    temporal_plain_month_day_function)                                         \
+  V(JS_TEMPORAL_PLAIN_TIME_FUNCTION_INDEX, JSFunction,                         \
+    temporal_plain_time_function)                                              \
+  V(JS_TEMPORAL_PLAIN_YEAR_MONTH_FUNCTION_INDEX, JSFunction,                   \
+    temporal_plain_year_month_function)                                        \
+  V(JS_TEMPORAL_TIME_ZONE_FUNCTION_INDEX, JSFunction,                          \
+    temporal_time_zone_function)                                               \
+  V(JS_TEMPORAL_ZONED_DATE_TIME_FUNCTION_INDEX, JSFunction,                    \
+    temporal_zoned_date_time_function)                                         \
+  V(TEMPORAL_OBJECT_INDEX, HeapObject, temporal_object)
+
+#else
+#define NATIVE_CONTEXT_FIELDS_TEMPORAL(V)
+#endif  // V8_TEMPORAL_SUPPORT
 
 #define NATIVE_CONTEXT_FIELDS(V)                                               \
   V(GLOBAL_PROXY_INDEX, JSGlobalProxy, global_proxy_object)                    \
@@ -63,7 +88,48 @@ enum ContextLookupFlags {
   /* it's already UBSan-fiendly and doesn't require a star... So declare */    \
   /* it as a HeapObject for now. */                                            \
   V(EMBEDDER_DATA_INDEX, HeapObject, embedder_data)                            \
+  V(CONTINUATION_PRESERVED_EMBEDDER_DATA_INDEX, HeapObject,                    \
+    continuation_preserved_embedder_data)                                      \
+  V(GENERATOR_NEXT_INTERNAL, JSFunction, generator_next_internal)              \
+  V(ASYNC_MODULE_EVALUATE_INTERNAL, JSFunction,                                \
+    async_module_evaluate_internal)                                            \
+  V(REFLECT_APPLY_INDEX, JSFunction, reflect_apply)                            \
+  V(REFLECT_CONSTRUCT_INDEX, JSFunction, reflect_construct)                    \
+  V(PERFORM_PROMISE_THEN_INDEX, JSFunction, perform_promise_then)              \
+  V(PROMISE_THEN_INDEX, JSFunction, promise_then)                              \
+  V(PROMISE_RESOLVE_INDEX, JSFunction, promise_resolve)                        \
+  V(FUNCTION_PROTOTYPE_APPLY_INDEX, JSFunction, function_prototype_apply)      \
+  /* TypedArray constructors - these must stay in order! */                    \
+  V(UINT8_ARRAY_FUN_INDEX, JSFunction, uint8_array_fun)                        \
+  V(INT8_ARRAY_FUN_INDEX, JSFunction, int8_array_fun)                          \
+  V(UINT16_ARRAY_FUN_INDEX, JSFunction, uint16_array_fun)                      \
+  V(INT16_ARRAY_FUN_INDEX, JSFunction, int16_array_fun)                        \
+  V(UINT32_ARRAY_FUN_INDEX, JSFunction, uint32_array_fun)                      \
+  V(INT32_ARRAY_FUN_INDEX, JSFunction, int32_array_fun)                        \
+  V(BIGUINT64_ARRAY_FUN_INDEX, JSFunction, biguint64_array_fun)                \
+  V(BIGINT64_ARRAY_FUN_INDEX, JSFunction, bigint64_array_fun)                  \
+  V(UINT8_CLAMPED_ARRAY_FUN_INDEX, JSFunction, uint8_clamped_array_fun)        \
+  V(FLOAT32_ARRAY_FUN_INDEX, JSFunction, float32_array_fun)                    \
+  V(FLOAT64_ARRAY_FUN_INDEX, JSFunction, float64_array_fun)                    \
+  V(FLOAT16_ARRAY_FUN_INDEX, JSFunction, float16_array_fun)                    \
+  V(RAB_GSAB_UINT8_ARRAY_MAP_INDEX, Map, rab_gsab_uint8_array_map)             \
+  V(RAB_GSAB_INT8_ARRAY_MAP_INDEX, Map, rab_gsab_int8_array_map)               \
+  V(RAB_GSAB_UINT16_ARRAY_MAP_INDEX, Map, rab_gsab_uint16_array_map)           \
+  V(RAB_GSAB_INT16_ARRAY_MAP_INDEX, Map, rab_gsab_int16_array_map)             \
+  V(RAB_GSAB_UINT32_ARRAY_MAP_INDEX, Map, rab_gsab_uint32_array_map)           \
+  V(RAB_GSAB_INT32_ARRAY_MAP_INDEX, Map, rab_gsab_int32_array_map)             \
+  V(RAB_GSAB_BIGUINT64_ARRAY_MAP_INDEX, Map, rab_gsab_biguint64_array_map)     \
+  V(RAB_GSAB_BIGINT64_ARRAY_MAP_INDEX, Map, rab_gsab_bigint64_array_map)       \
+  V(RAB_GSAB_UINT8_CLAMPED_ARRAY_MAP_INDEX, Map,                               \
+    rab_gsab_uint8_clamped_array_map)                                          \
+  V(RAB_GSAB_FLOAT32_ARRAY_MAP_INDEX, Map, rab_gsab_float32_array_map)         \
+  V(RAB_GSAB_FLOAT64_ARRAY_MAP_INDEX, Map, rab_gsab_float64_array_map)         \
+  V(RAB_GSAB_FLOAT16_ARRAY_MAP_INDEX, Map, rab_gsab_float16_array_map)         \
   /* Below is alpha-sorted */                                                  \
+  V(ABSTRACT_MODULE_SOURCE_FUNCTION_INDEX, JSFunction,                         \
+    abstract_module_source_function)                                           \
+  V(ABSTRACT_MODULE_SOURCE_PROTOTYPE_INDEX, JSObject,                          \
+    abstract_module_source_prototype)                                          \
   V(ACCESSOR_PROPERTY_DESCRIPTOR_MAP_INDEX, Map,                               \
     accessor_property_descriptor_map)                                          \
   V(ALLOW_CODE_GEN_FROM_STRINGS_INDEX, Object, allow_code_gen_from_strings)    \
@@ -72,33 +138,13 @@ enum ContextLookupFlags {
   V(ARRAY_BUFFER_NOINIT_FUN_INDEX, JSFunction, array_buffer_noinit_fun)        \
   V(ARRAY_FUNCTION_INDEX, JSFunction, array_function)                          \
   V(ARRAY_JOIN_STACK_INDEX, HeapObject, array_join_stack)                      \
+  V(ARRAY_FROM_ASYNC_INDEX, JSFunction, from_async)                            \
   V(ASYNC_FROM_SYNC_ITERATOR_MAP_INDEX, Map, async_from_sync_iterator_map)     \
-  V(ASYNC_FUNCTION_AWAIT_REJECT_SHARED_FUN, SharedFunctionInfo,                \
-    async_function_await_reject_shared_fun)                                    \
-  V(ASYNC_FUNCTION_AWAIT_RESOLVE_SHARED_FUN, SharedFunctionInfo,               \
-    async_function_await_resolve_shared_fun)                                   \
   V(ASYNC_FUNCTION_FUNCTION_INDEX, JSFunction, async_function_constructor)     \
   V(ASYNC_FUNCTION_OBJECT_MAP_INDEX, Map, async_function_object_map)           \
   V(ASYNC_GENERATOR_FUNCTION_FUNCTION_INDEX, JSFunction,                       \
     async_generator_function_function)                                         \
-  V(ASYNC_ITERATOR_VALUE_UNWRAP_SHARED_FUN, SharedFunctionInfo,                \
-    async_iterator_value_unwrap_shared_fun)                                    \
-  V(ASYNC_GENERATOR_AWAIT_REJECT_SHARED_FUN, SharedFunctionInfo,               \
-    async_generator_await_reject_shared_fun)                                   \
-  V(ASYNC_GENERATOR_AWAIT_RESOLVE_SHARED_FUN, SharedFunctionInfo,              \
-    async_generator_await_resolve_shared_fun)                                  \
-  V(ASYNC_GENERATOR_YIELD_RESOLVE_SHARED_FUN, SharedFunctionInfo,              \
-    async_generator_yield_resolve_shared_fun)                                  \
-  V(ASYNC_GENERATOR_RETURN_RESOLVE_SHARED_FUN, SharedFunctionInfo,             \
-    async_generator_return_resolve_shared_fun)                                 \
-  V(ASYNC_GENERATOR_RETURN_CLOSED_RESOLVE_SHARED_FUN, SharedFunctionInfo,      \
-    async_generator_return_closed_resolve_shared_fun)                          \
-  V(ASYNC_GENERATOR_RETURN_CLOSED_REJECT_SHARED_FUN, SharedFunctionInfo,       \
-    async_generator_return_closed_reject_shared_fun)                           \
-  V(ATOMICS_OBJECT, JSObject, atomics_object)                                  \
   V(BIGINT_FUNCTION_INDEX, JSFunction, bigint_function)                        \
-  V(BIGINT64_ARRAY_FUN_INDEX, JSFunction, bigint64_array_fun)                  \
-  V(BIGUINT64_ARRAY_FUN_INDEX, JSFunction, biguint64_array_fun)                \
   V(BOOLEAN_FUNCTION_INDEX, JSFunction, boolean_function)                      \
   V(BOUND_FUNCTION_WITH_CONSTRUCTOR_MAP_INDEX, Map,                            \
     bound_function_with_constructor_map)                                       \
@@ -107,26 +153,24 @@ enum ContextLookupFlags {
   V(CALL_AS_CONSTRUCTOR_DELEGATE_INDEX, JSFunction,                            \
     call_as_constructor_delegate)                                              \
   V(CALL_AS_FUNCTION_DELEGATE_INDEX, JSFunction, call_as_function_delegate)    \
-  V(CALL_ASYNC_MODULE_FULFILLED, JSFunction, call_async_module_fulfilled)      \
-  V(CALL_ASYNC_MODULE_REJECTED, JSFunction, call_async_module_rejected)        \
   V(CALLSITE_FUNCTION_INDEX, JSFunction, callsite_function)                    \
   V(CONTEXT_EXTENSION_FUNCTION_INDEX, JSFunction, context_extension_function)  \
   V(DATA_PROPERTY_DESCRIPTOR_MAP_INDEX, Map, data_property_descriptor_map)     \
   V(DATA_VIEW_FUN_INDEX, JSFunction, data_view_fun)                            \
   V(DATE_FUNCTION_INDEX, JSFunction, date_function)                            \
-  V(DEBUG_CONTEXT_ID_INDEX, Object, debug_context_id)                          \
+  V(DEBUG_CONTEXT_ID_INDEX, (UnionOf<Smi, Undefined>), debug_context_id)       \
   V(EMPTY_FUNCTION_INDEX, JSFunction, empty_function)                          \
   V(ERROR_MESSAGE_FOR_CODE_GEN_FROM_STRINGS_INDEX, Object,                     \
     error_message_for_code_gen_from_strings)                                   \
+  V(ERROR_MESSAGE_FOR_WASM_CODE_GEN_INDEX, Object,                             \
+    error_message_for_wasm_code_gen)                                           \
   V(ERRORS_THROWN_INDEX, Smi, errors_thrown)                                   \
-  V(EXTRAS_EXPORTS_OBJECT_INDEX, JSObject, extras_binding_object)              \
-  V(EXTRAS_UTILS_OBJECT_INDEX, Object, extras_utils_object)                    \
+  V(EXTRAS_BINDING_OBJECT_INDEX, JSObject, extras_binding_object)              \
   V(FAST_ALIASED_ARGUMENTS_MAP_INDEX, Map, fast_aliased_arguments_map)         \
   V(FAST_TEMPLATE_INSTANTIATIONS_CACHE_INDEX, FixedArray,                      \
     fast_template_instantiations_cache)                                        \
-  V(FLOAT32_ARRAY_FUN_INDEX, JSFunction, float32_array_fun)                    \
-  V(FLOAT64_ARRAY_FUN_INDEX, JSFunction, float64_array_fun)                    \
   V(FUNCTION_FUNCTION_INDEX, JSFunction, function_function)                    \
+  V(FUNCTION_PROTOTYPE_INDEX, JSObject, function_prototype)                    \
   V(GENERATOR_FUNCTION_FUNCTION_INDEX, JSFunction,                             \
     generator_function_function)                                               \
   V(GENERATOR_OBJECT_PROTOTYPE_MAP_INDEX, Map, generator_object_prototype_map) \
@@ -138,9 +182,16 @@ enum ContextLookupFlags {
   V(INITIAL_ARRAY_PROTOTYPE_INDEX, JSObject, initial_array_prototype)          \
   V(INITIAL_ERROR_PROTOTYPE_INDEX, JSObject, initial_error_prototype)          \
   V(INITIAL_GENERATOR_PROTOTYPE_INDEX, JSObject, initial_generator_prototype)  \
+  V(INITIAL_ASYNC_ITERATOR_PROTOTYPE_INDEX, JSObject,                          \
+    initial_async_iterator_prototype)                                          \
   V(INITIAL_ASYNC_GENERATOR_PROTOTYPE_INDEX, JSObject,                         \
     initial_async_generator_prototype)                                         \
+  V(INITIAL_ITERATOR_FUNCTION_INDEX, JSFunction, initial_iterator_function)    \
+  V(INITIAL_ITERATOR_HELPER_PROTOTYPE_INDEX, JSObject,                         \
+    initial_iterator_helper_prototype)                                         \
   V(INITIAL_ITERATOR_PROTOTYPE_INDEX, JSObject, initial_iterator_prototype)    \
+  V(INITIAL_DISPOSABLE_STACK_PROTOTYPE_INDEX, JSObject,                        \
+    initial_disposable_stack_prototype)                                        \
   V(INITIAL_MAP_ITERATOR_PROTOTYPE_INDEX, JSObject,                            \
     initial_map_iterator_prototype)                                            \
   V(INITIAL_MAP_PROTOTYPE_MAP_INDEX, Map, initial_map_prototype_map)           \
@@ -155,12 +206,13 @@ enum ContextLookupFlags {
   V(INITIAL_STRING_PROTOTYPE_INDEX, JSObject, initial_string_prototype)        \
   V(INITIAL_WEAKMAP_PROTOTYPE_MAP_INDEX, Map, initial_weakmap_prototype_map)   \
   V(INITIAL_WEAKSET_PROTOTYPE_MAP_INDEX, Map, initial_weakset_prototype_map)   \
-  V(INT16_ARRAY_FUN_INDEX, JSFunction, int16_array_fun)                        \
-  V(INT32_ARRAY_FUN_INDEX, JSFunction, int32_array_fun)                        \
-  V(INT8_ARRAY_FUN_INDEX, JSFunction, int8_array_fun)                          \
   V(INTL_COLLATOR_FUNCTION_INDEX, JSFunction, intl_collator_function)          \
   V(INTL_DATE_TIME_FORMAT_FUNCTION_INDEX, JSFunction,                          \
     intl_date_time_format_function)                                            \
+  V(INTL_DISPLAY_NAMES_FUNCTION_INDEX, JSFunction,                             \
+    intl_display_names_function)                                               \
+  V(INTL_DURATION_FORMAT_FUNCTION_INDEX, JSFunction,                           \
+    intl_duration_format_function)                                             \
   V(INTL_NUMBER_FORMAT_FUNCTION_INDEX, JSFunction,                             \
     intl_number_format_function)                                               \
   V(INTL_LOCALE_FUNCTION_INDEX, JSFunction, intl_locale_function)              \
@@ -169,7 +221,21 @@ enum ContextLookupFlags {
   V(INTL_RELATIVE_TIME_FORMAT_FUNCTION_INDEX, JSFunction,                      \
     intl_relative_time_format_function)                                        \
   V(INTL_SEGMENTER_FUNCTION_INDEX, JSFunction, intl_segmenter_function)        \
+  V(INTL_SEGMENTS_MAP_INDEX, Map, intl_segments_map)                           \
+  V(INTL_SEGMENT_DATA_OBJECT_MAP_INDEX, Map, intl_segment_data_object_map)     \
+  V(INTL_SEGMENT_DATA_OBJECT_WORDLIKE_MAP_INDEX, Map,                          \
+    intl_segment_data_object_wordlike_map)                                     \
   V(INTL_SEGMENT_ITERATOR_MAP_INDEX, Map, intl_segment_iterator_map)           \
+  V(ITERATOR_FILTER_HELPER_MAP_INDEX, Map, iterator_filter_helper_map)         \
+  V(ITERATOR_MAP_HELPER_MAP_INDEX, Map, iterator_map_helper_map)               \
+  V(ITERATOR_TAKE_HELPER_MAP_INDEX, Map, iterator_take_helper_map)             \
+  V(ITERATOR_DROP_HELPER_MAP_INDEX, Map, iterator_drop_helper_map)             \
+  V(ITERATOR_FLAT_MAP_HELPER_MAP_INDEX, Map, iterator_flatMap_helper_map)      \
+  V(ITERATOR_CONCAT_HELPER_MAP_INDEX, Map, iterator_concat_helper_map)         \
+  V(ITERATOR_ZIP_HELPER_MAP_INDEX, Map, iterator_zip_helper_map)               \
+  V(ITERATOR_ZIP_KEYED_HELPER_MAP_INDEX, Map, iterator_zip_keyed_helper_map)   \
+  V(ITERATOR_FUNCTION_INDEX, JSFunction, iterator_function)                    \
+  V(VALID_ITERATOR_WRAPPER_MAP_INDEX, Map, valid_iterator_wrapper_map)         \
   V(ITERATOR_RESULT_MAP_INDEX, Map, iterator_result_map)                       \
   V(JS_ARRAY_PACKED_SMI_ELEMENTS_MAP_INDEX, Map,                               \
     js_array_packed_smi_elements_map)                                          \
@@ -181,59 +247,65 @@ enum ContextLookupFlags {
     js_array_packed_double_elements_map)                                       \
   V(JS_ARRAY_HOLEY_DOUBLE_ELEMENTS_MAP_INDEX, Map,                             \
     js_array_holey_double_elements_map)                                        \
+  V(JS_ARRAY_TEMPLATE_LITERAL_OBJECT_MAP, Map,                                 \
+    js_array_template_literal_object_map)                                      \
+  V(JS_DISPOSABLE_STACK_FUNCTION_INDEX, JSFunction,                            \
+    js_disposable_stack_function)                                              \
+  V(JS_ASYNC_DISPOSABLE_STACK_FUNCTION_INDEX, JSFunction,                      \
+    js_async_disposable_stack_function)                                        \
+  V(JS_DISPOSABLE_STACK_MAP_INDEX, Map, js_disposable_stack_map)               \
   V(JS_MAP_FUN_INDEX, JSFunction, js_map_fun)                                  \
   V(JS_MAP_MAP_INDEX, Map, js_map_map)                                         \
   V(JS_MODULE_NAMESPACE_MAP, Map, js_module_namespace_map)                     \
+  V(JS_DEFERRED_MODULE_NAMESPACE_MAP, Map, js_deferred_module_namespace_map)   \
+  V(JS_RAW_JSON_MAP, Map, js_raw_json_map)                                     \
   V(JS_SET_FUN_INDEX, JSFunction, js_set_fun)                                  \
   V(JS_SET_MAP_INDEX, Map, js_set_map)                                         \
-  V(WEAK_CELL_MAP_INDEX, Map, weak_cell_map)                                   \
-  V(JS_FINALIZATION_GROUP_CLEANUP_ITERATOR_MAP_INDEX, Map,                     \
-    js_finalization_group_cleanup_iterator_map)                                \
   V(JS_WEAK_MAP_FUN_INDEX, JSFunction, js_weak_map_fun)                        \
   V(JS_WEAK_SET_FUN_INDEX, JSFunction, js_weak_set_fun)                        \
   V(JS_WEAK_REF_FUNCTION_INDEX, JSFunction, js_weak_ref_fun)                   \
-  V(JS_FINALIZATION_GROUP_FUNCTION_INDEX, JSFunction,                          \
-    js_finalization_group_fun)                                                 \
+  V(JS_FINALIZATION_REGISTRY_FUNCTION_INDEX, JSFunction,                       \
+    js_finalization_registry_fun)                                              \
+  V(JSON_OBJECT, JSObject, json_object)                                        \
+  V(PROMISE_WITHRESOLVERS_RESULT_MAP_INDEX, Map,                               \
+    promise_withresolvers_result_map)                                          \
+  /* Context maps */                                                           \
+  V(META_MAP_INDEX, Map, meta_map)                                             \
+  V(FUNCTION_CONTEXT_MAP_INDEX, Map, function_context_map)                     \
+  V(MODULE_CONTEXT_MAP_INDEX, Map, module_context_map)                         \
+  V(EVAL_CONTEXT_MAP_INDEX, Map, eval_context_map)                             \
+  V(SCRIPT_CONTEXT_MAP_INDEX, Map, script_context_map)                         \
+  V(AWAIT_CONTEXT_MAP_INDEX, Map, await_context_map)                           \
+  V(BLOCK_CONTEXT_MAP_INDEX, Map, block_context_map)                           \
+  V(CATCH_CONTEXT_MAP_INDEX, Map, catch_context_map)                           \
+  V(WITH_CONTEXT_MAP_INDEX, Map, with_context_map)                             \
+  V(DEBUG_EVALUATE_CONTEXT_MAP_INDEX, Map, debug_evaluate_context_map)         \
+  V(JS_RAB_GSAB_DATA_VIEW_MAP_INDEX, Map, js_rab_gsab_data_view_map)           \
   V(MAP_CACHE_INDEX, Object, map_cache)                                        \
   V(MAP_KEY_ITERATOR_MAP_INDEX, Map, map_key_iterator_map)                     \
   V(MAP_KEY_VALUE_ITERATOR_MAP_INDEX, Map, map_key_value_iterator_map)         \
   V(MAP_VALUE_ITERATOR_MAP_INDEX, Map, map_value_iterator_map)                 \
   V(MATH_RANDOM_INDEX_INDEX, Smi, math_random_index)                           \
   V(MATH_RANDOM_STATE_INDEX, ByteArray, math_random_state)                     \
-  V(MATH_RANDOM_CACHE_INDEX, FixedDoubleArray, math_random_cache)              \
-  V(MESSAGE_LISTENERS_INDEX, TemplateList, message_listeners)                  \
+  V(MATH_RANDOM_CACHE_INDEX, (UnionOf<Undefined, FixedDoubleArray>),           \
+    math_random_cache)                                                         \
   V(NORMALIZED_MAP_CACHE_INDEX, Object, normalized_map_cache)                  \
   V(NUMBER_FUNCTION_INDEX, JSFunction, number_function)                        \
   V(OBJECT_FUNCTION_INDEX, JSFunction, object_function)                        \
+  V(OBJECT_FUNCTION_PROTOTYPE_INDEX, JSObject, object_function_prototype)      \
   V(OBJECT_FUNCTION_PROTOTYPE_MAP_INDEX, Map, object_function_prototype_map)   \
-  V(OPAQUE_REFERENCE_FUNCTION_INDEX, JSFunction, opaque_reference_function)    \
+  V(PROMISE_HOOK_INIT_FUNCTION_INDEX, Object, promise_hook_init_function)      \
+  V(PROMISE_HOOK_BEFORE_FUNCTION_INDEX, Object, promise_hook_before_function)  \
+  V(PROMISE_HOOK_AFTER_FUNCTION_INDEX, Object, promise_hook_after_function)    \
+  V(PROMISE_HOOK_RESOLVE_FUNCTION_INDEX, Object,                               \
+    promise_hook_resolve_function)                                             \
   V(PROXY_CALLABLE_MAP_INDEX, Map, proxy_callable_map)                         \
   V(PROXY_CONSTRUCTOR_MAP_INDEX, Map, proxy_constructor_map)                   \
   V(PROXY_FUNCTION_INDEX, JSFunction, proxy_function)                          \
   V(PROXY_MAP_INDEX, Map, proxy_map)                                           \
   V(PROXY_REVOCABLE_RESULT_MAP_INDEX, Map, proxy_revocable_result_map)         \
-  V(PROXY_REVOKE_SHARED_FUN, SharedFunctionInfo, proxy_revoke_shared_fun)      \
-  V(PROMISE_GET_CAPABILITIES_EXECUTOR_SHARED_FUN, SharedFunctionInfo,          \
-    promise_get_capabilities_executor_shared_fun)                              \
-  V(PROMISE_CAPABILITY_DEFAULT_REJECT_SHARED_FUN_INDEX, SharedFunctionInfo,    \
-    promise_capability_default_reject_shared_fun)                              \
-  V(PROMISE_CAPABILITY_DEFAULT_RESOLVE_SHARED_FUN_INDEX, SharedFunctionInfo,   \
-    promise_capability_default_resolve_shared_fun)                             \
-  V(PROMISE_THEN_FINALLY_SHARED_FUN, SharedFunctionInfo,                       \
-    promise_then_finally_shared_fun)                                           \
-  V(PROMISE_CATCH_FINALLY_SHARED_FUN, SharedFunctionInfo,                      \
-    promise_catch_finally_shared_fun)                                          \
-  V(PROMISE_VALUE_THUNK_FINALLY_SHARED_FUN, SharedFunctionInfo,                \
-    promise_value_thunk_finally_shared_fun)                                    \
-  V(PROMISE_THROWER_FINALLY_SHARED_FUN, SharedFunctionInfo,                    \
-    promise_thrower_finally_shared_fun)                                        \
-  V(PROMISE_ALL_RESOLVE_ELEMENT_SHARED_FUN, SharedFunctionInfo,                \
-    promise_all_resolve_element_shared_fun)                                    \
-  V(PROMISE_ALL_SETTLED_RESOLVE_ELEMENT_SHARED_FUN, SharedFunctionInfo,        \
-    promise_all_settled_resolve_element_shared_fun)                            \
-  V(PROMISE_ALL_SETTLED_REJECT_ELEMENT_SHARED_FUN, SharedFunctionInfo,         \
-    promise_all_settled_reject_element_shared_fun)                             \
   V(PROMISE_PROTOTYPE_INDEX, JSObject, promise_prototype)                      \
+  V(RECORDER_CONTEXT_ID, Object, recorder_context_id)                          \
   V(REGEXP_EXEC_FUNCTION_INDEX, JSFunction, regexp_exec_function)              \
   V(REGEXP_FUNCTION_INDEX, JSFunction, regexp_function)                        \
   V(REGEXP_LAST_MATCH_INFO_INDEX, RegExpMatchInfo, regexp_last_match_info)     \
@@ -243,6 +315,7 @@ enum ContextLookupFlags {
   V(REGEXP_PROTOTYPE_MAP_INDEX, Map, regexp_prototype_map)                     \
   V(REGEXP_REPLACE_FUNCTION_INDEX, JSFunction, regexp_replace_function)        \
   V(REGEXP_RESULT_MAP_INDEX, Map, regexp_result_map)                           \
+  V(REGEXP_RESULT_WITH_INDICES_MAP_INDEX, Map, regexp_result_with_indices_map) \
   V(REGEXP_RESULT_INDICES_MAP_INDEX, Map, regexp_result_indices_map)           \
   V(REGEXP_SEARCH_FUNCTION_INDEX, JSFunction, regexp_search_function)          \
   V(REGEXP_SPLIT_FUNCTION_INDEX, JSFunction, regexp_split_function)            \
@@ -250,8 +323,10 @@ enum ContextLookupFlags {
     initial_regexp_string_iterator_prototype_map)                              \
   V(SCRIPT_CONTEXT_TABLE_INDEX, ScriptContextTable, script_context_table)      \
   V(SCRIPT_EXECUTION_CALLBACK_INDEX, Object, script_execution_callback)        \
+  V(TEMPORAL_GET_EPOCH_NANOSECONDS_CALLBACK_INDEX, Object,                     \
+    temporal_get_epoch_nanoseconds_callback)                                   \
   V(SECURITY_TOKEN_INDEX, Object, security_token)                              \
-  V(SERIALIZED_OBJECTS, FixedArray, serialized_objects)                        \
+  V(SERIALIZED_OBJECTS, HeapObject, serialized_objects)                        \
   V(SET_VALUE_ITERATOR_MAP_INDEX, Map, set_value_iterator_map)                 \
   V(SET_KEY_VALUE_ITERATOR_MAP_INDEX, Map, set_key_value_iterator_map)         \
   V(SHARED_ARRAY_BUFFER_FUN_INDEX, JSFunction, shared_array_buffer_fun)        \
@@ -262,10 +337,14 @@ enum ContextLookupFlags {
     slow_object_with_null_prototype_map)                                       \
   V(SLOW_OBJECT_WITH_OBJECT_PROTOTYPE_MAP, Map,                                \
     slow_object_with_object_prototype_map)                                     \
-  V(SLOW_TEMPLATE_INSTANTIATIONS_CACHE_INDEX, SimpleNumberDictionary,          \
+  V(SLOW_TEMPLATE_INSTANTIATIONS_CACHE_INDEX, EphemeronHashTable,              \
     slow_template_instantiations_cache)                                        \
+  V(ATOMICS_WAITASYNC_PROMISES, OrderedHashSet, atomics_waitasync_promises)    \
+  V(SET_UINT8_ARRAY_RESULT_MAP, Map, set_unit8_array_result_map)               \
+  V(WASM_DEBUG_MAPS, FixedArray, wasm_debug_maps)                              \
   /* Fast Path Protectors */                                                   \
-  V(REGEXP_SPECIES_PROTECTOR_INDEX, PropertyCell, regexp_species_protector)    \
+  V(INITIAL_ARRAY_PROTOTYPE_VALIDITY_CELL_INDEX, Cell,                         \
+    initial_array_prototype_validity_cell)                                     \
   /* All *_FUNCTION_MAP_INDEX definitions used by Context::FunctionMapIndex */ \
   /* must remain together. */                                                  \
   V(SLOPPY_FUNCTION_MAP_INDEX, Map, sloppy_function_map)                       \
@@ -281,47 +360,42 @@ enum ContextLookupFlags {
   V(STRICT_FUNCTION_WITHOUT_PROTOTYPE_MAP_INDEX, Map,                          \
     strict_function_without_prototype_map)                                     \
   V(METHOD_WITH_NAME_MAP_INDEX, Map, method_with_name_map)                     \
-  V(METHOD_WITH_HOME_OBJECT_MAP_INDEX, Map, method_with_home_object_map)       \
-  V(METHOD_WITH_NAME_AND_HOME_OBJECT_MAP_INDEX, Map,                           \
-    method_with_name_and_home_object_map)                                      \
   V(ASYNC_FUNCTION_MAP_INDEX, Map, async_function_map)                         \
   V(ASYNC_FUNCTION_WITH_NAME_MAP_INDEX, Map, async_function_with_name_map)     \
-  V(ASYNC_FUNCTION_WITH_HOME_OBJECT_MAP_INDEX, Map,                            \
-    async_function_with_home_object_map)                                       \
-  V(ASYNC_FUNCTION_WITH_NAME_AND_HOME_OBJECT_MAP_INDEX, Map,                   \
-    async_function_with_name_and_home_object_map)                              \
   V(GENERATOR_FUNCTION_MAP_INDEX, Map, generator_function_map)                 \
   V(GENERATOR_FUNCTION_WITH_NAME_MAP_INDEX, Map,                               \
     generator_function_with_name_map)                                          \
-  V(GENERATOR_FUNCTION_WITH_HOME_OBJECT_MAP_INDEX, Map,                        \
-    generator_function_with_home_object_map)                                   \
-  V(GENERATOR_FUNCTION_WITH_NAME_AND_HOME_OBJECT_MAP_INDEX, Map,               \
-    generator_function_with_name_and_home_object_map)                          \
   V(ASYNC_GENERATOR_FUNCTION_MAP_INDEX, Map, async_generator_function_map)     \
   V(ASYNC_GENERATOR_FUNCTION_WITH_NAME_MAP_INDEX, Map,                         \
     async_generator_function_with_name_map)                                    \
-  V(ASYNC_GENERATOR_FUNCTION_WITH_HOME_OBJECT_MAP_INDEX, Map,                  \
-    async_generator_function_with_home_object_map)                             \
-  V(ASYNC_GENERATOR_FUNCTION_WITH_NAME_AND_HOME_OBJECT_MAP_INDEX, Map,         \
-    async_generator_function_with_name_and_home_object_map)                    \
   V(CLASS_FUNCTION_MAP_INDEX, Map, class_function_map)                         \
   V(STRING_FUNCTION_INDEX, JSFunction, string_function)                        \
   V(STRING_FUNCTION_PROTOTYPE_MAP_INDEX, Map, string_function_prototype_map)   \
   V(SYMBOL_FUNCTION_INDEX, JSFunction, symbol_function)                        \
+  V(IS_WASM_JS_INSTALLED_INDEX, Smi, is_wasm_js_installed)                     \
+  V(IS_WASM_JSPI_INSTALLED_INDEX, Smi, is_wasm_jspi_installed)                 \
+  V(WASM_WEBASSEMBLY_OBJECT_INDEX, JSObject, wasm_webassembly_object)          \
   V(WASM_EXPORTED_FUNCTION_MAP_INDEX, Map, wasm_exported_function_map)         \
+  V(WASM_TAG_CONSTRUCTOR_INDEX, JSFunction, wasm_tag_constructor)              \
   V(WASM_EXCEPTION_CONSTRUCTOR_INDEX, JSFunction, wasm_exception_constructor)  \
   V(WASM_GLOBAL_CONSTRUCTOR_INDEX, JSFunction, wasm_global_constructor)        \
   V(WASM_INSTANCE_CONSTRUCTOR_INDEX, JSFunction, wasm_instance_constructor)    \
+  V(WASM_JS_TAG_INDEX, JSObject, wasm_js_tag)                                  \
   V(WASM_MEMORY_CONSTRUCTOR_INDEX, JSFunction, wasm_memory_constructor)        \
   V(WASM_MODULE_CONSTRUCTOR_INDEX, JSFunction, wasm_module_constructor)        \
   V(WASM_TABLE_CONSTRUCTOR_INDEX, JSFunction, wasm_table_constructor)          \
+  V(WASM_SUSPENDING_CONSTRUCTOR_INDEX, JSFunction,                             \
+    wasm_suspending_constructor)                                               \
+  V(WASM_SUSPENDER_CONSTRUCTOR_INDEX, JSFunction, wasm_suspender_constructor)  \
+  V(WASM_SUSPENDING_MAP, Map, wasm_suspending_map)                             \
+  V(WASM_SUSPENDING_PROTOTYPE, JSObject, wasm_suspending_prototype)            \
+  V(WASM_MEMORY_MAP_DESCRIPTOR_TEMPLATE_INDEX, ObjectTemplateInfo,             \
+    wasm_memory_map_descriptor_template)                                       \
+  V(WASM_MEMORY_MAP_DESCRIPTOR_CONSTRUCTOR_INDEX, JSFunction,                  \
+    wasm_memory_map_descriptor_constructor)                                    \
   V(TEMPLATE_WEAKMAP_INDEX, HeapObject, template_weakmap)                      \
   V(TYPED_ARRAY_FUN_INDEX, JSFunction, typed_array_function)                   \
   V(TYPED_ARRAY_PROTOTYPE_INDEX, JSObject, typed_array_prototype)              \
-  V(UINT16_ARRAY_FUN_INDEX, JSFunction, uint16_array_fun)                      \
-  V(UINT32_ARRAY_FUN_INDEX, JSFunction, uint32_array_fun)                      \
-  V(UINT8_ARRAY_FUN_INDEX, JSFunction, uint8_array_fun)                        \
-  V(UINT8_CLAMPED_ARRAY_FUN_INDEX, JSFunction, uint8_clamped_array_fun)        \
   V(ARRAY_ENTRIES_ITERATOR_INDEX, JSFunction, array_entries_iterator)          \
   V(ARRAY_FOR_EACH_ITERATOR_INDEX, JSFunction, array_for_each_iterator)        \
   V(ARRAY_KEYS_ITERATOR_INDEX, JSFunction, array_keys_iterator)                \
@@ -329,80 +403,50 @@ enum ContextLookupFlags {
   V(ERROR_FUNCTION_INDEX, JSFunction, error_function)                          \
   V(ERROR_TO_STRING, JSFunction, error_to_string)                              \
   V(EVAL_ERROR_FUNCTION_INDEX, JSFunction, eval_error_function)                \
+  V(AGGREGATE_ERROR_FUNCTION_INDEX, JSFunction, aggregate_error_function)      \
   V(GLOBAL_EVAL_FUN_INDEX, JSFunction, global_eval_fun)                        \
+  V(GLOBAL_PARSE_FLOAT_FUN_INDEX, JSFunction, global_parse_float_fun)          \
+  V(GLOBAL_PARSE_INT_FUN_INDEX, JSFunction, global_parse_int_fun)              \
   V(GLOBAL_PROXY_FUNCTION_INDEX, JSFunction, global_proxy_function)            \
   V(MAP_DELETE_INDEX, JSFunction, map_delete)                                  \
   V(MAP_GET_INDEX, JSFunction, map_get)                                        \
   V(MAP_HAS_INDEX, JSFunction, map_has)                                        \
   V(MAP_SET_INDEX, JSFunction, map_set)                                        \
   V(FUNCTION_HAS_INSTANCE_INDEX, JSFunction, function_has_instance)            \
+  V(FUNCTION_TO_STRING_INDEX, JSFunction, function_to_string)                  \
   V(OBJECT_TO_STRING, JSFunction, object_to_string)                            \
+  V(OBJECT_VALUE_OF_FUNCTION_INDEX, JSFunction, object_value_of_function)      \
   V(PROMISE_ALL_INDEX, JSFunction, promise_all)                                \
-  V(PROMISE_CATCH_INDEX, JSFunction, promise_catch)                            \
+  V(PROMISE_ALL_SETTLED_INDEX, JSFunction, promise_all_settled)                \
+  V(PROMISE_ANY_INDEX, JSFunction, promise_any)                                \
   V(PROMISE_FUNCTION_INDEX, JSFunction, promise_function)                      \
   V(RANGE_ERROR_FUNCTION_INDEX, JSFunction, range_error_function)              \
   V(REFERENCE_ERROR_FUNCTION_INDEX, JSFunction, reference_error_function)      \
   V(SET_ADD_INDEX, JSFunction, set_add)                                        \
   V(SET_DELETE_INDEX, JSFunction, set_delete)                                  \
   V(SET_HAS_INDEX, JSFunction, set_has)                                        \
+  V(SHADOW_REALM_IMPORT_VALUE_REJECTED_INDEX, JSFunction,                      \
+    shadow_realm_import_value_rejected)                                        \
+  V(SUPPRESSED_ERROR_FUNCTION_INDEX, JSFunction, suppressed_error_function)    \
   V(SYNTAX_ERROR_FUNCTION_INDEX, JSFunction, syntax_error_function)            \
   V(TYPE_ERROR_FUNCTION_INDEX, JSFunction, type_error_function)                \
   V(URI_ERROR_FUNCTION_INDEX, JSFunction, uri_error_function)                  \
   V(WASM_COMPILE_ERROR_FUNCTION_INDEX, JSFunction,                             \
     wasm_compile_error_function)                                               \
   V(WASM_LINK_ERROR_FUNCTION_INDEX, JSFunction, wasm_link_error_function)      \
+  V(WASM_SUSPEND_ERROR_FUNCTION_INDEX, JSFunction,                             \
+    wasm_suspend_error_function)                                               \
   V(WASM_RUNTIME_ERROR_FUNCTION_INDEX, JSFunction,                             \
     wasm_runtime_error_function)                                               \
   V(WEAKMAP_SET_INDEX, JSFunction, weakmap_set)                                \
   V(WEAKMAP_GET_INDEX, JSFunction, weakmap_get)                                \
+  V(WEAKMAP_DELETE_INDEX, JSFunction, weakmap_delete)                          \
   V(WEAKSET_ADD_INDEX, JSFunction, weakset_add)                                \
-  V(OSR_CODE_CACHE_INDEX, WeakFixedArray, osr_code_cache)                      \
-  NATIVE_CONTEXT_INTRINSIC_FUNCTIONS(V)
-
-// A table of all script contexts. Every loaded top-level script with top-level
-// lexical declarations contributes its ScriptContext into this table.
-//
-// The table is a fixed array, its first slot is the current used count and
-// the subsequent slots 1..used contain ScriptContexts.
-class ScriptContextTable : public FixedArray {
- public:
-  DECL_CAST(ScriptContextTable)
-
-  struct LookupResult {
-    int context_index;
-    int slot_index;
-    VariableMode mode;
-    InitializationFlag init_flag;
-    MaybeAssignedFlag maybe_assigned_flag;
-  };
-
-  inline int used() const;
-  inline void set_used(int used);
-
-  static inline Handle<Context> GetContext(Isolate* isolate,
-                                           Handle<ScriptContextTable> table,
-                                           int i);
-  inline Context get_context(int i) const;
-
-  // Lookup a variable `name` in a ScriptContextTable.
-  // If it returns true, the variable is found and `result` contains
-  // valid information about its location.
-  // If it returns false, `result` is untouched.
-  V8_WARN_UNUSED_RESULT
-  V8_EXPORT_PRIVATE static bool Lookup(Isolate* isolate,
-                                       ScriptContextTable table, String name,
-                                       LookupResult* result);
-
-  V8_WARN_UNUSED_RESULT
-  static Handle<ScriptContextTable> Extend(Handle<ScriptContextTable> table,
-                                           Handle<Context> script_context);
-
-  static const int kUsedSlotIndex = 0;
-  static const int kFirstContextSlotIndex = 1;
-  static const int kMinLength = kFirstContextSlotIndex;
-
-  OBJECT_CONSTRUCTORS(ScriptContextTable, FixedArray);
-};
+  V(WRAPPED_FUNCTION_MAP_INDEX, Map, wrapped_function_map)                     \
+  V(RETAINED_MAPS, Object, retained_maps)                                      \
+  V(SHARED_SPACE_JS_OBJECT_HAS_INSTANCE_INDEX, JSFunction,                     \
+    shared_space_js_object_has_instance)                                       \
+  NATIVE_CONTEXT_FIELDS_TEMPORAL(V)
 
 // JSFunctions are pairs (context, function code), sometimes also called
 // closures. A Context object is used to represent function contexts and
@@ -420,12 +464,14 @@ class ScriptContextTable : public FixedArray {
 //
 // [ previous       ]  A pointer to the previous context.
 //
-// [ extension      ]  Additional data.
+// [ extension      ]  Additional data. This slot is only available when
+//                     ScopeInfo::HasContextExtensionSlot returns true.
 //
 //                     For native contexts, it contains the global object.
 //                     For module contexts, it contains the module object.
 //                     For await contexts, it contains the generator object.
-//                     For block contexts, it may contain an "extension object".
+//                     For var block contexts, it may contain an "extension
+//                     object".
 //                     For with contexts, it contains an "extension object".
 //
 //                     An "extension object" is used to dynamically extend a
@@ -436,11 +482,10 @@ class ScriptContextTable : public FixedArray {
 //                     extension object is the original purpose of this context
 //                     slot, hence the name.)
 //
-// [ native_context ]  A pointer to the native context.
-//
-// In addition, function contexts may have statically allocated context slots
-// to store local variables/functions that are accessed from inner functions
-// (via static context addresses) or through 'eval' (dynamic context lookups).
+// In addition, function contexts with sloppy eval may have statically
+// allocated context slots to store local variables/functions that are accessed
+// from inner functions (via static context addresses) or through 'eval'
+// (dynamic context lookups).
 // The native context contains additional slots for fast access to native
 // properties.
 //
@@ -449,60 +494,57 @@ class ScriptContextTable : public FixedArray {
 // Script contexts from all top-level scripts are gathered in
 // ScriptContextTable.
 
-class Context : public HeapObject {
+V8_OBJECT class Context : public HeapObject {
  public:
-  NEVER_READ_ONLY_SPACE
+  V8_IT_ABSTRACT;
+  inline int length() const;
+  inline void set_length(int value);
+  inline int length(RelaxedLoadTag) const;
+  inline void set_length(int value, RelaxedStoreTag);
 
-  DECL_CAST(Context)
+  V8_INLINE bool IsElementTdzHole(int index);
 
-  enum class HasExtension { kYes, kNo };
+  template <typename MemoryTag>
+  V8_INLINE Tagged<Object> GetNoCell(int index, MemoryTag tag);
+  template <typename MemoryTag>
+  V8_INLINE void SetNoCell(int index, Tagged<Object> value, MemoryTag tag,
+                           WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
 
-  // [length]: length of the context.
-  V8_INLINE int length() const;
-  V8_INLINE int synchronized_length() const;
-  V8_INLINE void initialize_length_and_extension_bit(
-      int len, HasExtension flag = HasExtension::kNo);
+  V8_INLINE Tagged<Object> GetNoCell(int index);
+  V8_INLINE void SetNoCell(int index, Tagged<Object> value,
+                           WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
 
-  // We use the 30th bit. Otherwise if we set the 31st bit,
-  // the number would be pottentially bigger than an SMI.
-  // Any DCHECK(Smi::IsValue(...)) would fail.
-  using LengthField = BitField<int, 0, kSmiValueSize - 2>;
-  using HasExtensionField = BitField<int, kSmiValueSize - 2, 1>;
+  V8_EXPORT_PRIVATE static DirectHandle<Object> Get(
+      DirectHandle<Context> context, int index, Isolate* isolate);
+  V8_EXPORT_PRIVATE static void Set(DirectHandle<Context> context, int index,
+                                    DirectHandle<Object> new_value,
+                                    Isolate* isolate);
 
-  // Setter and getter for elements.
-  V8_INLINE Object get(int index) const;
-  V8_INLINE Object get(Isolate* isolate, int index) const;
-  V8_INLINE void set(int index, Object value);
-  // Setter with explicit barrier mode.
-  V8_INLINE void set(int index, Object value, WriteBarrierMode mode);
-
-  DEFINE_FIELD_OFFSET_CONSTANTS(HeapObject::kHeaderSize,
-                                TORQUE_GENERATED_CONTEXT_FIELDS)
-  // TODO(v8:8989): [torque] Support marker constants.
-  /* TODO(ishell): remove this fixedArray-like header size. */
-  static const int kFixedArrayLikeHeaderSize = kScopeInfoOffset;
-  static const int kStartOfTaggedFieldsOffset = kScopeInfoOffset;
-  /* Header size. */                                                  \
-  /* TODO(ishell): use this as header size once MIN_CONTEXT_SLOTS */  \
-  /* is removed in favour of offset-based access to common fields. */ \
-  static const int kTodoHeaderSize = kHeaderSize;
+  static const int kElementsOffset;
+  static const int kHeaderSize;
+  static const int kScopeInfoOffset;
+  static const int kPreviousOffset;
+  // TODO(ishell): use kTodoHeaderSize as header size once MIN_CONTEXT_SLOTS
+  // is removed in favour of offset-based access to common fields.
+  static const int kTodoHeaderSize;
+  // If the extension slot exists, it is the first slot after the header.
+  static const int kExtensionOffset;
+  static const int kExtensionSize;
+  static const int kExtendedHeaderSize;
 
   // Garbage collection support.
-  V8_INLINE static constexpr int SizeFor(int length) {
-    // TODO(ishell): switch to kTodoHeaderSize based approach once we no longer
-    // reference common Context fields via index
-    return kFixedArrayLikeHeaderSize + length * kTaggedSize;
-  }
+  static inline constexpr int SizeFor(int length);
+  inline int AllocatedSize() const;
 
   // Code Generation support.
   // Offset of the element from the beginning of object.
-  V8_INLINE static constexpr int OffsetOfElementAt(int index) {
-    return SizeFor(index);
-  }
+  static inline constexpr int OffsetOfElementAt(int index);
   // Offset of the element from the heap object pointer.
-  V8_INLINE static constexpr int SlotOffset(int index) {
-    return SizeFor(index) - kHeapObjectTag;
-  }
+  static inline constexpr int SlotOffset(int index);
+
+  // Initializes the variable slots of the context. Lexical variables that need
+  // initialization are filled with the hole.
+  void Initialize(Isolate* isolate);
 
   // TODO(ishell): eventually migrate to the offset based access instead of
   // index-based.
@@ -512,8 +554,9 @@ class Context : public HeapObject {
     // These slots are in all contexts.
     SCOPE_INFO_INDEX,
     PREVIOUS_INDEX,
+
+    // This slot only exists if ScopeInfo::HasContextExtensionSlot returns true.
     EXTENSION_INDEX,
-    NATIVE_CONTEXT_INDEX,
 
 // These slots are only in native contexts.
 #define NATIVE_CONTEXT_SLOT(index, type, name) index,
@@ -522,74 +565,75 @@ class Context : public HeapObject {
 
     // Properties from here are treated as weak references by the full GC.
     // Scavenge treats them as strong references.
-    OPTIMIZED_CODE_LIST,    // Weak.
-    DEOPTIMIZED_CODE_LIST,  // Weak.
-    NEXT_CONTEXT_LINK,      // Weak.
+    NEXT_CONTEXT_LINK,  // Weak.
 
     // Total number of slots.
     NATIVE_CONTEXT_SLOTS,
-    FIRST_WEAK_SLOT = OPTIMIZED_CODE_LIST,
+    FIRST_WEAK_SLOT = NEXT_CONTEXT_LINK,
     FIRST_JS_ARRAY_MAP_SLOT = JS_ARRAY_PACKED_SMI_ELEMENTS_MAP_INDEX,
 
     // TODO(shell): Remove, once it becomes zero
-    MIN_CONTEXT_SLOTS = GLOBAL_PROXY_INDEX,
+    MIN_CONTEXT_SLOTS = EXTENSION_INDEX,
+    MIN_CONTEXT_EXTENDED_SLOTS = EXTENSION_INDEX + 1,
 
     // This slot holds the thrown value in catch contexts.
     THROWN_OBJECT_INDEX = MIN_CONTEXT_SLOTS,
 
     // These slots hold values in debug evaluate contexts.
-    WRAPPED_CONTEXT_INDEX = MIN_CONTEXT_SLOTS,
-    BLACK_LIST_INDEX = MIN_CONTEXT_SLOTS + 1
+    WRAPPED_CONTEXT_INDEX = MIN_CONTEXT_EXTENDED_SLOTS,
   };
 
   // A region of native context entries containing maps for functions created
-  // by Builtins::kFastNewClosure.
+  // by Builtin::kFastNewClosure.
   static const int FIRST_FUNCTION_MAP_INDEX = SLOPPY_FUNCTION_MAP_INDEX;
   static const int LAST_FUNCTION_MAP_INDEX = CLASS_FUNCTION_MAP_INDEX;
 
+  static const int FIRST_FIXED_TYPED_ARRAY_FUN_INDEX = UINT8_ARRAY_FUN_INDEX;
+  static const int FIRST_RAB_GSAB_TYPED_ARRAY_MAP_INDEX =
+      RAB_GSAB_UINT8_ARRAY_MAP_INDEX;
+
   static const int kNoContext = 0;
-  static const int kInvalidContext = 1;
 
   // Direct slot access.
-  inline void set_scope_info(ScopeInfo scope_info);
+  DECL_ACCESSORS(scope_info, Tagged<ScopeInfo>)
 
-  inline Object unchecked_previous();
-  inline Context previous();
-  inline void set_previous(Context context);
+  inline Tagged<Object> unchecked_previous() const;
+  inline Tagged<Context> previous() const;
 
-  inline Object next_context_link();
+  inline Tagged<Object> next_context_link() const;
+  inline void set_next_context_link(
+      Tagged<Object> object, WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
 
-  inline bool has_extension();
-  inline HeapObject extension();
-  inline void set_extension(HeapObject object);
-  JSObject extension_object();
-  JSReceiver extension_receiver();
-  V8_EXPORT_PRIVATE ScopeInfo scope_info();
+  inline bool has_extension() const;
+  inline Tagged<HeapObject> extension() const;
+  V8_EXPORT_PRIVATE void set_extension(
+      Tagged<HeapObject> object, WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
+  Tagged<JSObject> extension_object() const;
+  Tagged<JSReceiver> extension_receiver() const;
 
   // Find the module context (assuming there is one) and return the associated
   // module object.
-  SourceTextModule module();
+  Tagged<SourceTextModule> module() const;
 
   // Get the context where var declarations will be hoisted to, which
   // may be the context itself.
-  Context declaration_context();
-  bool is_declaration_context();
+  Tagged<Context> declaration_context() const;
+  bool is_declaration_context() const;
 
   // Get the next closure's context on the context chain.
-  Context closure_context();
+  Tagged<Context> closure_context() const;
 
   // Returns a JSGlobalProxy object or null.
-  V8_EXPORT_PRIVATE JSGlobalProxy global_proxy();
+  V8_EXPORT_PRIVATE inline Tagged<JSGlobalProxy> global_proxy() const;
 
   // Get the JSGlobalObject object.
-  V8_EXPORT_PRIVATE JSGlobalObject global_object();
+  V8_EXPORT_PRIVATE inline Tagged<JSGlobalObject> global_object() const;
 
   // Get the script context by traversing the context chain.
-  Context script_context();
+  Tagged<Context> script_context() const;
 
   // Compute the native context.
-  inline NativeContext native_context() const;
-  inline void set_native_context(NativeContext context);
+  inline Tagged<NativeContext> native_context() const;
 
   // Predicates for context types.  IsNativeContext is already defined on
   // Object.
@@ -602,18 +646,16 @@ class Context : public HeapObject {
   inline bool IsModuleContext() const;
   inline bool IsEvalContext() const;
   inline bool IsScriptContext() const;
-
-  inline bool HasSameSecurityTokenAs(Context that) const;
+  inline bool HasContextCells() const;
 
   Handle<Object> ErrorMessageForCodeGenerationFromStrings();
+  DirectHandle<Object> ErrorMessageForWasmCodeGeneration();
 
-  static int IntrinsicIndexForName(Handle<String> name);
-  static int IntrinsicIndexForName(const unsigned char* name, int length);
-
-#define NATIVE_CONTEXT_FIELD_ACCESSORS(index, type, name) \
-  inline void set_##name(type value);                     \
-  inline bool is_##name(type value) const;                \
-  inline type name() const;
+#define NATIVE_CONTEXT_FIELD_ACCESSORS(index, type, name)   \
+  inline void set_##name(Tagged<UNPAREN(type)> value);      \
+  inline bool is_##name(Tagged<UNPAREN(type)> value) const; \
+  inline Tagged<UNPAREN(type)> name() const;                \
+  inline Tagged<UNPAREN(type)> name(AcquireLoadTag) const;
   NATIVE_CONTEXT_FIELDS(NATIVE_CONTEXT_FIELD_ACCESSORS)
 #undef NATIVE_CONTEXT_FIELD_ACCESSORS
 
@@ -645,16 +687,16 @@ class Context : public HeapObject {
                                VariableMode* variable_mode,
                                bool* is_sloppy_function_name = nullptr);
 
-  static inline int FunctionMapIndex(LanguageMode language_mode,
-                                     FunctionKind kind, bool has_shared_name,
-                                     bool needs_home_object);
+  V8_EXPORT_PRIVATE static int FunctionMapIndex(LanguageMode language_mode,
+                                                FunctionKind kind,
+                                                bool has_shared_name);
 
   static int ArrayMapIndex(ElementsKind elements_kind) {
     DCHECK(IsFastElementsKind(elements_kind));
-    return elements_kind + FIRST_JS_ARRAY_MAP_SLOT;
+    return int{elements_kind} + FIRST_JS_ARRAY_MAP_SLOT;
   }
 
-  inline Map GetInitialJSArrayMap(ElementsKind kind) const;
+  inline Tagged<Map> GetInitialJSArrayMap(ElementsKind kind) const;
 
   static const int kNotFound = -1;
 
@@ -662,28 +704,141 @@ class Context : public HeapObject {
   DECL_PRINTER(Context)
   DECL_VERIFIER(Context)
 
-  using BodyDescriptor = FlexibleBodyDescriptor<kStartOfTaggedFieldsOffset>;
+  class BodyDescriptor;
+
+#ifdef VERIFY_HEAP
+  V8_EXPORT_PRIVATE void VerifyExtensionSlot(Tagged<HeapObject> extension);
+#endif
+
+ protected:
+  // Setter and getter for elements (relaxed / acquire-release variants).
+  V8_INLINE Tagged<Object> get(int index, RelaxedLoadTag) const;
+  V8_INLINE Tagged<Object> get(int index, AcquireLoadTag) const;
+  V8_INLINE void set(int index, Tagged<Object> value,
+                     WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
+  V8_INLINE void set(int index, Tagged<Object> value, WriteBarrierMode mode,
+                     RelaxedStoreTag);
+  V8_INLINE void set(int index, Tagged<Object> value, WriteBarrierMode mode,
+                     ReleaseStoreTag);
+
+  // These classes can load an element with a context cell.
+  friend class compiler::ContextRef;
+  friend class JavaScriptFrame;
+  friend class V8HeapExplorer;
+
+#ifdef OBJECT_PRINT
+  void PrintContextWithHeader(std::ostream& os, const char* type);
+#endif
 
  private:
 #ifdef DEBUG
   // Bootstrapping-aware type checks.
-  V8_EXPORT_PRIVATE static bool IsBootstrappingOrNativeContext(Isolate* isolate,
-                                                               Object object);
-  static bool IsBootstrappingOrValidParentContext(Object object, Context kid);
+  V8_EXPORT_PRIVATE static bool IsBootstrappingOrValidParentContext(
+      Tagged<Object> object, Tagged<Context> kid);
 #endif
 
-  OBJECT_CONSTRUCTORS(Context, HeapObject);
-  DECL_INT_ACCESSORS(length_and_extension_flag)
-  DECL_SYNCHRONIZED_INT_ACCESSORS(length_and_extension_flag)
-};
+  friend class Factory;
+  inline void set_previous(Tagged<Context> context,
+                           WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
 
-class NativeContext : public Context {
  public:
-  DECL_CAST(NativeContext)
+  TaggedMember<Smi> length_;
+  FLEXIBLE_ARRAY_MEMBER(TaggedMember<Object>, elements);
+} V8_OBJECT_END;
+
+inline constexpr int Context::kElementsOffset = OFFSET_OF_DATA_START(Context);
+inline constexpr int Context::kHeaderSize = Context::kElementsOffset;
+inline constexpr int Context::kScopeInfoOffset = Context::kElementsOffset;
+inline constexpr int Context::kPreviousOffset =
+    Context::kScopeInfoOffset + kTaggedSize;
+inline constexpr int Context::kTodoHeaderSize =
+    Context::kPreviousOffset + kTaggedSize;
+inline constexpr int Context::kExtensionOffset = Context::kTodoHeaderSize;
+inline constexpr int Context::kExtensionSize =
+    (Context::MIN_CONTEXT_EXTENDED_SLOTS - Context::MIN_CONTEXT_SLOTS) *
+    kTaggedSize;
+inline constexpr int Context::kExtendedHeaderSize =
+    Context::kTodoHeaderSize + Context::kExtensionSize;
+
+inline constexpr int Context::SizeFor(int length) {
+  return kElementsOffset + length * kTaggedSize;
+}
+inline constexpr int Context::OffsetOfElementAt(int index) {
+  return SizeFor(index);
+}
+inline constexpr int Context::SlotOffset(int index) {
+  return OffsetOfElementAt(index) - kHeapObjectTag;
+}
+
+V8_OBJECT class AwaitContext : public Context {
+} V8_OBJECT_END;
+V8_OBJECT class BlockContext : public Context {
+} V8_OBJECT_END;
+V8_OBJECT class CatchContext : public Context {
+} V8_OBJECT_END;
+V8_OBJECT class DebugEvaluateContext : public Context {
+} V8_OBJECT_END;
+V8_OBJECT class EvalContext : public Context {
+} V8_OBJECT_END;
+V8_OBJECT class ModuleContext : public Context {
+} V8_OBJECT_END;
+V8_OBJECT class ScriptContext : public Context {
+} V8_OBJECT_END;
+V8_OBJECT class WithContext : public Context {
+} V8_OBJECT_END;
+V8_OBJECT class FunctionContext : public Context {
+} V8_OBJECT_END;
+
+V8_OBJECT class NativeContext : public Context {
+  V8_IT_NO_AUTO_DISPATCH;
+
+ public:
   // TODO(neis): Move some stuff from Context here.
 
+  inline bool HasSameSecurityTokenAs(Tagged<NativeContext> that) const;
+
+  // NativeContext fields are read concurrently from background threads; any
+  // concurrent writes of affected fields must have acquire-release semantics,
+  // thus we hide the non-atomic setter. Note this doesn't protect fully since
+  // one could still use Context::set and/or write directly using offsets (e.g.
+  // from CSA/Torque).
+  void set(int index, Tagged<Object> value, WriteBarrierMode mode) = delete;
+  V8_INLINE void set(int index, Tagged<Object> value, WriteBarrierMode mode,
+                     ReleaseStoreTag);
+
   // [microtask_queue]: pointer to the MicrotaskQueue object.
-  DECL_PRIMITIVE_ACCESSORS(microtask_queue, MicrotaskQueue*)
+  static constexpr int kMicrotaskQueueSlotSize = kCppHeapPointerSlotSize;
+  DECL_CPP_POINTER_ACCESSORS(microtask_queue, MicrotaskQueue*)
+
+  inline void synchronized_set_script_context_table(
+      Tagged<ScriptContextTable> script_context_table);
+  inline Tagged<ScriptContextTable> synchronized_script_context_table() const;
+
+  // Returns whether the context is detached or not.
+  inline bool IsDetached() const;
+
+  // Returns a JSGlobalProxy object or null.
+  V8_EXPORT_PRIVATE inline Tagged<JSGlobalProxy> global_proxy() const;
+
+  // Get the JSGlobalObject object.
+  V8_EXPORT_PRIVATE inline Tagged<JSGlobalObject> global_object() const;
+
+  // Caution, hack: this getter ignores the AcquireLoadTag. The global_object
+  // slot is safe to read concurrently since it is immutable after
+  // initialization.  This function should *not* be used from anywhere other
+  // than heap-refs.cc.
+  // TODO(jgruber): Remove this function after NativeContextRef is actually
+  // never serialized and BROKER_NATIVE_CONTEXT_FIELDS is removed.
+  V8_EXPORT_PRIVATE inline Tagged<JSGlobalObject> global_object(
+      AcquireLoadTag) const;
+
+  inline Tagged<Map> TypedArrayElementsKindToCtorMap(
+      ElementsKind element_kind) const;
+
+  inline Tagged<Map> TypedArrayElementsKindToRabGsabCtorMap(
+      ElementsKind element_kind) const;
+
+  bool HasTemplateLiteralObject(Tagged<JSArray> array);
 
   // Dispatched behavior.
   DECL_PRINTER(NativeContext)
@@ -693,7 +848,7 @@ class NativeContext : public Context {
 #define NATIVE_CONTEXT_FIELDS_DEF(V)                                        \
   /* TODO(ishell): move definition of common context offsets to Context. */ \
   V(kStartOfNativeContextFieldsOffset,                                      \
-    (FIRST_WEAK_SLOT - MIN_CONTEXT_SLOTS) * kTaggedSize)                    \
+    (FIRST_WEAK_SLOT - MIN_CONTEXT_EXTENDED_SLOTS) * kTaggedSize)           \
   V(kEndOfStrongFieldsOffset, 0)                                            \
   V(kStartOfWeakFieldsOffset,                                               \
     (NATIVE_CONTEXT_SLOTS - FIRST_WEAK_SLOT) * kTaggedSize)                 \
@@ -701,38 +856,159 @@ class NativeContext : public Context {
   V(kEndOfNativeContextFieldsOffset, 0)                                     \
   V(kEndOfTaggedFieldsOffset, 0)                                            \
   /* Raw data. */                                                           \
-  V(kMicrotaskQueueOffset, kSystemPointerSize)                              \
+  V(kMicrotaskQueueOffset, kMicrotaskQueueSlotSize)                         \
   /* Total size. */                                                         \
   V(kSize, 0)
 
-  DEFINE_FIELD_OFFSET_CONSTANTS(Context::kTodoHeaderSize,
+  DEFINE_FIELD_OFFSET_CONSTANTS(Context::kExtendedHeaderSize,
                                 NATIVE_CONTEXT_FIELDS_DEF)
 #undef NATIVE_CONTEXT_FIELDS_DEF
 
   class BodyDescriptor;
 
-  // The native context stores a list of all optimized code and a list of all
-  // deoptimized code, which are needed by the deoptimizer.
-  V8_EXPORT_PRIVATE void AddOptimizedCode(Code code);
-  void SetOptimizedCodeListHead(Object head);
-  Object OptimizedCodeListHead();
-  void SetDeoptimizedCodeListHead(Object head);
-  Object DeoptimizedCodeListHead();
-
-  inline OSROptimizedCodeCache GetOSROptimizedCodeCache();
-
   void ResetErrorsThrown();
   void IncrementErrorsThrown();
   int GetErrorsThrown();
 
- private:
-  STATIC_ASSERT(OffsetOfElementAt(EMBEDDER_DATA_INDEX) ==
-                Internals::kNativeContextEmbedderDataOffset);
+#ifdef V8_ENABLE_JAVASCRIPT_PROMISE_HOOKS
+  void RunPromiseHook(PromiseHookType type, DirectHandle<JSPromise> promise,
+                      DirectHandle<Object> parent);
+#endif
 
-  OBJECT_CONSTRUCTORS(NativeContext, Context);
-};
+ private:
+  // TODO(ishell): define fields using TaggedMember<T> and CppHeapMember<T>
+  // once the latter is available.
+  // TaggedMember<Object> elements_[Context::NATIVE_CONTEXT_SLOTS];
+  // CppHeapMember<MicrotaskQueue> microtask_queue_;
+
+  static_assert(OffsetOfElementAt(EMBEDDER_DATA_INDEX) ==
+                Internals::kNativeContextEmbedderDataOffset);
+} V8_OBJECT_END;
+
+// A table of all script contexts. Every loaded top-level script with top-level
+// lexical declarations contributes its ScriptContext into this table.
+V8_OBJECT class ScriptContextTable
+    : public TaggedArrayBase<ScriptContextTable, Context, HeapObject> {
+  using Super = TaggedArrayBase<ScriptContextTable, Context, HeapObject>;
+
+ public:
+  static constexpr RootIndex kMapRootIndex = RootIndex::kScriptContextTableMap;
+
+  static Handle<ScriptContextTable> New(
+      Isolate* isolate, uint32_t capacity,
+      AllocationType allocation = AllocationType::kYoung);
+
+  inline SafeHeapObjectSize length() const {
+    return SafeHeapObjectSize(length_);
+  }
+  inline SafeHeapObjectSize ulength() const { return length(); }
+  inline void set_length(uint32_t value) { length_ = value; }
+
+  inline SafeHeapObjectSize length(AcquireLoadTag) const;
+  inline void set_length(uint32_t value, ReleaseStoreTag);
+
+  inline Tagged<NameToIndexHashTable> names_to_context_index() const;
+  inline void set_names_to_context_index(
+      Tagged<NameToIndexHashTable> value,
+      WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
+
+  inline Tagged<Context> get(uint32_t index) const;
+  inline Tagged<Context> get(uint32_t index, AcquireLoadTag) const;
+
+  // Lookup a variable `name` in a ScriptContextTable.
+  // If it returns true, the variable is found and `result` contains
+  // valid information about its location.
+  // If it returns false, `result` is untouched.
+  V8_WARN_UNUSED_RESULT
+  V8_EXPORT_PRIVATE bool Lookup(DirectHandle<String> name,
+                                VariableLookupResult* result);
+
+  V8_WARN_UNUSED_RESULT
+  V8_EXPORT_PRIVATE static Handle<ScriptContextTable> Add(
+      Isolate* isolate, Handle<ScriptContextTable> table,
+      DirectHandle<Context> script_context, bool ignore_duplicates);
+
+  DECL_PRINTER(ScriptContextTable)
+  DECL_VERIFIER(ScriptContextTable)
+
+  class BodyDescriptor;
+
+  static constexpr uint32_t kCapacityOffset = sizeof(HeapObject);
+  static constexpr uint32_t kLengthOffset = kCapacityOffset + kApiInt32Size;
+  static constexpr uint32_t kHeaderSize =
+      kLengthOffset + kApiInt32Size +
+      (TAGGED_SIZE_8_BYTES ? kTaggedSize : kApiInt32Size);
+
+ public:
+  uint32_t capacity_;
+  uint32_t length_;
+  TaggedMember<NameToIndexHashTable> names_to_context_index_;
+  FLEXIBLE_ARRAY_MEMBER(typename Super::ElementMemberT, objects);
+} V8_OBJECT_END;
 
 using ContextField = Context::Field;
+
+V8_OBJECT class ContextCell : public HeapObject {
+ public:
+  enum State : int32_t {
+    kConst = 0,
+    kSmi = 1,
+    kInt32 = 2,
+    kFloat64 = 3,
+    kDetached = 4,  // The context cell is not attached to a context anymore.
+  };
+
+  DECL_VERIFIER(ContextCell)
+  DECL_PRINTER(ContextCell)
+
+  inline State state() const;
+  inline void set_state(State state);
+
+  inline Tagged<DependentCode> dependent_code() const;
+  inline void set_dependent_code(Tagged<DependentCode> value,
+                                 WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
+
+  inline Tagged<JSAny> tagged_value() const;
+  inline void set_tagged_value(Tagged<JSAny> value,
+                               WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
+  inline void clear_tagged_value();
+
+  inline void set_smi_value(Tagged<Smi> value);
+
+  inline int32_t int32_value() const;
+  inline void set_int32_value(int32_t value);
+
+  inline double float64_value() const;
+  inline void set_float64_value(double value);
+
+  inline void clear_padding();
+
+ private:
+  friend class CodeStubAssembler;
+  friend struct ObjectTraits<ContextCell>;
+  friend class TorqueGeneratedContextCellAsserts;
+  friend class maglev::StoreSmiContextCell;
+  friend class maglev::StoreInt32ContextCell;
+  friend class maglev::StoreFloat64ContextCell;
+  friend class maglev::MaglevGraphBuilder;
+  friend class maglev::MaglevAssembler;
+  friend class compiler::AccessBuilder;
+
+  TaggedMember<JSAny> tagged_value_;
+  TaggedMember<DependentCode> dependent_code_;
+  std::atomic<State> state_;
+#if TAGGED_SIZE_8_BYTES
+  uint32_t optional_padding_;
+#endif  // TAGGED_SIZE_8_BYTES
+  UnalignedDoubleMember double_value_;
+} V8_OBJECT_END;
+
+template <>
+struct ObjectTraits<ContextCell> {
+  using BodyDescriptor =
+      FixedBodyDescriptor<offsetof(ContextCell, tagged_value_),
+                          offsetof(ContextCell, state_), sizeof(ContextCell)>;
+};
 
 }  // namespace internal
 }  // namespace v8

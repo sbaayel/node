@@ -131,20 +131,36 @@ assert.throws(() => {
 });
 
 // BASE64
-testBufs('YWJj', 'ucs2');
-testBufs('yKJhYQ==', 'ucs2');
-testBufs('Yci0Ysi1Y8i2', 'ucs2');
-testBufs('YWJj', 4, 'ucs2');
-testBufs('YWJj', SIZE, 'ucs2');
-testBufs('yKJhYQ==', 2, 'ucs2');
-testBufs('yKJhYQ==', 8, 'ucs2');
-testBufs('Yci0Ysi1Y8i2', 4, 'ucs2');
-testBufs('Yci0Ysi1Y8i2', 12, 'ucs2');
-testBufs('YWJj', 4, 1, 'ucs2');
-testBufs('YWJj', 5, 1, 'ucs2');
-testBufs('yKJhYQ==', 8, 1, 'ucs2');
-testBufs('Yci0Ysi1Y8i2', 4, 1, 'ucs2');
-testBufs('Yci0Ysi1Y8i2', 12, 1, 'ucs2');
+testBufs('YWJj', 'base64');
+testBufs('yKJhYQ==', 'base64');
+testBufs('Yci0Ysi1Y8i2', 'base64');
+testBufs('YWJj', 4, 'base64');
+testBufs('YWJj', SIZE, 'base64');
+testBufs('yKJhYQ==', 2, 'base64');
+testBufs('yKJhYQ==', 8, 'base64');
+testBufs('Yci0Ysi1Y8i2', 4, 'base64');
+testBufs('Yci0Ysi1Y8i2', 12, 'base64');
+testBufs('YWJj', 4, 1, 'base64');
+testBufs('YWJj', 5, 1, 'base64');
+testBufs('yKJhYQ==', 8, 1, 'base64');
+testBufs('Yci0Ysi1Y8i2', 4, 1, 'base64');
+testBufs('Yci0Ysi1Y8i2', 12, 1, 'base64');
+
+// BASE64URL
+testBufs('YWJj', 'base64url');
+testBufs('yKJhYQ', 'base64url');
+testBufs('Yci0Ysi1Y8i2', 'base64url');
+testBufs('YWJj', 4, 'base64url');
+testBufs('YWJj', SIZE, 'base64url');
+testBufs('yKJhYQ', 2, 'base64url');
+testBufs('yKJhYQ', 8, 'base64url');
+testBufs('Yci0Ysi1Y8i2', 4, 'base64url');
+testBufs('Yci0Ysi1Y8i2', 12, 'base64url');
+testBufs('YWJj', 4, 1, 'base64url');
+testBufs('YWJj', 5, 1, 'base64url');
+testBufs('yKJhYQ', 8, 1, 'base64url');
+testBufs('Yci0Ysi1Y8i2', 4, 1, 'base64url');
+testBufs('Yci0Ysi1Y8i2', 12, 1, 'base64url');
 
 // Buffer
 function deepStrictEqualValues(buf, arr) {
@@ -189,7 +205,7 @@ assert.throws(
 
 [
   ['a', 0, 0, NaN],
-  ['a', 0, 0, false]
+  ['a', 0, 0, false],
 ].forEach((args) => {
   assert.throws(
     () => buf1.fill(...args),
@@ -299,7 +315,7 @@ Buffer.alloc(8, '');
 
   buf.fill('h');
   for (let i = 0; i < buf.length; i++)
-    assert.strictEqual('h'.charCodeAt(0), buf[i]);
+    assert.strictEqual(buf[i], 'h'.charCodeAt(0));
 
   buf.fill(0);
   for (let i = 0; i < buf.length; i++)
@@ -325,10 +341,12 @@ Buffer.alloc(8, '');
   assert.strictEqual(buf.toString(), 'էէէէէ');
 }
 
-// Testing process.binding. Make sure "start" is properly checked for -1 wrap
-// around.
-assert.strictEqual(
-  internalBinding('buffer').fill(Buffer.alloc(1), 1, -1, 0, 1), -2);
+// Testing process.binding. Make sure "start" is properly checked for range
+// errors.
+assert.throws(
+  () => { internalBinding('buffer').fill(Buffer.alloc(1), 1, -1, 0, 1); },
+  { code: 'ERR_OUT_OF_RANGE' }
+);
 
 // Make sure "end" is properly checked, even if it's magically mangled using
 // Symbol.toPrimitive.
@@ -347,10 +365,12 @@ assert.strictEqual(
   });
 }
 
-// Testing process.binding. Make sure "end" is properly checked for -1 wrap
-// around.
-assert.strictEqual(
-  internalBinding('buffer').fill(Buffer.alloc(1), 1, 1, -2, 1), -2);
+// Testing process.binding. Make sure "end" is properly checked for range
+// errors.
+assert.throws(
+  () => { internalBinding('buffer').fill(Buffer.alloc(1), 1, 1, -2, 1); },
+  { code: 'ERR_OUT_OF_RANGE' }
+);
 
 // Test that bypassing 'length' won't cause an abort.
 assert.throws(() => {
@@ -409,3 +429,18 @@ assert.throws(() => {
   code: 'ERR_INVALID_ARG_VALUE',
   name: 'TypeError'
 });
+
+
+{
+  const bufEmptyString = Buffer.alloc(5, '');
+  assert.strictEqual(bufEmptyString.toString(), '\x00\x00\x00\x00\x00');
+
+  const bufEmptyArray = Buffer.alloc(5, []);
+  assert.strictEqual(bufEmptyArray.toString(), '\x00\x00\x00\x00\x00');
+
+  const bufEmptyBuffer = Buffer.alloc(5, Buffer.alloc(5));
+  assert.strictEqual(bufEmptyBuffer.toString(), '\x00\x00\x00\x00\x00');
+
+  const bufZero = Buffer.alloc(5, 0);
+  assert.strictEqual(bufZero.toString(), '\x00\x00\x00\x00\x00');
+}

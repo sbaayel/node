@@ -6,59 +6,26 @@
 #define V8_EXECUTION_ISOLATE_UTILS_INL_H_
 
 #include "src/execution/isolate-utils.h"
+// Include the non-inl header before the rest of the headers.
 
 #include "src/common/ptr-compr-inl.h"
 #include "src/execution/isolate.h"
-#include "src/heap/heap-write-barrier-inl.h"
+#include "src/heap/heap-layout-inl.h"
+#include "src/sandbox/isolate.h"
 
-namespace v8 {
-namespace internal {
+namespace v8::internal {
 
-inline Isolate* GetIsolateForPtrCompr(HeapObject object) {
-#ifdef V8_COMPRESS_POINTERS
-  return Isolate::FromRoot(GetIsolateRoot(object.ptr()));
-#else
-  return nullptr;
-#endif  // V8_COMPRESS_POINTERS
-}
-
-V8_INLINE Heap* GetHeapFromWritableObject(HeapObject object) {
-#ifdef V8_COMPRESS_POINTERS
-  return GetIsolateFromWritableObject(object)->heap();
-#else
-  heap_internals::MemoryChunk* chunk =
-      heap_internals::MemoryChunk::FromHeapObject(object);
-  return chunk->GetHeap();
-#endif  // V8_COMPRESS_POINTERS
-}
-
-V8_INLINE Isolate* GetIsolateFromWritableObject(HeapObject object) {
-#ifdef V8_COMPRESS_POINTERS
-  Isolate* isolate = Isolate::FromRoot(GetIsolateRoot(object.ptr()));
-  DCHECK_NOT_NULL(isolate);
-  return isolate;
-#else
-  return Isolate::FromHeap(GetHeapFromWritableObject(object));
-#endif  // V8_COMPRESS_POINTERS
-}
-
-V8_INLINE bool GetIsolateFromHeapObject(HeapObject object, Isolate** isolate) {
-#ifdef V8_COMPRESS_POINTERS
-  *isolate = GetIsolateFromWritableObject(object);
-  return true;
-#else
-  heap_internals::MemoryChunk* chunk =
-      heap_internals::MemoryChunk::FromHeapObject(object);
+V8_INLINE bool GetIsolateFromHeapObject(Tagged<HeapObject> object,
+                                        Isolate** isolate) {
+  MemoryChunk* chunk = MemoryChunk::FromHeapObject(object);
   if (chunk->InReadOnlySpace()) {
     *isolate = nullptr;
     return false;
   }
-  *isolate = Isolate::FromHeap(chunk->GetHeap());
+  *isolate = Isolate::FromHeap(chunk->Metadata()->heap());
   return true;
-#endif  // V8_COMPRESS_POINTERS
 }
 
-}  // namespace internal
-}  // namespace v8
+}  // namespace v8::internal
 
 #endif  // V8_EXECUTION_ISOLATE_UTILS_INL_H_

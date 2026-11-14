@@ -11,8 +11,8 @@ const bench = common.createBenchmark(main, {
   dur: [5],
 });
 
-var chunk;
-var encoding;
+let chunk;
+let encoding;
 
 function main({ dur, len, type }) {
   switch (type) {
@@ -55,7 +55,7 @@ function main({ dur, len, type }) {
 
       function send() {
         socket.cork();
-        while (socket.write(chunk, encoding)) {}
+        while (socket.write(chunk, encoding));
         socket.uncork();
       }
     });

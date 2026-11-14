@@ -2,143 +2,31 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+#include <optional>
 #include <sstream>
 
 #include "debug-helper-internal.h"
 #include "heap-constants.h"
 #include "include/v8-internal.h"
-#include "src/common/ptr-compr-inl.h"
+#include "src/execution/frame-constants.h"
+#include "src/execution/frames.h"
+#include "src/execution/isolate-utils.h"
 #include "src/objects/string-inl.h"
+#include "src/sandbox/external-pointer.h"
 #include "src/strings/unicode-inl.h"
-#include "torque-generated/class-debug-readers-tq.h"
+#include "torque-generated/class-debug-readers.h"
+#include "torque-generated/debug-macros.h"
+#include "torque-generated/debug-reader-classes-list.h"
 
 namespace i = v8::internal;
 
-namespace v8_debug_helper_internal {
+namespace v8::internal::debug_helper_internal {
 
-// INSTANCE_TYPE_CHECKERS_SINGLE_BASE, trimmed down to only classes that have
-// layouts defined in .tq files (this subset relationship is asserted below).
-// For now, this is a hand-maintained list.
-// TODO(v8:7793): Torque should know enough about instance types to generate
-// this list.
-#define TQ_INSTANCE_TYPES_SINGLE_BASE(V)                       \
-  V(ByteArray, BYTE_ARRAY_TYPE)                                \
-  V(BytecodeArray, BYTECODE_ARRAY_TYPE)                        \
-  V(CallHandlerInfo, CALL_HANDLER_INFO_TYPE)                   \
-  V(Cell, CELL_TYPE)                                           \
-  V(DescriptorArray, DESCRIPTOR_ARRAY_TYPE)                    \
-  V(EmbedderDataArray, EMBEDDER_DATA_ARRAY_TYPE)               \
-  V(FeedbackCell, FEEDBACK_CELL_TYPE)                          \
-  V(FeedbackVector, FEEDBACK_VECTOR_TYPE)                      \
-  V(FixedDoubleArray, FIXED_DOUBLE_ARRAY_TYPE)                 \
-  V(Foreign, FOREIGN_TYPE)                                     \
-  V(FreeSpace, FREE_SPACE_TYPE)                                \
-  V(HeapNumber, HEAP_NUMBER_TYPE)                              \
-  V(JSArgumentsObject, JS_ARGUMENTS_OBJECT_TYPE)               \
-  V(JSArray, JS_ARRAY_TYPE)                                    \
-  V(JSArrayBuffer, JS_ARRAY_BUFFER_TYPE)                       \
-  V(JSArrayIterator, JS_ARRAY_ITERATOR_TYPE)                   \
-  V(JSAsyncFromSyncIterator, JS_ASYNC_FROM_SYNC_ITERATOR_TYPE) \
-  V(JSAsyncFunctionObject, JS_ASYNC_FUNCTION_OBJECT_TYPE)      \
-  V(JSAsyncGeneratorObject, JS_ASYNC_GENERATOR_OBJECT_TYPE)    \
-  V(JSBoundFunction, JS_BOUND_FUNCTION_TYPE)                   \
-  V(JSDataView, JS_DATA_VIEW_TYPE)                             \
-  V(JSDate, JS_DATE_TYPE)                                      \
-  V(JSFunction, JS_FUNCTION_TYPE)                              \
-  V(JSGlobalObject, JS_GLOBAL_OBJECT_TYPE)                     \
-  V(JSGlobalProxy, JS_GLOBAL_PROXY_TYPE)                       \
-  V(JSMap, JS_MAP_TYPE)                                        \
-  V(JSMessageObject, JS_MESSAGE_OBJECT_TYPE)                   \
-  V(JSModuleNamespace, JS_MODULE_NAMESPACE_TYPE)               \
-  V(JSPromise, JS_PROMISE_TYPE)                                \
-  V(JSProxy, JS_PROXY_TYPE)                                    \
-  V(JSRegExp, JS_REG_EXP_TYPE)                                 \
-  V(JSRegExpStringIterator, JS_REG_EXP_STRING_ITERATOR_TYPE)   \
-  V(JSSet, JS_SET_TYPE)                                        \
-  V(JSStringIterator, JS_STRING_ITERATOR_TYPE)                 \
-  V(JSTypedArray, JS_TYPED_ARRAY_TYPE)                         \
-  V(JSPrimitiveWrapper, JS_PRIMITIVE_WRAPPER_TYPE)             \
-  V(JSFinalizationGroup, JS_FINALIZATION_GROUP_TYPE)           \
-  V(JSFinalizationGroupCleanupIterator,                        \
-    JS_FINALIZATION_GROUP_CLEANUP_ITERATOR_TYPE)               \
-  V(JSWeakMap, JS_WEAK_MAP_TYPE)                               \
-  V(JSWeakRef, JS_WEAK_REF_TYPE)                               \
-  V(JSWeakSet, JS_WEAK_SET_TYPE)                               \
-  V(Map, MAP_TYPE)                                             \
-  V(Oddball, ODDBALL_TYPE)                                     \
-  V(PreparseData, PREPARSE_DATA_TYPE)                          \
-  V(PropertyArray, PROPERTY_ARRAY_TYPE)                        \
-  V(PropertyCell, PROPERTY_CELL_TYPE)                          \
-  V(SharedFunctionInfo, SHARED_FUNCTION_INFO_TYPE)             \
-  V(Symbol, SYMBOL_TYPE)                                       \
-  V(WasmExceptionObject, WASM_EXCEPTION_OBJECT_TYPE)           \
-  V(WasmGlobalObject, WASM_GLOBAL_OBJECT_TYPE)                 \
-  V(WasmMemoryObject, WASM_MEMORY_OBJECT_TYPE)                 \
-  V(WasmModuleObject, WASM_MODULE_OBJECT_TYPE)                 \
-  V(WasmTableObject, WASM_TABLE_OBJECT_TYPE)                   \
-  V(WeakArrayList, WEAK_ARRAY_LIST_TYPE)                       \
-  V(WeakCell, WEAK_CELL_TYPE)
-#ifdef V8_INTL_SUPPORT
-
-#define TQ_INSTANCE_TYPES_SINGLE_NOSTRUCTS(V)           \
-  TQ_INSTANCE_TYPES_SINGLE_BASE(V)                      \
-  V(JSV8BreakIterator, JS_V8_BREAK_ITERATOR_TYPE)       \
-  V(JSCollator, JS_COLLATOR_TYPE)                       \
-  V(JSDateTimeFormat, JS_DATE_TIME_FORMAT_TYPE)         \
-  V(JSListFormat, JS_LIST_FORMAT_TYPE)                  \
-  V(JSLocale, JS_LOCALE_TYPE)                           \
-  V(JSNumberFormat, JS_NUMBER_FORMAT_TYPE)              \
-  V(JSPluralRules, JS_PLURAL_RULES_TYPE)                \
-  V(JSRelativeTimeFormat, JS_RELATIVE_TIME_FORMAT_TYPE) \
-  V(JSSegmentIterator, JS_SEGMENT_ITERATOR_TYPE)        \
-  V(JSSegmenter, JS_SEGMENTER_TYPE)
-
-#else
-
-#define TQ_INSTANCE_TYPES_SINGLE_NOSTRUCTS(V) TQ_INSTANCE_TYPES_SINGLE_BASE(V)
-
-#endif  // V8_INTL_SUPPORT
-
-// Used in the static assertion below.
-enum class InstanceTypeCheckersSingle {
-#define ENUM_VALUE(ClassName, INSTANCE_TYPE) k##ClassName = i::INSTANCE_TYPE,
-  INSTANCE_TYPE_CHECKERS_SINGLE(ENUM_VALUE)
-#undef ENUM_VALUE
-};
-
-// Verify that the instance type list above stays in sync with the truth.
-#define CHECK_VALUE(ClassName, INSTANCE_TYPE)                            \
-  static_assert(                                                         \
-      static_cast<i::InstanceType>(                                      \
-          InstanceTypeCheckersSingle::k##ClassName) == i::INSTANCE_TYPE, \
-      "TQ_INSTANCE_TYPES_SINGLE_NOSTRUCTS must be subset of "            \
-      "INSTANCE_TYPE_CHECKERS_SINGLE. Invalid class: " #ClassName);
-TQ_INSTANCE_TYPES_SINGLE_NOSTRUCTS(CHECK_VALUE)
-#undef CHECK_VALUE
-
-// Adapts one STRUCT_LIST_GENERATOR entry to (Name, NAME) format.
-#define STRUCT_INSTANCE_TYPE_ADAPTER(V, NAME, Name, name) V(Name, NAME)
-
-// Pairs of (ClassName, CLASS_NAME_TYPE) for every instance type that
-// corresponds to a single Torque-defined class. Note that all Struct-derived
-// classes are defined in Torque.
-#define TQ_INSTANCE_TYPES_SINGLE(V)     \
-  TQ_INSTANCE_TYPES_SINGLE_NOSTRUCTS(V) \
-  STRUCT_LIST_GENERATOR(STRUCT_INSTANCE_TYPE_ADAPTER, V)
-
-// Likewise, these are the subset of INSTANCE_TYPE_CHECKERS_RANGE that have
-// definitions in .tq files, rearranged with more specific things first. Also
-// includes JSObject and JSReceiver, which in the runtime are optimized to use
-// a one-sided check.
-#define TQ_INSTANCE_TYPES_RANGE(V)                                           \
-  V(Context, FIRST_CONTEXT_TYPE, LAST_CONTEXT_TYPE)                          \
-  V(FixedArray, FIRST_FIXED_ARRAY_TYPE, LAST_FIXED_ARRAY_TYPE)               \
-  V(Microtask, FIRST_MICROTASK_TYPE, LAST_MICROTASK_TYPE)                    \
-  V(String, FIRST_STRING_TYPE, LAST_STRING_TYPE)                             \
-  V(Name, FIRST_NAME_TYPE, LAST_NAME_TYPE)                                   \
-  V(WeakFixedArray, FIRST_WEAK_FIXED_ARRAY_TYPE, LAST_WEAK_FIXED_ARRAY_TYPE) \
-  V(JSObject, FIRST_JS_OBJECT_TYPE, LAST_JS_OBJECT_TYPE)                     \
-  V(JSReceiver, FIRST_JS_RECEIVER_TYPE, LAST_JS_RECEIVER_TYPE)
+constexpr char kTaggedValue[] = "v8::internal::TaggedValue";
+constexpr char kSmi[] = "v8::internal::Smi";
+constexpr char kHeapObject[] = "v8::internal::HeapObject";
+constexpr char kObjectAsStoredInHeap[] =
+    "v8::internal::TaggedMember<v8::internal::Object>";
 
 std::string AppendAddressAndType(const std::string& brief, uintptr_t address,
                                  const char* type) {
@@ -146,6 +34,10 @@ std::string AppendAddressAndType(const std::string& brief, uintptr_t address,
   brief_stream << "0x" << std::hex << address << " <" << type << ">";
   return brief.empty() ? brief_stream.str()
                        : brief + " (" + brief_stream.str() + ")";
+}
+
+std::string JoinWithSpace(const std::string& a, const std::string& b) {
+  return a.empty() || b.empty() ? a + b : a + " " + b;
 }
 
 struct TypedObject {
@@ -173,8 +65,8 @@ TypedObject GetTypedObjectByHint(uintptr_t address,
             std::make_unique<Tq##ClassName>(address)};   \
   }
 
-  TQ_INSTANCE_TYPES_SINGLE(TYPE_NAME_CASE)
-  TQ_INSTANCE_TYPES_RANGE(TYPE_NAME_CASE)
+  TORQUE_DEBUG_READER_CLASSES_SINGLE(TYPE_NAME_CASE)
+  TORQUE_DEBUG_READER_CLASSES_RANGE(TYPE_NAME_CASE)
   STRING_CLASS_TYPES(TYPE_NAME_CASE)
 
 #undef TYPE_NAME_CASE
@@ -201,9 +93,8 @@ TypedObject GetTypedObjectForString(uintptr_t address, i::InstanceType type,
     }
   };
 
-  return i::StringShape(type)
-      .DispatchToSpecificTypeWithoutCast<StringGetDispatcher, TypedObject>(
-          address, type_source);
+  return String::DispatchToSpecificTypeWithoutCast<StringGetDispatcher>(
+      type, address, type_source);
 }
 
 TypedObject GetTypedObjectByInstanceType(uintptr_t address,
@@ -213,7 +104,8 @@ TypedObject GetTypedObjectByInstanceType(uintptr_t address,
 #define INSTANCE_TYPE_CASE(ClassName, INSTANCE_TYPE) \
   case i::INSTANCE_TYPE:                             \
     return {type_source, std::make_unique<Tq##ClassName>(address)};
-    TQ_INSTANCE_TYPES_SINGLE(INSTANCE_TYPE_CASE)
+    TORQUE_DEBUG_READER_CLASSES_SINGLE(INSTANCE_TYPE_CASE)
+    TORQUE_DEBUG_READER_CLASSES_MULTIPLE(INSTANCE_TYPE_CASE)
 #undef INSTANCE_TYPE_CASE
 
     default:
@@ -229,12 +121,29 @@ TypedObject GetTypedObjectByInstanceType(uintptr_t address,
   if (type >= i::FIRST_TYPE && type <= i::LAST_TYPE) {              \
     return {type_source, std::make_unique<Tq##ClassName>(address)}; \
   }
-      TQ_INSTANCE_TYPES_RANGE(INSTANCE_RANGE_CASE)
+      TORQUE_DEBUG_READER_CLASSES_RANGE(INSTANCE_RANGE_CASE)
 #undef INSTANCE_RANGE_CASE
 
       return {d::TypeCheckResult::kUnknownInstanceType,
               std::make_unique<TqHeapObject>(address)};
   }
+}
+
+bool IsTypedHeapObjectInstanceTypeOf(uintptr_t address,
+                                     d::MemoryAccessor accessor,
+                                     i::InstanceType instance_type) {
+  auto heap_object = std::make_unique<TqHeapObject>(address);
+  Value<uintptr_t> map_ptr = heap_object->GetMapValue(accessor);
+
+  if (map_ptr.validity == d::MemoryAccessResult::kOk) {
+    Value<i::InstanceType> type =
+        TqMap(map_ptr.value).GetInstanceTypeValue(accessor);
+    if (type.validity == d::MemoryAccessResult::kOk) {
+      return instance_type == type.value;
+    }
+  }
+
+  return false;
 }
 
 TypedObject GetTypedHeapObject(uintptr_t address, d::MemoryAccessor accessor,
@@ -263,7 +172,7 @@ TypedObject GetTypedHeapObject(uintptr_t address, d::MemoryAccessor accessor,
   // We can't read the Map, so check whether it is in the list of known Maps,
   // as another way to get its instance type.
   KnownInstanceType known_map_type =
-      FindKnownMapInstanceType(map_ptr.value, heap_addresses);
+      FindKnownMapInstanceTypes(map_ptr.value, heap_addresses);
   if (known_map_type.confidence == KnownInstanceType::Confidence::kHigh) {
     DCHECK_EQ(known_map_type.types.size(), 1);
     return GetTypedObjectByInstanceType(address, known_map_type.types[0],
@@ -302,25 +211,24 @@ TypedObject GetTypedHeapObject(uintptr_t address, d::MemoryAccessor accessor,
   return result;
 }
 
-#undef STRUCT_INSTANCE_TYPE_ADAPTER
-#undef TQ_INSTANCE_TYPES_SINGLE_BASE
-#undef TQ_INSTANCE_TYPES_SINGLE
-#undef TQ_INSTANCE_TYPES_SINGLE_NOSTRUCTS
-#undef TQ_INSTANCE_TYPES_RANGE
-
 // An object visitor that accumulates the first few characters of a string.
 class ReadStringVisitor : public TqObjectVisitor {
  public:
-  ReadStringVisitor(d::MemoryAccessor accessor,
-                    const d::HeapAddresses& heap_addresses)
-      : accessor_(accessor),
-        heap_addresses_(heap_addresses),
-        index_(0),
-        limit_(INT32_MAX),
-        done_(false) {}
+  struct Result {
+    std::optional<std::string> maybe_truncated_string;
+    std::unique_ptr<ObjectProperty> maybe_raw_characters_property;
+  };
+  static Result Visit(d::MemoryAccessor accessor,
+                      const d::HeapAddresses& heap_addresses,
+                      const TqString* object) {
+    ReadStringVisitor visitor(accessor, heap_addresses);
+    object->Visit(&visitor);
+    return {visitor.GetString(), visitor.GetRawCharactersProperty()};
+  }
 
   // Returns the result as UTF-8 once visiting is complete.
-  std::string GetString() {
+  std::optional<std::string> GetString() {
+    if (failed_) return {};
     std::vector<char> result(
         string_.size() * unibrow::Utf16::kMaxExtraUtf8BytesForOneUtf16CodeUnit);
     unsigned write_index = 0;
@@ -332,25 +240,57 @@ class ReadStringVisitor : public TqObjectVisitor {
                                 prev_char, /*replace_invalid=*/true);
       prev_char = character;
     }
-    return {result.data(), write_index};
+    return std::string(result.data(), write_index);
+  }
+
+  // Returns a property referring to the address of the flattened character
+  // array, if possible, once visiting is complete.
+  std::unique_ptr<ObjectProperty> GetRawCharactersProperty() {
+    if (failed_ || raw_characters_address_ == 0) return {};
+    DCHECK(size_per_character_ == 1 || size_per_character_ == 2);
+    const char* type = size_per_character_ == 1 ? "char" : "char16_t";
+    return std::make_unique<ObjectProperty>(
+        "raw_characters", type, raw_characters_address_, num_characters_,
+        size_per_character_, std::vector<std::unique_ptr<StructProperty>>(),
+        d::PropertyKind::kArrayOfKnownSize);
   }
 
   template <typename T>
-  void ReadSeqString(const T* object) {
+  Value<T> ReadValue(uintptr_t data_address, int32_t index = 0) {
+    T value{};
+    d::MemoryAccessResult validity =
+        accessor_(data_address + index * sizeof(T),
+                  reinterpret_cast<uint8_t*>(&value), sizeof(value));
+    return {validity, value};
+  }
+
+  template <typename TChar>
+  void ReadStringCharacters(const TqString* object, uintptr_t data_address) {
     int32_t length = GetOrFinish(object->GetLengthValue(accessor_));
+    if (string_.size() == 0) {
+      raw_characters_address_ = data_address + index_ * sizeof(TChar);
+      size_per_character_ = sizeof(TChar);
+      num_characters_ = std::min(length, limit_) - index_;
+    }
     for (; index_ < length && index_ < limit_ && !done_; ++index_) {
+      static_assert(sizeof(TChar) <= sizeof(char16_t));
       char16_t c = static_cast<char16_t>(
-          GetOrFinish(object->GetCharsValue(accessor_, index_)));
+          GetOrFinish(ReadValue<TChar>(data_address, index_)));
       if (!done_) AddCharacter(c);
     }
   }
 
+  template <typename TChar, typename TString>
+  void ReadSeqString(const TString* object) {
+    ReadStringCharacters<TChar>(object, object->GetCharsAddress());
+  }
+
   void VisitSeqOneByteString(const TqSeqOneByteString* object) override {
-    ReadSeqString(object);
+    ReadSeqString<char>(object);
   }
 
   void VisitSeqTwoByteString(const TqSeqTwoByteString* object) override {
-    ReadSeqString(object);
+    ReadSeqString<char16_t>(object);
   }
 
   void VisitConsString(const TqConsString* object) override {
@@ -360,6 +300,10 @@ class ReadStringVisitor : public TqObjectVisitor {
         GetTypedHeapObject(first_address, accessor_, nullptr, heap_addresses_)
             .object;
     first->Visit(this);
+    // Cons strings don't have all of their characters in a contiguous memory
+    // region, so it would be confusing to show the user a raw pointer to the
+    // character storage for only part of the cons string.
+    raw_characters_address_ = 0;
     if (done_) return;
     int32_t first_length = GetOrFinish(
         static_cast<TqString*>(first.get())->GetLengthValue(accessor_));
@@ -389,13 +333,99 @@ class ReadStringVisitor : public TqObjectVisitor {
         .object->Visit(this);
   }
 
-  void VisitExternalString(const TqExternalString* object) override {
-    // TODO(v8:9376): External strings are very common and important when
-    // attempting to print the source of a function in the browser. For now
-    // we're just ignoring them, but eventually we'll want some kind of
-    // mechanism where the user of this library can provide a callback function
-    // that fetches data from external strings.
-    AddEllipsisAndFinish();
+  bool IsExternalStringCached(const TqExternalString* object) {
+    // The safest way to get the instance type is to use known map pointers, in
+    // case the map data is not available.
+    Value<uintptr_t> map_ptr = object->GetMapValue(accessor_);
+    DCHECK_IMPLIES(map_ptr.validity == d::MemoryAccessResult::kOk,
+                   !v8::internal::MapWord::IsPacked(map_ptr.value));
+    uintptr_t map = GetOrFinish(map_ptr);
+    if (done_) return false;
+    auto instance_types = FindKnownMapInstanceTypes(map, heap_addresses_);
+    // Exactly one of the matched instance types should be a string type,
+    // because all maps for string types are in the same space (read-only
+    // space). The "uncached" flag on that instance type tells us whether it's
+    // safe to read the cached data.
+    for (const auto& type : instance_types.types) {
+      if ((type & i::kIsNotStringMask) == i::kStringTag &&
+          (type & i::kStringRepresentationMask) == i::kExternalStringTag) {
+        return (type & i::kUncachedExternalStringMask) !=
+               i::kUncachedExternalStringTag;
+      }
+    }
+
+    // If for some reason we can't find an external string type here (maybe the
+    // caller provided an external string type as the type hint, but it doesn't
+    // actually match the in-memory map pointer), then we can't safely use the
+    // cached data.
+    return false;
+  }
+
+  template <typename TChar>
+  void ReadExternalString(const TqExternalString* object) {
+    // Uncached external strings require knowledge of the embedder. For now, we
+    // only read cached external strings.
+    if (IsExternalStringCached(object)) {
+      ExternalPointer_t resource_data =
+          GetOrFinish(object->GetResourceDataValue(accessor_));
+#ifdef V8_ENABLE_SANDBOX
+      Address memory_chunk =
+          MemoryChunk::FromAddress(object->GetMapAddress())->address();
+      uint32_t metadata_index = GetOrFinish(ReadValue<uint32_t>(
+          memory_chunk + MemoryChunk::MetadataIndexOffset()));
+      auto metadata_entry =
+          GetOrFinish(ReadValue<IsolateGroup::BasePageTableEntry>(
+              heap_addresses_.metadata_pointer_table, metadata_index));
+      Address heap = GetOrFinish(ReadValue<Address>(
+          reinterpret_cast<uintptr_t>(metadata_entry.metadata()) +
+          BasePage::HeapOffset()));
+      // Get the Isolate pointer from the Heap object. The Heap class has a
+      // field "Isolate* isolate_" that points to the owning Isolate. The offset
+      // of this field is provided by the debugger (from PDB symbols). If the
+      // offset is not available (zero), fall back to using Isolate::FromHeap()
+      // which may fail if the offset differs between builds.
+      Isolate* isolate;
+      if (heap_addresses_.isolate_heap_member_offset != 0) {
+        // Read the Isolate* pointer from Heap::isolate_ field.
+        Address isolate_address = GetOrFinish(ReadValue<Address>(
+            heap + heap_addresses_.isolate_heap_member_offset));
+        isolate = reinterpret_cast<Isolate*>(isolate_address);
+      } else {
+        isolate = Isolate::FromHeap(reinterpret_cast<Heap*>(heap));
+      }
+      Address external_pointer_table_address_address =
+          isolate->shared_external_pointer_table_address_address();
+      Address external_pointer_table_address = GetOrFinish(
+          ReadValue<Address>(external_pointer_table_address_address));
+      Address external_pointer_table =
+          GetOrFinish(ReadValue<Address>(external_pointer_table_address));
+      int32_t index =
+          static_cast<int32_t>(resource_data >> kExternalPointerIndexShift);
+      Address tagged_data =
+          GetOrFinish(ReadValue<Address>(external_pointer_table, index));
+      // We don't really need to perform the type check here.
+      Address data_address = tagged_data & kExternalPointerPayloadMask;
+#else
+      uintptr_t data_address = static_cast<uintptr_t>(resource_data);
+#endif  // V8_ENABLE_SANDBOX
+      if (done_) return;
+      ReadStringCharacters<TChar>(object, data_address);
+    } else {
+      // TODO(v8:9376): Come up with some way that a caller with full knowledge
+      // of a particular embedder could provide a callback function for getting
+      // uncached string data.
+      AddEllipsisAndFinish();
+    }
+  }
+
+  void VisitExternalOneByteString(
+      const TqExternalOneByteString* object) override {
+    ReadExternalString<char>(object);
+  }
+
+  void VisitExternalTwoByteString(
+      const TqExternalTwoByteString* object) override {
+    ReadExternalString<char16_t>(object);
   }
 
   void VisitObject(const TqObject* object) override {
@@ -405,6 +435,15 @@ class ReadStringVisitor : public TqObjectVisitor {
   }
 
  private:
+  ReadStringVisitor(d::MemoryAccessor accessor,
+                    const d::HeapAddresses& heap_addresses)
+      : accessor_(accessor),
+        heap_addresses_(heap_addresses),
+        index_(0),
+        limit_(INT32_MAX),
+        done_(false),
+        failed_(false) {}
+
   // Unpacks a value that was fetched from the debuggee. If the value indicates
   // that it couldn't successfully fetch memory, then prevents further work.
   template <typename T>
@@ -417,8 +456,12 @@ class ReadStringVisitor : public TqObjectVisitor {
 
   void AddEllipsisAndFinish() {
     if (!done_) {
-      string_ += u"...";
       done_ = true;
+      if (string_.empty()) {
+        failed_ = true;
+      } else {
+        string_ += u"...";
+      }
     }
   }
 
@@ -442,6 +485,8 @@ class ReadStringVisitor : public TqObjectVisitor {
       that_->index_ += index_adjust_;
       that_->limit_ += limit_adjust_;
     }
+    IndexModifier(const IndexModifier&) = delete;
+    IndexModifier& operator=(const IndexModifier&) = delete;
     ~IndexModifier() {
       that_->index_ -= index_adjust_;
       that_->limit_ -= limit_adjust_;
@@ -451,7 +496,6 @@ class ReadStringVisitor : public TqObjectVisitor {
     ReadStringVisitor* that_;
     int32_t index_adjust_;
     int32_t limit_adjust_;
-    DISALLOW_COPY_AND_ASSIGN(IndexModifier);
   };
 
   static constexpr int kMaxCharacters = 80;  // How many characters to print.
@@ -462,29 +506,110 @@ class ReadStringVisitor : public TqObjectVisitor {
   int32_t index_;  // Index of next char to read.
   int32_t limit_;  // Don't read past this index (set by SlicedString).
   bool done_;      // Whether to stop further work.
+  bool failed_;    // Whether an error was encountered before any valid data.
+
+  // If the string's characters are in a contiguous block of memory (including
+  // sequential strings, external strings where we could determine the raw data
+  // location, and thin or sliced strings pointing to either of those), then
+  // after this visitor has run, the character data's address, size per
+  // character, and number of characters will be present in the following
+  // fields.
+  Address raw_characters_address_ = 0;
+  int32_t size_per_character_ = 0;
+  int32_t num_characters_ = 0;
 };
 
-// An object visitor that adds extra debugging information for some types.
+// An object visitor that supplies extra information for some types.
 class AddInfoVisitor : public TqObjectVisitor {
  public:
-  AddInfoVisitor(const std::string& brief, d::MemoryAccessor accessor,
-                 const d::HeapAddresses& heap_addresses)
-      : accessor_(accessor), brief_(brief), heap_addresses_(heap_addresses) {}
+  // Returns a descriptive string and a list of properties for the given object.
+  // Both may be empty, and are meant as an addition or a replacement for,
+  // the Torque-generated data about the object.
+  static std::pair<std::string, std::vector<std::unique_ptr<ObjectProperty>>>
+  Visit(const TqObject* object, d::MemoryAccessor accessor,
+        const d::HeapAddresses& heap_addresses) {
+    AddInfoVisitor visitor(accessor, heap_addresses);
+    object->Visit(&visitor);
+    return {std::move(visitor.brief_), std::move(visitor.properties_)};
+  }
 
-  // Returns the brief object description, once visiting is complete.
-  const std::string& GetBrief() { return brief_; }
+  void VisitStringImpl(const TqString* object, bool is_sequential) {
+    auto visit_result =
+        ReadStringVisitor::Visit(accessor_, heap_addresses_, object);
+    auto str = visit_result.maybe_truncated_string;
+    if (str.has_value()) {
+      brief_ = "\"" + *str + "\"";
+    }
+    // Sequential strings already have a "chars" property based on the Torque
+    // type definition, so there's no need to duplicate it. Otherwise, it is
+    // useful to display a pointer to the flattened character data if possible.
+    if (!is_sequential && visit_result.maybe_raw_characters_property) {
+      properties_.push_back(
+          std::move(visit_result.maybe_raw_characters_property));
+    }
+  }
 
   void VisitString(const TqString* object) override {
-    ReadStringVisitor visitor(accessor_, heap_addresses_);
-    object->Visit(&visitor);
-    if (!brief_.empty()) brief_ += " ";
-    brief_ += "\"" + visitor.GetString() + "\"";
+    VisitStringImpl(object, /*is_sequential=*/false);
+  }
+
+  void VisitSeqString(const TqSeqString* object) override {
+    VisitStringImpl(object, /*is_sequential=*/true);
+  }
+
+  void VisitJSObject(const TqJSObject* object) override {
+    // JSObject and its subclasses can be followed directly by an array of
+    // property values. The start and end offsets of those values are described
+    // by a pair of values in its Map.
+    auto map_ptr = object->GetMapValue(accessor_);
+    if (map_ptr.validity != d::MemoryAccessResult::kOk) {
+      return;  // Can't read the JSObject. Nothing useful to do.
+    }
+    DCHECK(!v8::internal::MapWord::IsPacked(map_ptr.value));
+    TqMap map(map_ptr.value);
+
+    // On JSObject instances, this value is the start of in-object properties.
+    // The constructor function index option is only for primitives.
+    auto start_offset =
+        map.GetInobjectPropertiesStartOrConstructorFunctionIndexValue(
+            accessor_);
+
+    // The total size of the object in memory. This may include over-allocated
+    // expansion space that doesn't correspond to any user-accessible property.
+    auto instance_size = map.GetInstanceSizeInWordsValue(accessor_);
+
+    if (start_offset.validity != d::MemoryAccessResult::kOk ||
+        instance_size.validity != d::MemoryAccessResult::kOk) {
+      return;  // Can't read the Map. Nothing useful to do.
+    }
+    int num_properties = instance_size.value - start_offset.value;
+    if (num_properties > 0) {
+      properties_.push_back(std::make_unique<ObjectProperty>(
+          "in-object properties", kObjectAsStoredInHeap,
+          object->GetMapAddress() + start_offset.value * i::kTaggedSize,
+          num_properties, i::kTaggedSize,
+          std::vector<std::unique_ptr<StructProperty>>(),
+          d::PropertyKind::kArrayOfKnownSize));
+    }
   }
 
  private:
+  AddInfoVisitor(d::MemoryAccessor accessor,
+                 const d::HeapAddresses& heap_addresses)
+      : accessor_(accessor), heap_addresses_(heap_addresses) {}
+
+  // Inputs used by this visitor:
+
   d::MemoryAccessor accessor_;
-  std::string brief_;
   const d::HeapAddresses& heap_addresses_;
+
+  // Outputs generated by this visitor:
+
+  // A brief description of the object.
+  std::string brief_;
+  // A list of extra properties to append after the automatic ones that are
+  // created for all Torque-defined class fields.
+  std::vector<std::unique_ptr<ObjectProperty>> properties_;
 };
 
 std::unique_ptr<ObjectPropertiesResult> GetHeapObjectPropertiesNotCompressed(
@@ -496,16 +621,28 @@ std::unique_ptr<ObjectPropertiesResult> GetHeapObjectPropertiesNotCompressed(
 
   TypedObject typed =
       GetTypedHeapObject(address, accessor, type_hint, heap_addresses);
+  auto props = typed.object->GetProperties(accessor);
 
-  // TODO(v8:9376): Many object types need additional data that is not included
-  // in their Torque layout definitions. For example, JSObject has an array of
-  // in-object properties after its Torque-defined fields, which at a minimum
-  // should be represented as an array in this response. If the relevant memory
-  // is available, we should instead represent those properties (and any out-of-
-  // object properties) using their JavaScript property names.
-  AddInfoVisitor visitor(brief, accessor, heap_addresses);
-  typed.object->Visit(&visitor);
-  brief = visitor.GetBrief();
+  // Use the AddInfoVisitor to get any extra properties or descriptive text that
+  // can't be directly derived from Torque class definitions.
+  auto extra_info =
+      AddInfoVisitor::Visit(typed.object.get(), accessor, heap_addresses);
+  brief = JoinWithSpace(brief, extra_info.first);
+
+  // Overwrite existing properties if they have the same name.
+  for (size_t i = 0; i < extra_info.second.size(); i++) {
+    bool overwrite = false;
+    for (size_t j = 0; j < props.size(); j++) {
+      if (strcmp(props[j]->GetPublicView()->name,
+                 extra_info.second[i]->GetPublicView()->name) == 0) {
+        props[j] = std::move(extra_info.second[i]);
+        overwrite = true;
+        break;
+      }
+    }
+    if (overwrite) continue;
+    props.push_back(std::move(extra_info.second[i]));
+  }
 
   brief = AppendAddressAndType(brief, address, typed.object->GetName());
 
@@ -517,8 +654,8 @@ std::unique_ptr<ObjectPropertiesResult> GetHeapObjectPropertiesNotCompressed(
   }
 
   return std::make_unique<ObjectPropertiesResult>(
-      typed.type_check_result, brief, typed.object->GetName(),
-      typed.object->GetProperties(accessor), std::move(guessed_types));
+      typed.type_check_result, brief, typed.object->GetName(), std::move(props),
+      std::move(guessed_types));
 }
 
 std::unique_ptr<ObjectPropertiesResult> GetHeapObjectPropertiesMaybeCompressed(
@@ -528,22 +665,32 @@ std::unique_ptr<ObjectPropertiesResult> GetHeapObjectPropertiesMaybeCompressed(
   // if pointer compression is disabled).
   uintptr_t any_uncompressed_ptr = 0;
   if (!IsPointerCompressed(address)) any_uncompressed_ptr = address;
-  if (any_uncompressed_ptr == 0)
+  if (any_uncompressed_ptr == 0) {
     any_uncompressed_ptr = heap_addresses.any_heap_pointer;
-  if (any_uncompressed_ptr == 0)
+  }
+  if (any_uncompressed_ptr == 0) {
     any_uncompressed_ptr = heap_addresses.map_space_first_page;
-  if (any_uncompressed_ptr == 0)
+  }
+  if (any_uncompressed_ptr == 0) {
     any_uncompressed_ptr = heap_addresses.old_space_first_page;
-  if (any_uncompressed_ptr == 0)
+  }
+  if (any_uncompressed_ptr == 0) {
     any_uncompressed_ptr = heap_addresses.read_only_space_first_page;
+  }
+#ifdef V8_COMPRESS_POINTERS
+  Address base =
+      V8HeapCompressionScheme::GetPtrComprCageBaseAddress(any_uncompressed_ptr);
+  if (base != V8HeapCompressionScheme::base()) {
+    V8HeapCompressionScheme::InitBase(base);
+  }
+#endif  // V8_COMPRESS_POINTERS
   FillInUnknownHeapAddresses(&heap_addresses, any_uncompressed_ptr);
   if (any_uncompressed_ptr == 0) {
     // We can't figure out the heap range. Just check for known objects.
     std::string brief = FindKnownObject(address, heap_addresses);
-    brief = AppendAddressAndType(brief, address, "v8::internal::TaggedValue");
+    brief = AppendAddressAndType(brief, address, kTaggedValue);
     return std::make_unique<ObjectPropertiesResult>(
-        d::TypeCheckResult::kUnableToDecompress, brief,
-        "v8::internal::TaggedValue");
+        d::TypeCheckResult::kUnableToDecompress, brief, kTaggedValue);
   }
 
   address = EnsureDecompressed(address, any_uncompressed_ptr);
@@ -557,8 +704,7 @@ std::unique_ptr<ObjectPropertiesResult> GetObjectProperties(
     const d::HeapAddresses& heap_addresses, const char* type_hint) {
   if (static_cast<uint32_t>(address) == i::kClearedWeakHeapObjectLower32) {
     return std::make_unique<ObjectPropertiesResult>(
-        d::TypeCheckResult::kWeakRef, "cleared weak ref",
-        "v8::internal::HeapObject");
+        d::TypeCheckResult::kWeakRef, "cleared weak ref", kHeapObject);
   }
   bool is_weak = (address & i::kHeapObjectTagMask) == i::kWeakHeapObjectTag;
   if (is_weak) {
@@ -579,13 +725,116 @@ std::unique_ptr<ObjectPropertiesResult> GetObjectProperties(
   int32_t value = i::PlatformSmiTagging::SmiToInt(address);
   std::stringstream stream;
   stream << value << " (0x" << std::hex << value << ")";
-  return std::make_unique<ObjectPropertiesResult>(
-      d::TypeCheckResult::kSmi, stream.str(), "v8::internal::Smi");
+  return std::make_unique<ObjectPropertiesResult>(d::TypeCheckResult::kSmi,
+                                                  stream.str(), kSmi);
 }
 
-}  // namespace v8_debug_helper_internal
+std::unique_ptr<StackFrameResult> GetStackFrame(
+    uintptr_t frame_pointer, d::MemoryAccessor memory_accessor) {
+  // Read the data at frame_pointer + kContextOrFrameTypeOffset.
+  intptr_t context_or_frame_type = 0;
+  d::MemoryAccessResult validity = memory_accessor(
+      frame_pointer + CommonFrameConstants::kContextOrFrameTypeOffset,
+      reinterpret_cast<void*>(&context_or_frame_type), sizeof(intptr_t));
+  auto props = std::vector<std::unique_ptr<ObjectProperty>>();
+  if (validity == d::MemoryAccessResult::kOk) {
+    // If it is context, not frame marker then add new property
+    // "currently_executing_function".
+    if (!StackFrame::IsTypeMarker(context_or_frame_type)) {
+      props.push_back(std::make_unique<ObjectProperty>(
+          "currently_executing_jsfunction",
+          CheckTypeName<v8::internal::Tagged<v8::internal::JSFunction>>(
+              "v8::internal::Tagged<v8::internal::JSFunction>"),
+          frame_pointer + StandardFrameConstants::kFunctionOffset, 1,
+          sizeof(v8::internal::JSFunction),
+          std::vector<std::unique_ptr<StructProperty>>(),
+          d::PropertyKind::kSingle));
+      // Add more items in the Locals pane representing the JS function name,
+      // source file name, and line & column numbers within the source file, so
+      // that the user doesn’t need to dig through the shared_function_info to
+      // find them.
+      intptr_t js_function_ptr = 0;
+      validity = memory_accessor(
+          frame_pointer + StandardFrameConstants::kFunctionOffset,
+          reinterpret_cast<void*>(&js_function_ptr), sizeof(intptr_t));
+      if (validity == d::MemoryAccessResult::kOk) {
+        TqJSFunction js_function(js_function_ptr);
+        auto shared_function_info_ptr =
+            js_function.GetSharedFunctionInfoValue(memory_accessor);
+        if (shared_function_info_ptr.validity == d::MemoryAccessResult::kOk) {
+          TqSharedFunctionInfo shared_function_info(
+              shared_function_info_ptr.value);
+          auto script_ptr =
+              shared_function_info.GetScriptValue(memory_accessor);
+          if (script_ptr.validity == d::MemoryAccessResult::kOk) {
+            // Make sure script_ptr is script.
+            auto address = script_ptr.value;
+            if (IsTypedHeapObjectInstanceTypeOf(address, memory_accessor,
+                                                i::InstanceType::SCRIPT_TYPE)) {
+              TqScript script(script_ptr.value);
+              props.push_back(std::make_unique<ObjectProperty>(
+                  "script_name", kObjectAsStoredInHeap, script.GetNameAddress(),
+                  1, i::kTaggedSize,
+                  std::vector<std::unique_ptr<StructProperty>>(),
+                  d::PropertyKind::kSingle));
+              props.push_back(std::make_unique<ObjectProperty>(
+                  "script_source", kObjectAsStoredInHeap,
+                  script.GetSourceAddress(), 1, i::kTaggedSize,
+                  std::vector<std::unique_ptr<StructProperty>>(),
+                  d::PropertyKind::kSingle));
+            }
+          }
+          auto name_or_scope_info_ptr =
+              shared_function_info.GetNameOrScopeInfoValue(memory_accessor);
+          if (name_or_scope_info_ptr.validity == d::MemoryAccessResult::kOk) {
+            auto scope_info_address = name_or_scope_info_ptr.value;
+            // Make sure name_or_scope_info_ptr is scope info.
+            if (IsTypedHeapObjectInstanceTypeOf(
+                    scope_info_address, memory_accessor,
+                    i::InstanceType::SCOPE_INFO_TYPE)) {
+              auto indexed_field_slice_function_variable_info =
+                  TqDebugFieldSliceScopeInfoFunctionVariableInfo(
+                      memory_accessor, scope_info_address);
+              if (indexed_field_slice_function_variable_info.validity ==
+                  d::MemoryAccessResult::kOk) {
+                props.push_back(std::make_unique<ObjectProperty>(
+                    "function_name", kObjectAsStoredInHeap,
+                    scope_info_address - i::kHeapObjectTag +
+                        std::get<1>(
+                            indexed_field_slice_function_variable_info.value),
+                    std::get<2>(
+                        indexed_field_slice_function_variable_info.value),
+                    i::kTaggedSize,
+                    std::vector<std::unique_ptr<StructProperty>>(),
+                    d::PropertyKind::kSingle));
+              }
+              std::vector<std::unique_ptr<StructProperty>>
+                  position_info_struct_field_list;
+              position_info_struct_field_list.push_back(
+                  std::make_unique<StructProperty>(
+                      "start", kObjectAsStoredInHeap, 0, 0, 0));
+              position_info_struct_field_list.push_back(
+                  std::make_unique<StructProperty>("end", kObjectAsStoredInHeap,
+                                                   4, 0, 0));
+              TqScopeInfo scope_info(scope_info_address);
+              props.push_back(std::make_unique<ObjectProperty>(
+                  "function_character_offset", "",
+                  scope_info.GetPositionInfoAddress(), 1, 2 * i::kTaggedSize,
+                  std::move(position_info_struct_field_list),
+                  d::PropertyKind::kSingle));
+            }
+          }
+        }
+      }
+    }
+  }
 
-namespace di = v8_debug_helper_internal;
+  return std::make_unique<StackFrameResult>(std::move(props));
+}
+
+}  // namespace v8::internal::debug_helper_internal
+
+namespace di = v8::internal::debug_helper_internal;
 
 extern "C" {
 V8_DEBUG_HELPER_EXPORT d::ObjectPropertiesResult*
@@ -602,5 +851,17 @@ V8_DEBUG_HELPER_EXPORT void _v8_debug_helper_Free_ObjectPropertiesResult(
     d::ObjectPropertiesResult* result) {
   std::unique_ptr<di::ObjectPropertiesResult> ptr(
       static_cast<di::ObjectPropertiesResultExtended*>(result)->base);
+}
+
+V8_DEBUG_HELPER_EXPORT d::StackFrameResult* _v8_debug_helper_GetStackFrame(
+    uintptr_t frame_pointer, d::MemoryAccessor memory_accessor) {
+  return di::GetStackFrame(frame_pointer, memory_accessor)
+      .release()
+      ->GetPublicView();
+}
+V8_DEBUG_HELPER_EXPORT void _v8_debug_helper_Free_StackFrameResult(
+    d::StackFrameResult* result) {
+  std::unique_ptr<di::StackFrameResult> ptr(
+      static_cast<di::StackFrameResultExtended*>(result)->base);
 }
 }

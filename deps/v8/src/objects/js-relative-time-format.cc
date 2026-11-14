@@ -17,84 +17,91 @@
 #include "src/objects/intl-objects.h"
 #include "src/objects/js-number-format.h"
 #include "src/objects/js-relative-time-format-inl.h"
+#include "src/objects/managed-inl.h"
+#include "src/objects/object-conversions-inl.h"
 #include "src/objects/objects-inl.h"
+#include "src/objects/option-utils.h"
+#include "unicode/decimfmt.h"
 #include "unicode/numfmt.h"
 #include "unicode/reldatefmt.h"
+#include "unicode/unum.h"
 
 namespace v8 {
 namespace internal {
 
 namespace {
-UDateRelativeDateTimeFormatterStyle getIcuStyle(
-    JSRelativeTimeFormat::Style style) {
+// Style: identifying the relative time format style used.
+//
+// https://tc39.es/ecma402/#sec-properties-of-intl-relativetimeformat-instances
+
+enum class Style {
+  LONG,   // Everything spelled out.
+  SHORT,  // Abbreviations used when possible.
+  NARROW  // Use the shortest possible form.
+};
+
+UDateRelativeDateTimeFormatterStyle toIcuStyle(Style style) {
   switch (style) {
-    case JSRelativeTimeFormat::Style::LONG:
+    case Style::LONG:
       return UDAT_STYLE_LONG;
-    case JSRelativeTimeFormat::Style::SHORT:
+    case Style::SHORT:
       return UDAT_STYLE_SHORT;
-    case JSRelativeTimeFormat::Style::NARROW:
+    case Style::NARROW:
       return UDAT_STYLE_NARROW;
+  }
+  UNREACHABLE();
+}
+
+Style fromIcuStyle(UDateRelativeDateTimeFormatterStyle icu_style) {
+  switch (icu_style) {
+    case UDAT_STYLE_LONG:
+      return Style::LONG;
+    case UDAT_STYLE_SHORT:
+      return Style::SHORT;
+    case UDAT_STYLE_NARROW:
+      return Style::NARROW;
+    case UDAT_STYLE_COUNT:
+      UNREACHABLE();
   }
   UNREACHABLE();
 }
 }  // namespace
 
-JSRelativeTimeFormat::Style JSRelativeTimeFormat::getStyle(const char* str) {
-  if (strcmp(str, "long") == 0) return JSRelativeTimeFormat::Style::LONG;
-  if (strcmp(str, "short") == 0) return JSRelativeTimeFormat::Style::SHORT;
-  if (strcmp(str, "narrow") == 0) return JSRelativeTimeFormat::Style::NARROW;
-  UNREACHABLE();
-}
-
-JSRelativeTimeFormat::Numeric JSRelativeTimeFormat::getNumeric(
-    const char* str) {
-  if (strcmp(str, "auto") == 0) return JSRelativeTimeFormat::Numeric::AUTO;
-  if (strcmp(str, "always") == 0) return JSRelativeTimeFormat::Numeric::ALWAYS;
-  UNREACHABLE();
-}
-
-MaybeHandle<JSRelativeTimeFormat> JSRelativeTimeFormat::New(
-    Isolate* isolate, Handle<Map> map, Handle<Object> locales,
-    Handle<Object> input_options) {
+MaybeDirectHandle<JSRelativeTimeFormat> JSRelativeTimeFormat::New(
+    Isolate* isolate, DirectHandle<Map> map, DirectHandle<Object> locales,
+    DirectHandle<Object> input_options, const char* service) {
   // 1. Let requestedLocales be ? CanonicalizeLocaleList(locales).
   Maybe<std::vector<std::string>> maybe_requested_locales =
       Intl::CanonicalizeLocaleList(isolate, locales);
-  MAYBE_RETURN(maybe_requested_locales, Handle<JSRelativeTimeFormat>());
+  MAYBE_RETURN(maybe_requested_locales, DirectHandle<JSRelativeTimeFormat>());
   std::vector<std::string> requested_locales =
       maybe_requested_locales.FromJust();
 
-  // 2. If options is undefined, then
-  Handle<JSReceiver> options;
-  if (input_options->IsUndefined(isolate)) {
-    // 2. a. Let options be ObjectCreate(null).
-    options = isolate->factory()->NewJSObjectWithNullProto();
-    // 3. Else
-  } else {
-    // 3. a. Let options be ? ToObject(options).
-    ASSIGN_RETURN_ON_EXCEPTION(isolate, options,
-                               Object::ToObject(isolate, input_options),
-                               JSRelativeTimeFormat);
-  }
+  // 2. Set options to ? CoerceOptionsToObject(options).
+  DirectHandle<JSReceiver> options;
+  ASSIGN_RETURN_ON_EXCEPTION(
+      isolate, options, CoerceOptionsToObject(isolate, input_options, service));
 
   // 4. Let opt be a new Record.
   // 5. Let matcher be ? GetOption(options, "localeMatcher", "string", «
   // "lookup", "best fit" », "best fit").
   // 6. Set opt.[[localeMatcher]] to matcher.
   Maybe<Intl::MatcherOption> maybe_locale_matcher =
-      Intl::GetLocaleMatcher(isolate, options, "Intl.RelativeTimeFormat");
-  MAYBE_RETURN(maybe_locale_matcher, MaybeHandle<JSRelativeTimeFormat>());
+      Intl::GetLocaleMatcher(isolate, options, service);
+  MAYBE_RETURN(maybe_locale_matcher, MaybeDirectHandle<JSRelativeTimeFormat>());
   Intl::MatcherOption matcher = maybe_locale_matcher.FromJust();
 
   // 7. Let _numberingSystem_ be ? GetOption(_options_, `"numberingSystem"`,
   //    `"string"`, *undefined*, *undefined*).
-  std::unique_ptr<char[]> numbering_system_str = nullptr;
-  Maybe<bool> maybe_numberingSystem = Intl::GetNumberingSystem(
-      isolate, options, "Intl.RelativeTimeFormat", &numbering_system_str);
+  std::string numbering_system_str;
+  Maybe<bool> maybe_numberingSystem =
+      Intl::GetNumberingSystem(isolate, options, service, numbering_system_str);
   // 8. If _numberingSystem_ is not *undefined*, then
   // a. If _numberingSystem_ does not match the
   //    `(3*8alphanum) *("-" (3*8alphanum))` sequence, throw a *RangeError*
   //     exception.
-  MAYBE_RETURN(maybe_numberingSystem, MaybeHandle<JSRelativeTimeFormat>());
+  MAYBE_RETURN(maybe_numberingSystem,
+               MaybeDirectHandle<JSRelativeTimeFormat>());
 
   // 9. Set _opt_.[[nu]] to _numberingSystem_.
 
@@ -103,140 +110,181 @@ MaybeHandle<JSRelativeTimeFormat> JSRelativeTimeFormat::New(
   // ResolveLocale(%RelativeTimeFormat%.[[AvailableLocales]],
   //               requestedLocales, opt,
   //               %RelativeTimeFormat%.[[RelevantExtensionKeys]], localeData).
-  Intl::ResolvedLocale r =
-      Intl::ResolveLocale(isolate, JSRelativeTimeFormat::GetAvailableLocales(),
-                          requested_locales, matcher, {"nu"});
-
-  // 12. Let locale be r.[[Locale]].
-  // 13. Set relativeTimeFormat.[[Locale]] to locale.
-  // 14. Let dataLocale be r.[[DataLocale]].
-  icu::Locale icu_locale = r.icu_locale;
-  UErrorCode status = U_ZERO_ERROR;
-  if (numbering_system_str != nullptr &&
-      Intl::IsValidNumberingSystem(numbering_system_str.get())) {
-    icu_locale.setUnicodeKeywordValue("nu", numbering_system_str.get(), status);
-    CHECK(U_SUCCESS(status));
+  Intl::ResolvedLocale r;
+  if (!Intl::ResolveLocale(isolate, JSRelativeTimeFormat::GetAvailableLocales(),
+                           requested_locales, matcher, {"nu"})
+           .To(&r)) {
+    THROW_NEW_ERROR(isolate, NewRangeError(MessageTemplate::kIcuError));
   }
 
+  UErrorCode status = U_ZERO_ERROR;
+
+  icu::Locale icu_locale = r.icu_locale;
+  if (maybe_numberingSystem.FromJust()) {
+    auto nu_extension_it = r.extensions.find("nu");
+    if (nu_extension_it != r.extensions.end() &&
+        nu_extension_it->second != numbering_system_str &&
+        Intl::IsValidNumberingSystem(numbering_system_str)) {
+      icu_locale.setUnicodeKeywordValue("nu", nullptr, status);
+      DCHECK(U_SUCCESS(status));
+    }
+  }
+  // 12. Let locale be r.[[Locale]].
   Maybe<std::string> maybe_locale_str = Intl::ToLanguageTag(icu_locale);
-  MAYBE_RETURN(maybe_locale_str, MaybeHandle<JSRelativeTimeFormat>());
+  MAYBE_RETURN(maybe_locale_str, MaybeDirectHandle<JSRelativeTimeFormat>());
 
-  Handle<String> locale_str = isolate->factory()->NewStringFromAsciiChecked(
-      maybe_locale_str.FromJust().c_str());
+  // 13. Set relativeTimeFormat.[[Locale]] to locale.
+  DirectHandle<String> locale_str =
+      isolate->factory()->NewStringFromAsciiChecked(
+          maybe_locale_str.FromJust().c_str());
 
-  // 15. Let s be ? GetOption(options, "style", "string",
+  // 14. Set relativeTimeFormat.[[NumberingSystem]] to r.[[nu]].
+  if (maybe_numberingSystem.FromJust() &&
+      Intl::IsValidNumberingSystem(numbering_system_str)) {
+    icu_locale.setUnicodeKeywordValue("nu", numbering_system_str, status);
+    DCHECK(U_SUCCESS(status));
+  }
+  // 15. Let dataLocale be r.[[DataLocale]].
+
+  // 16. Let s be ? GetOption(options, "style", "string",
   //                          «"long", "short", "narrow"», "long").
-  Maybe<Style> maybe_style = Intl::GetStringOption<Style>(
-      isolate, options, "style", "Intl.RelativeTimeFormat",
-      {"long", "short", "narrow"}, {Style::LONG, Style::SHORT, Style::NARROW},
-      Style::LONG);
-  MAYBE_RETURN(maybe_style, MaybeHandle<JSRelativeTimeFormat>());
+  Maybe<Style> maybe_style = GetStringOption<Style>(
+      isolate, options, isolate->factory()->style_string(), service,
+      std::to_array<const std::string_view>({"long", "short", "narrow"}),
+      std::array{Style::LONG, Style::SHORT, Style::NARROW}, Style::LONG);
+  MAYBE_RETURN(maybe_style, MaybeDirectHandle<JSRelativeTimeFormat>());
   Style style_enum = maybe_style.FromJust();
 
-  // 17. Let numeric be ? GetOption(options, "numeric", "string",
+  // 17. Set relativeTimeFormat.[[Style]] to s.
+
+  // 18. Let numeric be ? GetOption(options, "numeric", "string",
   //                                «"always", "auto"», "always").
-  Maybe<Numeric> maybe_numeric = Intl::GetStringOption<Numeric>(
-      isolate, options, "numeric", "Intl.RelativeTimeFormat",
-      {"always", "auto"}, {Numeric::ALWAYS, Numeric::AUTO}, Numeric::ALWAYS);
-  MAYBE_RETURN(maybe_numeric, MaybeHandle<JSRelativeTimeFormat>());
+  Maybe<Numeric> maybe_numeric = GetStringOption<Numeric>(
+      isolate, options, isolate->factory()->numeric_string(), service,
+      std::to_array<const std::string_view>({"always", "auto"}),
+      std::array{Numeric::ALWAYS, Numeric::AUTO}, Numeric::ALWAYS);
+  MAYBE_RETURN(maybe_numeric, MaybeDirectHandle<JSRelativeTimeFormat>());
   Numeric numeric_enum = maybe_numeric.FromJust();
 
-  // 19. Let relativeTimeFormat.[[NumberFormat]] be
+  // 19. Set relativeTimeFormat.[[Numeric]] to numeric.
+
+  // 23. Let relativeTimeFormat.[[NumberFormat]] be
   //     ? Construct(%NumberFormat%, « nfLocale, nfOptions »).
   icu::NumberFormat* number_format =
       icu::NumberFormat::createInstance(icu_locale, UNUM_DECIMAL, status);
   if (U_FAILURE(status)) {
-    delete number_format;
-    FATAL("Failed to create ICU number format, are ICU data files missing?");
+    // Data build filter files excluded data in "rbnf_tree" since ECMA402 does
+    // not support "algorithmic" numbering systems. Therefore we may get the
+    // U_MISSING_RESOURCE_ERROR here. Fallback to locale without the numbering
+    // system and create the object again.
+    if (status == U_MISSING_RESOURCE_ERROR) {
+      delete number_format;
+      status = U_ZERO_ERROR;
+      icu_locale.setUnicodeKeywordValue("nu", nullptr, status);
+      DCHECK(U_SUCCESS(status));
+      number_format =
+          icu::NumberFormat::createInstance(icu_locale, UNUM_DECIMAL, status);
+    }
+    if (U_FAILURE(status) || number_format == nullptr) {
+      delete number_format;
+      THROW_NEW_ERROR(isolate, NewRangeError(MessageTemplate::kIcuError));
+    }
   }
-  CHECK_NOT_NULL(number_format);
+
+  if (number_format->getDynamicClassID() ==
+      icu::DecimalFormat::getStaticClassID()) {
+    icu::DecimalFormat* decimal_format =
+        static_cast<icu::DecimalFormat*>(number_format);
+    decimal_format->setMinimumGroupingDigits(-2);
+  }
 
   // Change UDISPCTX_CAPITALIZATION_NONE to other values if
   // ECMA402 later include option to change capitalization.
   // Ref: https://github.com/tc39/proposal-intl-relative-time/issues/11
-  icu::RelativeDateTimeFormatter* icu_formatter =
-      new icu::RelativeDateTimeFormatter(icu_locale, number_format,
-                                         getIcuStyle(style_enum),
-                                         UDISPCTX_CAPITALIZATION_NONE, status);
-  if (U_FAILURE(status)) {
-    delete icu_formatter;
-    FATAL(
-        "Failed to create ICU relative date time formatter, are ICU data files "
-        "missing?");
+  std::shared_ptr<icu::RelativeDateTimeFormatter> icu_formatter =
+      std::make_shared<icu::RelativeDateTimeFormatter>(
+          icu_locale, number_format, toIcuStyle(style_enum),
+          UDISPCTX_CAPITALIZATION_NONE, status);
+  if (U_FAILURE(status) || icu_formatter == nullptr) {
+    THROW_NEW_ERROR(isolate, NewRangeError(MessageTemplate::kIcuError));
   }
-  CHECK_NOT_NULL(icu_formatter);
 
-  Handle<Managed<icu::RelativeDateTimeFormatter>> managed_formatter =
-      Managed<icu::RelativeDateTimeFormatter>::FromRawPtr(isolate, 0,
-                                                          icu_formatter);
+  DirectHandle<String> numbering_system_string =
+      isolate->factory()->NewStringFromAsciiChecked(
+          Intl::GetNumberingSystem(icu_locale).c_str());
 
-  // Now all properties are ready, so we can allocate the result object.
-  Handle<JSRelativeTimeFormat> relative_time_format_holder =
-      Handle<JSRelativeTimeFormat>::cast(
+  DirectHandle<Managed<icu::RelativeDateTimeFormatter>> managed_formatter =
+      Managed<icu::RelativeDateTimeFormatter>::From(isolate, 0,
+                                                    std::move(icu_formatter));
+
+  DirectHandle<JSRelativeTimeFormat> relative_time_format_holder =
+      Cast<JSRelativeTimeFormat>(
           isolate->factory()->NewFastOrSlowJSObjectFromMap(map));
-  DisallowHeapAllocation no_gc;
+
+  DisallowGarbageCollection no_gc;
   relative_time_format_holder->set_flags(0);
-
   relative_time_format_holder->set_locale(*locale_str);
-
-  // 16. Set relativeTimeFormat.[[Style]] to s.
-  relative_time_format_holder->set_style(style_enum);
-
-  // 18. Set relativeTimeFormat.[[Numeric]] to numeric.
+  relative_time_format_holder->set_numberingSystem(*numbering_system_string);
   relative_time_format_holder->set_numeric(numeric_enum);
-
-  // 21. Set relativeTimeFormat.[[InitializedRelativeTimeFormat]] to true.
   relative_time_format_holder->set_icu_formatter(*managed_formatter);
 
-  // 22. Return relativeTimeFormat.
+  // 25. Return relativeTimeFormat.
   return relative_time_format_holder;
 }
 
-Handle<JSObject> JSRelativeTimeFormat::ResolvedOptions(
-    Isolate* isolate, Handle<JSRelativeTimeFormat> format_holder) {
-  Factory* factory = isolate->factory();
-  Handle<JSObject> result = factory->NewJSObject(isolate->object_function());
-  Handle<String> locale(format_holder->locale(), isolate);
-  JSObject::AddProperty(isolate, result, factory->locale_string(), locale,
-                        NONE);
-  JSObject::AddProperty(isolate, result, factory->style_string(),
-                        format_holder->StyleAsString(), NONE);
-  JSObject::AddProperty(isolate, result, factory->numeric_string(),
-                        format_holder->NumericAsString(), NONE);
-  std::string locale_str(format_holder->locale().ToCString().get());
-  icu::Locale icu_locale = Intl::CreateICULocale(locale_str);
-  std::string numbering_system = Intl::GetNumberingSystem(icu_locale);
-  JSObject::AddProperty(
-      isolate, result, factory->numberingSystem_string(),
-      factory->NewStringFromAsciiChecked(numbering_system.c_str()), NONE);
-  return result;
-}
+namespace {
 
-Handle<String> JSRelativeTimeFormat::StyleAsString() const {
-  switch (style()) {
+DirectHandle<String> StyleAsString(Isolate* isolate, Style style) {
+  switch (style) {
     case Style::LONG:
-      return GetReadOnlyRoots().long_string_handle();
+      return isolate->factory()->long_string();
     case Style::SHORT:
-      return GetReadOnlyRoots().short_string_handle();
+      return isolate->factory()->short_string();
     case Style::NARROW:
-      return GetReadOnlyRoots().narrow_string_handle();
+      return isolate->factory()->narrow_string();
   }
   UNREACHABLE();
 }
 
-Handle<String> JSRelativeTimeFormat::NumericAsString() const {
+}  // namespace
+
+DirectHandle<JSObject> JSRelativeTimeFormat::ResolvedOptions(
+    Isolate* isolate, DirectHandle<JSRelativeTimeFormat> format_holder) {
+  Factory* factory = isolate->factory();
+  Managed<icu::RelativeDateTimeFormatter>::Ptr formatter =
+      format_holder->icu_formatter()->ptr();
+  DCHECK_NOT_NULL(formatter);
+  DirectHandle<JSObject> result =
+      factory->NewJSObject(isolate->object_function());
+  DirectHandle<String> locale(format_holder->locale(), isolate);
+  DirectHandle<String> numberingSystem(format_holder->numberingSystem(),
+                                       isolate);
+  JSObject::AddProperty(isolate, result, factory->locale_string(), locale,
+                        NONE);
+  JSObject::AddProperty(
+      isolate, result, factory->style_string(),
+      StyleAsString(isolate, fromIcuStyle(formatter->getFormatStyle())), NONE);
+  JSObject::AddProperty(isolate, result, factory->numeric_string(),
+                        format_holder->NumericAsString(isolate), NONE);
+  JSObject::AddProperty(isolate, result, factory->numberingSystem_string(),
+                        numberingSystem, NONE);
+  return result;
+}
+
+Handle<String> JSRelativeTimeFormat::NumericAsString(Isolate* isolate) const {
   switch (numeric()) {
     case Numeric::ALWAYS:
-      return GetReadOnlyRoots().always_string_handle();
+      return isolate->factory()->always_string();
     case Numeric::AUTO:
-      return GetReadOnlyRoots().auto_string_handle();
+      return isolate->factory()->auto_string();
   }
   UNREACHABLE();
 }
 
 namespace {
 
-Handle<String> UnitAsString(Isolate* isolate, URelativeDateTimeUnit unit_enum) {
+DirectHandle<String> UnitAsString(Isolate* isolate,
+                                  URelativeDateTimeUnit unit_enum) {
   Factory* factory = isolate->factory();
   switch (unit_enum) {
     case UDAT_REL_UNIT_SECOND:
@@ -260,32 +308,24 @@ Handle<String> UnitAsString(Isolate* isolate, URelativeDateTimeUnit unit_enum) {
   }
 }
 
-bool GetURelativeDateTimeUnit(Handle<String> unit,
+bool GetURelativeDateTimeUnit(DirectHandle<String> unit,
                               URelativeDateTimeUnit* unit_enum) {
-  std::unique_ptr<char[]> unit_str = unit->ToCString();
-  if ((strcmp("second", unit_str.get()) == 0) ||
-      (strcmp("seconds", unit_str.get()) == 0)) {
+  std::string unit_str = unit->ToStdString();
+  if (unit_str == "second" || unit_str == "seconds") {
     *unit_enum = UDAT_REL_UNIT_SECOND;
-  } else if ((strcmp("minute", unit_str.get()) == 0) ||
-             (strcmp("minutes", unit_str.get()) == 0)) {
+  } else if (unit_str == "minute" || unit_str == "minutes") {
     *unit_enum = UDAT_REL_UNIT_MINUTE;
-  } else if ((strcmp("hour", unit_str.get()) == 0) ||
-             (strcmp("hours", unit_str.get()) == 0)) {
+  } else if (unit_str == "hour" || unit_str == "hours") {
     *unit_enum = UDAT_REL_UNIT_HOUR;
-  } else if ((strcmp("day", unit_str.get()) == 0) ||
-             (strcmp("days", unit_str.get()) == 0)) {
+  } else if (unit_str == "day" || unit_str == "days") {
     *unit_enum = UDAT_REL_UNIT_DAY;
-  } else if ((strcmp("week", unit_str.get()) == 0) ||
-             (strcmp("weeks", unit_str.get()) == 0)) {
+  } else if (unit_str == "week" || unit_str == "weeks") {
     *unit_enum = UDAT_REL_UNIT_WEEK;
-  } else if ((strcmp("month", unit_str.get()) == 0) ||
-             (strcmp("months", unit_str.get()) == 0)) {
+  } else if (unit_str == "month" || unit_str == "months") {
     *unit_enum = UDAT_REL_UNIT_MONTH;
-  } else if ((strcmp("quarter", unit_str.get()) == 0) ||
-             (strcmp("quarters", unit_str.get()) == 0)) {
+  } else if (unit_str == "quarter" || unit_str == "quarters") {
     *unit_enum = UDAT_REL_UNIT_QUARTER;
-  } else if ((strcmp("year", unit_str.get()) == 0) ||
-             (strcmp("years", unit_str.get()) == 0)) {
+  } else if (unit_str == "year" || unit_str == "years") {
     *unit_enum = UDAT_REL_UNIT_YEAR;
   } else {
     return false;
@@ -294,39 +334,38 @@ bool GetURelativeDateTimeUnit(Handle<String> unit,
 }
 
 template <typename T>
-MaybeHandle<T> FormatCommon(
-    Isolate* isolate, Handle<JSRelativeTimeFormat> format,
+MaybeDirectHandle<T> FormatCommon(
+    Isolate* isolate, DirectHandle<JSRelativeTimeFormat> format,
     Handle<Object> value_obj, Handle<Object> unit_obj, const char* func_name,
-    MaybeHandle<T> (*formatToResult)(Isolate*,
-                                     const icu::FormattedRelativeDateTime&,
-                                     Handle<Object>, Handle<String>)) {
+    MaybeDirectHandle<T> (*formatToResult)(
+        Isolate*, const icu::FormattedRelativeDateTime&, DirectHandle<String>,
+        bool)) {
   // 3. Let value be ? ToNumber(value).
-  Handle<Object> value;
+  DirectHandle<Object> value;
   ASSIGN_RETURN_ON_EXCEPTION(isolate, value,
-                             Object::ToNumber(isolate, value_obj), T);
-  double number = value->Number();
+                             Object::ToNumber(isolate, value_obj));
+  double number = Object::NumberValue(*value);
   // 4. Let unit be ? ToString(unit).
   Handle<String> unit;
-  ASSIGN_RETURN_ON_EXCEPTION(isolate, unit, Object::ToString(isolate, unit_obj),
-                             T);
+  ASSIGN_RETURN_ON_EXCEPTION(isolate, unit,
+                             Object::ToString(isolate, unit_obj));
   // 4. If isFinite(value) is false, then throw a RangeError exception.
   if (!std::isfinite(number)) {
     THROW_NEW_ERROR(
-        isolate,
-        NewRangeError(MessageTemplate::kNotFiniteNumber,
-                      isolate->factory()->NewStringFromAsciiChecked(func_name)),
-        T);
+        isolate, NewRangeError(
+                     MessageTemplate::kNotFiniteNumber,
+                     isolate->factory()->NewStringFromAsciiChecked(func_name)));
   }
-  icu::RelativeDateTimeFormatter* formatter = format->icu_formatter().raw();
-  CHECK_NOT_NULL(formatter);
+  Managed<icu::RelativeDateTimeFormatter>::Ptr formatter =
+      format->icu_formatter()->ptr();
+  DCHECK_NOT_NULL(formatter);
   URelativeDateTimeUnit unit_enum;
   if (!GetURelativeDateTimeUnit(unit, &unit_enum)) {
     THROW_NEW_ERROR(
         isolate,
         NewRangeError(MessageTemplate::kInvalidUnit,
                       isolate->factory()->NewStringFromAsciiChecked(func_name),
-                      unit),
-        T);
+                      unit));
   }
   UErrorCode status = U_ZERO_ERROR;
   icu::FormattedRelativeDateTime formatted =
@@ -334,63 +373,62 @@ MaybeHandle<T> FormatCommon(
           ? formatter->formatNumericToValue(number, unit_enum, status)
           : formatter->formatToValue(number, unit_enum, status);
   if (U_FAILURE(status)) {
-    THROW_NEW_ERROR(isolate, NewTypeError(MessageTemplate::kIcuError), T);
+    THROW_NEW_ERROR(isolate, NewTypeError(MessageTemplate::kIcuError));
   }
-  return formatToResult(isolate, formatted, value,
-                        UnitAsString(isolate, unit_enum));
+  return formatToResult(isolate, formatted, UnitAsString(isolate, unit_enum),
+                        IsNaN(*value));
 }
 
-MaybeHandle<String> FormatToString(
+MaybeDirectHandle<String> FormatToString(
     Isolate* isolate, const icu::FormattedRelativeDateTime& formatted,
-    Handle<Object> value, Handle<String> unit) {
+    DirectHandle<String> unit, bool is_nan) {
   UErrorCode status = U_ZERO_ERROR;
   icu::UnicodeString result = formatted.toString(status);
   if (U_FAILURE(status)) {
-    THROW_NEW_ERROR(isolate, NewTypeError(MessageTemplate::kIcuError), String);
+    THROW_NEW_ERROR(isolate, NewTypeError(MessageTemplate::kIcuError));
   }
   return Intl::ToString(isolate, result);
 }
 
-Maybe<bool> AddLiteral(Isolate* isolate, Handle<JSArray> array,
+Maybe<bool> AddLiteral(Isolate* isolate, DirectHandle<JSArray> array,
                        const icu::UnicodeString& string, int32_t index,
                        int32_t start, int32_t limit) {
-  Handle<String> substring;
-  ASSIGN_RETURN_ON_EXCEPTION_VALUE(
-      isolate, substring, Intl::ToString(isolate, string, start, limit),
-      Nothing<bool>());
+  DirectHandle<String> substring;
+  ASSIGN_RETURN_ON_EXCEPTION(isolate, substring,
+                             Intl::ToString(isolate, string, start, limit));
   Intl::AddElement(isolate, array, index, isolate->factory()->literal_string(),
                    substring);
   return Just(true);
 }
 
-Maybe<bool> AddUnit(Isolate* isolate, Handle<JSArray> array,
+Maybe<bool> AddUnit(Isolate* isolate, DirectHandle<JSArray> array,
                     const icu::UnicodeString& string, int32_t index,
-                    int32_t start, int32_t limit, int32_t field_id,
-                    Handle<Object> value, Handle<String> unit) {
-  Handle<String> substring;
-  ASSIGN_RETURN_ON_EXCEPTION_VALUE(
-      isolate, substring, Intl::ToString(isolate, string, start, limit),
-      Nothing<bool>());
+                    const NumberFormatSpan& part, DirectHandle<String> unit,
+                    bool is_nan) {
+  DirectHandle<String> substring;
+  ASSIGN_RETURN_ON_EXCEPTION(
+      isolate, substring,
+      Intl::ToString(isolate, string, part.begin_pos, part.end_pos));
   Intl::AddElement(isolate, array, index,
-                   Intl::NumberFieldToType(isolate, value, field_id), substring,
-                   isolate->factory()->unit_string(), unit);
+                   Intl::NumberFieldToType(isolate, part, string, is_nan),
+                   substring, isolate->factory()->unit_string(), unit);
   return Just(true);
 }
 
-MaybeHandle<JSArray> FormatToJSArray(
+MaybeDirectHandle<JSArray> FormatToJSArray(
     Isolate* isolate, const icu::FormattedRelativeDateTime& formatted,
-    Handle<Object> value, Handle<String> unit) {
+    DirectHandle<String> unit, bool is_nan) {
   UErrorCode status = U_ZERO_ERROR;
   icu::UnicodeString string = formatted.toString(status);
 
   Factory* factory = isolate->factory();
-  Handle<JSArray> array = factory->NewJSArray(0);
+  DirectHandle<JSArray> array = factory->NewJSArray(0);
   icu::ConstrainedFieldPosition cfpos;
   cfpos.constrainCategory(UFIELD_CATEGORY_NUMBER);
   int32_t index = 0;
 
   int32_t previous_end = 0;
-  Handle<String> substring;
+  DirectHandle<String> substring;
   std::vector<std::pair<int32_t, int32_t>> groups;
   while (formatted.nextPosition(cfpos, status) && U_SUCCESS(status)) {
     int32_t category = cfpos.getCategory();
@@ -405,55 +443,59 @@ MaybeHandle<JSArray> FormatToJSArray(
       if (start > previous_end) {
         Maybe<bool> maybe_added =
             AddLiteral(isolate, array, string, index++, previous_end, start);
-        MAYBE_RETURN(maybe_added, Handle<JSArray>());
+        MAYBE_RETURN(maybe_added, DirectHandle<JSArray>());
       }
       if (field == UNUM_INTEGER_FIELD) {
         for (auto start_limit : groups) {
           if (start_limit.first > start) {
             Maybe<bool> maybe_added =
-                AddUnit(isolate, array, string, index++, start,
-                        start_limit.first, field, value, unit);
-            MAYBE_RETURN(maybe_added, Handle<JSArray>());
-            maybe_added = AddUnit(isolate, array, string, index++,
-                                  start_limit.first, start_limit.second,
-                                  UNUM_GROUPING_SEPARATOR_FIELD, value, unit);
-            MAYBE_RETURN(maybe_added, Handle<JSArray>());
+                AddUnit(isolate, array, string, index++,
+                        NumberFormatSpan(field, start, start_limit.first), unit,
+                        is_nan);
+            MAYBE_RETURN(maybe_added, DirectHandle<JSArray>());
+            maybe_added =
+                AddUnit(isolate, array, string, index++,
+                        NumberFormatSpan(UNUM_GROUPING_SEPARATOR_FIELD,
+                                         start_limit.first, start_limit.second),
+                        unit, is_nan);
+            MAYBE_RETURN(maybe_added, DirectHandle<JSArray>());
             start = start_limit.second;
           }
         }
       }
-      Maybe<bool> maybe_added = AddUnit(isolate, array, string, index++, start,
-                                        limit, field, value, unit);
-      MAYBE_RETURN(maybe_added, Handle<JSArray>());
+      Maybe<bool> maybe_added =
+          AddUnit(isolate, array, string, index++,
+                  NumberFormatSpan(field, start, limit), unit, is_nan);
+      MAYBE_RETURN(maybe_added, DirectHandle<JSArray>());
       previous_end = limit;
     }
   }
   if (U_FAILURE(status)) {
-    THROW_NEW_ERROR(isolate, NewTypeError(MessageTemplate::kIcuError), JSArray);
+    THROW_NEW_ERROR(isolate, NewTypeError(MessageTemplate::kIcuError));
   }
   if (string.length() > previous_end) {
     Maybe<bool> maybe_added = AddLiteral(isolate, array, string, index,
                                          previous_end, string.length());
-    MAYBE_RETURN(maybe_added, Handle<JSArray>());
+    MAYBE_RETURN(maybe_added, DirectHandle<JSArray>());
   }
 
-  JSObject::ValidateElements(*array);
+  JSObject::ValidateElements(isolate, *array);
   return array;
 }
 
 }  // namespace
 
-MaybeHandle<String> JSRelativeTimeFormat::Format(
+MaybeDirectHandle<String> JSRelativeTimeFormat::Format(
     Isolate* isolate, Handle<Object> value_obj, Handle<Object> unit_obj,
-    Handle<JSRelativeTimeFormat> format) {
+    DirectHandle<JSRelativeTimeFormat> format) {
   return FormatCommon<String>(isolate, format, value_obj, unit_obj,
                               "Intl.RelativeTimeFormat.prototype.format",
                               FormatToString);
 }
 
-MaybeHandle<JSArray> JSRelativeTimeFormat::FormatToParts(
+MaybeDirectHandle<JSArray> JSRelativeTimeFormat::FormatToParts(
     Isolate* isolate, Handle<Object> value_obj, Handle<Object> unit_obj,
-    Handle<JSRelativeTimeFormat> format) {
+    DirectHandle<JSRelativeTimeFormat> format) {
   return FormatCommon<JSArray>(
       isolate, format, value_obj, unit_obj,
       "Intl.RelativeTimeFormat.prototype.formatToParts", FormatToJSArray);

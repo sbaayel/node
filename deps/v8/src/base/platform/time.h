@@ -14,6 +14,7 @@
 #include "src/base/base-export.h"
 #include "src/base/bits.h"
 #include "src/base/macros.h"
+#include "src/base/numerics/safe_conversions.h"
 #if V8_OS_WIN
 #include "src/base/win32-headers.h"
 #endif
@@ -36,7 +37,7 @@ class TimeTicks;
 namespace time_internal {
 template<class TimeClass>
 class TimeBase;
-}
+}  // namespace time_internal
 
 class TimeConstants {
  public:
@@ -55,6 +56,9 @@ class TimeConstants {
   static constexpr int64_t kNanosecondsPerMicrosecond = 1000;
   static constexpr int64_t kNanosecondsPerSecond =
       kNanosecondsPerMicrosecond * kMicrosecondsPerSecond;
+
+  // Support defaulted comparison of subclasses.
+  constexpr auto operator<=>(const TimeConstants&) const = default;
 };
 
 // -----------------------------------------------------------------------------
@@ -88,6 +92,14 @@ class V8_BASE_EXPORT TimeDelta final {
   }
   static constexpr TimeDelta FromNanoseconds(int64_t nanoseconds) {
     return TimeDelta(nanoseconds / TimeConstants::kNanosecondsPerMicrosecond);
+  }
+
+  static constexpr TimeDelta FromSecondsD(double seconds) {
+    return FromDouble(seconds * TimeConstants::kMicrosecondsPerSecond);
+  }
+  static constexpr TimeDelta FromMillisecondsD(double milliseconds) {
+    return FromDouble(milliseconds *
+                      TimeConstants::kMicrosecondsPerMillisecond);
   }
 
   // Returns the maximum time delta, which should be greater than any reasonable
@@ -136,18 +148,18 @@ class V8_BASE_EXPORT TimeDelta final {
   struct timespec ToTimespec() const;
 
   // Computations with other deltas.
-  TimeDelta operator+(const TimeDelta& other) const {
+  constexpr TimeDelta operator+(const TimeDelta& other) const {
     return TimeDelta(delta_ + other.delta_);
   }
-  TimeDelta operator-(const TimeDelta& other) const {
+  constexpr TimeDelta operator-(const TimeDelta& other) const {
     return TimeDelta(delta_ - other.delta_);
   }
 
-  TimeDelta& operator+=(const TimeDelta& other) {
+  constexpr TimeDelta& operator+=(const TimeDelta& other) {
     delta_ += other.delta_;
     return *this;
   }
-  TimeDelta& operator-=(const TimeDelta& other) {
+  constexpr TimeDelta& operator-=(const TimeDelta& other) {
     delta_ -= other.delta_;
     return *this;
   }
@@ -180,27 +192,13 @@ class V8_BASE_EXPORT TimeDelta final {
     return delta_ / other.delta_;
   }
 
-  // Comparison operators.
-  constexpr bool operator==(const TimeDelta& other) const {
-    return delta_ == other.delta_;
-  }
-  constexpr bool operator!=(const TimeDelta& other) const {
-    return delta_ != other.delta_;
-  }
-  constexpr bool operator<(const TimeDelta& other) const {
-    return delta_ < other.delta_;
-  }
-  constexpr bool operator<=(const TimeDelta& other) const {
-    return delta_ <= other.delta_;
-  }
-  constexpr bool operator>(const TimeDelta& other) const {
-    return delta_ > other.delta_;
-  }
-  constexpr bool operator>=(const TimeDelta& other) const {
-    return delta_ >= other.delta_;
-  }
+  constexpr auto operator<=>(const TimeDelta&) const = default;
+
+  friend void swap(TimeDelta a, TimeDelta b) { std::swap(a.delta_, b.delta_); }
 
  private:
+  static constexpr inline TimeDelta FromDouble(double value);
+
   template<class TimeClass> friend class time_internal::TimeBase;
   // Constructs a delta given the duration in microseconds. This is private
   // to avoid confusion by callers with an integer constructor. Use
@@ -212,6 +210,11 @@ class V8_BASE_EXPORT TimeDelta final {
 };
 
 // static
+constexpr TimeDelta TimeDelta::FromDouble(double value) {
+  return TimeDelta(saturated_cast<int64_t>(value));
+}
+
+// static
 constexpr TimeDelta TimeDelta::Max() {
   return TimeDelta(std::numeric_limits<int64_t>::max());
 }
@@ -220,6 +223,38 @@ constexpr TimeDelta TimeDelta::Max() {
 constexpr TimeDelta TimeDelta::Min() {
   return TimeDelta(std::numeric_limits<int64_t>::min());
 }
+
+constexpr TimeDelta Nanoseconds(int64_t nanoseconds) {
+  return TimeDelta::FromNanoseconds(nanoseconds);
+}
+
+constexpr TimeDelta Microseconds(int64_t microseconds) {
+  return TimeDelta::FromMicroseconds(microseconds);
+}
+
+constexpr TimeDelta Milliseconds(int64_t milliseconds) {
+  return TimeDelta::FromMilliseconds(milliseconds);
+}
+
+constexpr TimeDelta Milliseconds(double milliseconds) {
+  return TimeDelta::FromMillisecondsD(milliseconds);
+}
+
+constexpr TimeDelta Seconds(int64_t seconds) {
+  return TimeDelta::FromSeconds(seconds);
+}
+
+constexpr TimeDelta Seconds(double seconds) {
+  return TimeDelta::FromSecondsD(seconds);
+}
+
+constexpr TimeDelta Minutes(int minutes) {
+  return TimeDelta::FromMinutes(minutes);
+}
+
+constexpr TimeDelta Hours(int hours) { return TimeDelta::FromHours(hours); }
+
+constexpr TimeDelta FromDays(int days) { return TimeDelta::FromDays(days); }
 
 namespace time_internal {
 
@@ -268,6 +303,16 @@ class TimeBase : public TimeConstants {
   // provided operators.
   int64_t ToInternalValue() const { return us_; }
 
+  // The amount of time since the origin (or "zero") point. This is a syntactic
+  // convenience to aid in code readability, mainly for debugging/testing use
+  // cases.
+  //
+  // Warning: While the Time subclass has a fixed origin point, the origin for
+  // the other subclasses can vary each time the application is restarted.
+  constexpr TimeDelta since_origin() const {
+    return TimeDelta::FromMicroseconds(us_);
+  }
+
   TimeClass& operator=(TimeClass other) {
     us_ = other.us_;
     return *(static_cast<TimeClass*>(this));
@@ -294,25 +339,7 @@ class TimeBase : public TimeConstants {
     return static_cast<TimeClass&>(*this = (*this - delta));
   }
 
-  // Comparison operators
-  bool operator==(TimeClass other) const {
-    return us_ == other.us_;
-  }
-  bool operator!=(TimeClass other) const {
-    return us_ != other.us_;
-  }
-  bool operator<(TimeClass other) const {
-    return us_ < other.us_;
-  }
-  bool operator<=(TimeClass other) const {
-    return us_ <= other.us_;
-  }
-  bool operator>(TimeClass other) const {
-    return us_ > other.us_;
-  }
-  bool operator>=(TimeClass other) const {
-    return us_ >= other.us_;
-  }
+  constexpr auto operator<=>(const TimeBase&) const = default;
 
   // Converts an integer value representing TimeClass to a class. This is used
   // when deserializing a |TimeClass| structure, using a value known to be
@@ -406,13 +433,12 @@ class V8_BASE_EXPORT TimeTicks final
   // This method never returns a null TimeTicks.
   static TimeTicks Now();
 
-  // This is equivalent to Now() but DCHECKs that IsHighResolution(). Useful for
-  // test frameworks that rely on high resolution clocks (in practice all
-  // platforms but low-end Windows devices have high resolution clocks).
-  static TimeTicks HighResolutionNow();
-
   // Returns true if the high-resolution clock is working on this system.
   static bool IsHighResolution();
+
+  static constexpr TimeTicks FromMsTicksForTesting(int64_t ticks) {
+    return TimeTicks(ticks * kMicrosecondsPerMillisecond);
+  }
 
  private:
   friend class time_internal::TimeBase<TimeTicks>;
@@ -472,9 +498,15 @@ class V8_BASE_EXPORT ThreadTicks final
   explicit constexpr ThreadTicks(int64_t ticks) : TimeBase(ticks) {}
 
 #if V8_OS_WIN
+#if V8_HOST_ARCH_ARM64
+  // TSCTicksPerSecond is not supported on Windows on Arm systems because the
+  // cycle-counting methods use the actual CPU cycle count, and not a consistent
+  // incrementing counter.
+#else
   // Returns the frequency of the TSC in ticks per second, or 0 if it hasn't
   // been measured yet. Needs to be guarded with a call to IsSupported().
   static double TSCTicksPerSecond();
+#endif
   static bool IsSupportedWin();
   static void WaitUntilInitializedWin();
 #endif

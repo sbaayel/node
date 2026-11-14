@@ -5,17 +5,21 @@
 #ifndef V8_WASM_WASM_LINKAGE_H_
 #define V8_WASM_WASM_LINKAGE_H_
 
+#if !V8_ENABLE_WEBASSEMBLY
+#error This header should only be included if WebAssembly is enabled.
+#endif  // !V8_ENABLE_WEBASSEMBLY
+
+#include "src/codegen/aligned-slot-allocator.h"
 #include "src/codegen/assembler-arch.h"
+#include "src/codegen/linkage-location.h"
 #include "src/codegen/machine-type.h"
-#include "src/codegen/signature.h"
-#include "src/wasm/value-type.h"
 
 namespace v8 {
 namespace internal {
 namespace wasm {
 
 // TODO(wasm): optimize calling conventions to be both closer to C++ (to
-// reduce adapter costs for fast WASM <-> C++ calls) and to be more efficient
+// reduce adapter costs for fast Wasm <-> C++ calls) and to be more efficient
 // in general.
 
 #if V8_TARGET_ARCH_IA32
@@ -27,6 +31,8 @@ constexpr Register kGpReturnRegisters[] = {eax, edx};
 constexpr DoubleRegister kFpParamRegisters[] = {xmm1, xmm2, xmm3,
                                                 xmm4, xmm5, xmm6};
 constexpr DoubleRegister kFpReturnRegisters[] = {xmm1, xmm2};
+constexpr std::array<Simd128Register, 0> kSimd128ParamRegisters{};
+constexpr std::array<Simd128Register, 0> kSimd128ReturnRegisters{};
 
 #elif V8_TARGET_ARCH_X64
 // ===========================================================================
@@ -37,6 +43,8 @@ constexpr Register kGpReturnRegisters[] = {rax, rdx};
 constexpr DoubleRegister kFpParamRegisters[] = {xmm1, xmm2, xmm3,
                                                 xmm4, xmm5, xmm6};
 constexpr DoubleRegister kFpReturnRegisters[] = {xmm1, xmm2};
+constexpr std::array<Simd128Register, 0> kSimd128ParamRegisters{};
+constexpr std::array<Simd128Register, 0> kSimd128ReturnRegisters{};
 
 #elif V8_TARGET_ARCH_ARM
 // ===========================================================================
@@ -44,9 +52,11 @@ constexpr DoubleRegister kFpReturnRegisters[] = {xmm1, xmm2};
 // ===========================================================================
 constexpr Register kGpParamRegisters[] = {r3, r0, r2, r6};
 constexpr Register kGpReturnRegisters[] = {r0, r1};
-// ARM d-registers must be in ascending order for correct allocation.
+// ARM d-registers must be in even/odd D-register pairs for correct allocation.
 constexpr DoubleRegister kFpParamRegisters[] = {d0, d1, d2, d3, d4, d5, d6, d7};
 constexpr DoubleRegister kFpReturnRegisters[] = {d0, d1};
+constexpr std::array<Simd128Register, 0> kSimd128ParamRegisters{};
+constexpr std::array<Simd128Register, 0> kSimd128ReturnRegisters{};
 
 #elif V8_TARGET_ARCH_ARM64
 // ===========================================================================
@@ -56,15 +66,8 @@ constexpr Register kGpParamRegisters[] = {x7, x0, x2, x3, x4, x5, x6};
 constexpr Register kGpReturnRegisters[] = {x0, x1};
 constexpr DoubleRegister kFpParamRegisters[] = {d0, d1, d2, d3, d4, d5, d6, d7};
 constexpr DoubleRegister kFpReturnRegisters[] = {d0, d1};
-
-#elif V8_TARGET_ARCH_MIPS
-// ===========================================================================
-// == mips ===================================================================
-// ===========================================================================
-constexpr Register kGpParamRegisters[] = {a0, a2, a3};
-constexpr Register kGpReturnRegisters[] = {v0, v1};
-constexpr DoubleRegister kFpParamRegisters[] = {f2, f4, f6, f8, f10, f12, f14};
-constexpr DoubleRegister kFpReturnRegisters[] = {f2, f4};
+constexpr std::array<Simd128Register, 0> kSimd128ParamRegisters{};
+constexpr std::array<Simd128Register, 0> kSimd128ReturnRegisters{};
 
 #elif V8_TARGET_ARCH_MIPS64
 // ===========================================================================
@@ -74,15 +77,30 @@ constexpr Register kGpParamRegisters[] = {a0, a2, a3, a4, a5, a6, a7};
 constexpr Register kGpReturnRegisters[] = {v0, v1};
 constexpr DoubleRegister kFpParamRegisters[] = {f2, f4, f6, f8, f10, f12, f14};
 constexpr DoubleRegister kFpReturnRegisters[] = {f2, f4};
+constexpr std::array<Simd128Register, 0> kSimd128ParamRegisters{};
+constexpr std::array<Simd128Register, 0> kSimd128ReturnRegisters{};
 
-#elif V8_TARGET_ARCH_PPC || V8_TARGET_ARCH_PPC64
+#elif V8_TARGET_ARCH_LOONG64
 // ===========================================================================
-// == ppc & ppc64 ============================================================
+// == LOONG64 ================================================================
+// ===========================================================================
+constexpr Register kGpParamRegisters[] = {a7, a0, a2, a3, a4, a5, a6};
+constexpr Register kGpReturnRegisters[] = {a0, a1};
+constexpr DoubleRegister kFpParamRegisters[] = {f0, f1, f2, f3, f4, f5, f6, f7};
+constexpr DoubleRegister kFpReturnRegisters[] = {f0, f1};
+constexpr std::array<Simd128Register, 0> kSimd128ParamRegisters{};
+constexpr std::array<Simd128Register, 0> kSimd128ReturnRegisters{};
+
+#elif V8_TARGET_ARCH_PPC64
+// ===========================================================================
+// == ppc64 ==================================================================
 // ===========================================================================
 constexpr Register kGpParamRegisters[] = {r10, r3, r5, r6, r7, r8, r9};
 constexpr Register kGpReturnRegisters[] = {r3, r4};
 constexpr DoubleRegister kFpParamRegisters[] = {d1, d2, d3, d4, d5, d6, d7, d8};
 constexpr DoubleRegister kFpReturnRegisters[] = {d1, d2};
+constexpr std::array kSimd128ParamRegisters = {v1, v2, v3, v4, v5, v6, v7, v8};
+constexpr std::array kSimd128ReturnRegisters = {v1, v2};
 
 #elif V8_TARGET_ARCH_S390X
 // ===========================================================================
@@ -91,16 +109,24 @@ constexpr DoubleRegister kFpReturnRegisters[] = {d1, d2};
 constexpr Register kGpParamRegisters[] = {r6, r2, r4, r5};
 constexpr Register kGpReturnRegisters[] = {r2, r3};
 constexpr DoubleRegister kFpParamRegisters[] = {d0, d2, d4, d6};
-constexpr DoubleRegister kFpReturnRegisters[] = {d0, d2, d4, d6};
-
-#elif V8_TARGET_ARCH_S390
-// ===========================================================================
-// == s390 ===================================================================
-// ===========================================================================
-constexpr Register kGpParamRegisters[] = {r6, r2, r4, r5};
-constexpr Register kGpReturnRegisters[] = {r2, r3};
-constexpr DoubleRegister kFpParamRegisters[] = {d0, d2};
 constexpr DoubleRegister kFpReturnRegisters[] = {d0, d2};
+constexpr std::array<Simd128Register, 0> kSimd128ParamRegisters{};
+constexpr std::array<Simd128Register, 0> kSimd128ReturnRegisters{};
+
+#elif V8_TARGET_ARCH_RISCV32 || V8_TARGET_ARCH_RISCV64
+// ===========================================================================
+// == riscv64 =================================================================
+// ===========================================================================
+// Note that kGpParamRegisters and kFpParamRegisters are used in
+// Builtins::Generate_WasmCompileLazy (builtins-riscv.cc)
+constexpr Register kGpParamRegisters[] = {a7, a0, a2, a3, a4, a5, a6};
+constexpr Register kGpReturnRegisters[] = {a0, a1};
+constexpr DoubleRegister kFpParamRegisters[] = {fa0, fa1, fa2, fa3,
+                                                fa4, fa5, fa6, fa7};
+constexpr DoubleRegister kFpReturnRegisters[] = {fa0, fa1};
+constexpr std::array kSimd128ParamRegisters = {v8,  v9,  v10, v11,
+                                               v12, v13, v14, v15};
+constexpr std::array kSimd128ReturnRegisters = {v8};
 
 #else
 // ===========================================================================
@@ -111,40 +137,84 @@ constexpr Register kGpParamRegisters[] = {};
 constexpr Register kGpReturnRegisters[] = {};
 constexpr DoubleRegister kFpParamRegisters[] = {};
 constexpr DoubleRegister kFpReturnRegisters[] = {};
+constexpr std::array<Simd128Register, 0> kSimd128ParamRegisters{};
+constexpr std::array<Simd128Register, 0> kSimd128ReturnRegisters{};
 
 #endif
 
-// The parameter index where the instance parameter should be placed in wasm
+#if V8_TARGET_ARCH_PPC64
+// Platforms where a Floating Point value is represented in Double Precision
+// format in a FP register.
+constexpr bool kIsFpAlwaysDouble = true;
+#else
+constexpr bool kIsFpAlwaysDouble = false;
+#endif
+#if V8_TARGET_BIG_ENDIAN
+constexpr bool kIsBigEndian = true;
+#else
+constexpr bool kIsBigEndian = false;
+#endif
+#if V8_TARGET_ARCH_S390X_LE_SIM
+constexpr bool kIsBigEndianOnSim = true;
+#else
+constexpr bool kIsBigEndianOnSim = false;
+#endif
+// Platforms where single-precision floats are stored NaN-boxed in FP registers
+// (upper 32 bits all ones). On these, the generic JS-to-wasm wrapper must write
+// f32 parameters in NaN-boxed 64-bit form, because the assembly wrapper reloads
+// them with a 64-bit FP load.
+#if V8_TARGET_ARCH_RISCV64
+constexpr bool kFP32NeedNanBox = true;
+#else
+constexpr bool kFP32NeedNanBox = false;
+#endif
+
+// The parameter index where the trusted instance data should be placed in wasm
 // call descriptors. This is used by the Int64Lowering::LowerNode method.
-constexpr int kWasmInstanceParameterIndex = 0;
+constexpr int kWasmInstanceDataParameterIndex = 0;
+static_assert(kWasmImplicitArgRegister ==
+              kGpParamRegisters[kWasmInstanceDataParameterIndex]);
 
 class LinkageAllocator {
  public:
-  template <size_t kNumGpRegs, size_t kNumFpRegs>
-  constexpr LinkageAllocator(const Register (&gp)[kNumGpRegs],
-                             const DoubleRegister (&fp)[kNumFpRegs])
-      : LinkageAllocator(gp, kNumGpRegs, fp, kNumFpRegs) {}
-
   constexpr LinkageAllocator(const Register* gp, int gpc,
-                             const DoubleRegister* fp, int fpc)
-      : gp_count_(gpc), gp_regs_(gp), fp_count_(fpc), fp_regs_(fp) {}
+                             const DoubleRegister* fp, int fpc,
+                             const Simd128Register* simd128, int simd128c)
+      : gp_count_(gpc),
+        gp_regs_(gp),
+        fp_count_(fpc),
+        fp_regs_(fp),
+        simd128_count_(simd128c),
+        simd128_regs_(simd128) {}
 
   bool CanAllocateGP() const { return gp_offset_ < gp_count_; }
   bool CanAllocateFP(MachineRepresentation rep) const {
 #if V8_TARGET_ARCH_ARM
     switch (rep) {
-      case MachineRepresentation::kFloat32:
-        return fp_offset_ < fp_count_ && fp_regs_[fp_offset_].code() < 16;
-      case MachineRepresentation::kFloat64:
-        return extra_double_reg_ >= 0 || fp_offset_ < fp_count_;
-      case MachineRepresentation::kSimd128:
-        return ((fp_offset_ + 1) & ~1) + 1 < fp_count_;
+      case MachineRepresentation::kFloat32: {
+        // Get the next D-register (Liftoff only uses the even S-registers).
+        int next = fp_allocator_.NextSlot(2) / 2;
+        // Only the lower 16 D-registers alias S-registers.
+        return next < fp_count_ && fp_regs_[next].code() < 16;
+      }
+      case MachineRepresentation::kFloat64: {
+        int next = fp_allocator_.NextSlot(2) / 2;
+        return next < fp_count_;
+      }
+      case MachineRepresentation::kSimd128: {
+        int next = fp_allocator_.NextSlot(4) / 2;
+        return next < fp_count_ - 1;  // 2 D-registers are required.
+      }
       default:
         UNREACHABLE();
         return false;
     }
-#endif
+#else
     return fp_offset_ < fp_count_;
+#endif
+  }
+  bool CanAllocateSimd128(MachineRepresentation rep) const {
+    return simd128_offset_ < simd128_count_;
   }
 
   int NextGpReg() {
@@ -153,80 +223,65 @@ class LinkageAllocator {
   }
 
   int NextFpReg(MachineRepresentation rep) {
+    DCHECK(CanAllocateFP(rep));
 #if V8_TARGET_ARCH_ARM
     switch (rep) {
       case MachineRepresentation::kFloat32: {
-        // Liftoff uses only even-numbered f32 registers, and encodes them using
-        // the code of the corresponding f64 register. This limits the calling
-        // interface to only using the even-numbered f32 registers.
+        // Liftoff uses only even-numbered S-registers, and encodes them using
+        // the code of the corresponding D-register. This limits the calling
+        // interface to only using the even-numbered S-registers.
         int d_reg_code = NextFpReg(MachineRepresentation::kFloat64);
-        DCHECK_GT(16, d_reg_code);  // D-registers 16 - 31 can't split.
+        DCHECK_GT(16, d_reg_code);  // D16 - D31 don't alias S-registers.
         return d_reg_code * 2;
       }
       case MachineRepresentation::kFloat64: {
-        // Use the extra D-register if there is one.
-        if (extra_double_reg_ >= 0) {
-          int reg_code = extra_double_reg_;
-          extra_double_reg_ = -1;
-          return reg_code;
-        }
-        DCHECK_LT(fp_offset_, fp_count_);
-        return fp_regs_[fp_offset_++].code();
+        int next = fp_allocator_.Allocate(2) / 2;
+        return fp_regs_[next].code();
       }
       case MachineRepresentation::kSimd128: {
-        // Q-register must be an even-odd pair, so we must try to allocate at
-        // the end, not using extra_double_reg_. If we are at an odd D-register,
-        // skip past it (saving it to extra_double_reg_).
-        DCHECK_LT(((fp_offset_ + 1) & ~1) + 1, fp_count_);
-        int d_reg1_code = fp_regs_[fp_offset_++].code();
-        if (d_reg1_code % 2 != 0) {
-          // If we're misaligned then extra_double_reg_ must have been consumed.
-          DCHECK_EQ(-1, extra_double_reg_);
-          int odd_double_reg = d_reg1_code;
-          d_reg1_code = fp_regs_[fp_offset_++].code();
-          extra_double_reg_ = odd_double_reg;
-        }
-        // Combine the current D-register with the next to form a Q-register.
-        int d_reg2_code = fp_regs_[fp_offset_++].code();
-        DCHECK_EQ(0, d_reg1_code % 2);
-        DCHECK_EQ(d_reg1_code + 1, d_reg2_code);
-        USE(d_reg2_code);
-        return d_reg1_code / 2;
+        int next = fp_allocator_.Allocate(4) / 2;
+        int d_reg_code = fp_regs_[next].code();
+        // Check that result and the next D-register pair.
+        DCHECK_EQ(0, d_reg_code % 2);
+        DCHECK_EQ(d_reg_code + 1, fp_regs_[next + 1].code());
+        return d_reg_code / 2;
       }
       default:
         UNREACHABLE();
     }
 #else
-    DCHECK_LT(fp_offset_, fp_count_);
     return fp_regs_[fp_offset_++].code();
 #endif
   }
 
-  // Stackslots are counted upwards starting from 0 (or the offset set by
-  // {SetStackOffset}.
-  int NumStackSlots(MachineRepresentation type) {
-    return std::max(1, ElementSizeInBytes(type) / kSystemPointerSize);
+  bool HasSimd128Regs() const { return simd128_count_ > 0; }
+
+  int NextSimd128Reg() {
+    DCHECK_LT(simd128_offset_, simd128_count_);
+    return simd128_regs_[simd128_offset_++].code();
   }
 
   // Stackslots are counted upwards starting from 0 (or the offset set by
-  // {SetStackOffset}. If {type} needs more than
-  // one stack slot, the lowest used stack slot is returned.
+  // {SetStackOffset}. If {type} needs more than one stack slot, the lowest
+  // used stack slot is returned.
   int NextStackSlot(MachineRepresentation type) {
-    int num_stack_slots = NumStackSlots(type);
-    int offset = stack_offset_;
-    stack_offset_ += num_stack_slots;
-    return offset;
+    int num_slots =
+        AlignedSlotAllocator::NumSlotsForWidth(ElementSizeInBytes(type));
+    int slot = slot_allocator_.Allocate(num_slots);
+    return slot;
   }
 
   // Set an offset for the stack slots returned by {NextStackSlot} and
   // {NumStackSlots}. Can only be called before any call to {NextStackSlot}.
-  void SetStackOffset(int num) {
-    DCHECK_LE(0, num);
-    DCHECK_EQ(0, stack_offset_);
-    stack_offset_ = num;
+  void SetStackOffset(int offset) {
+    DCHECK_LE(0, offset);
+    DCHECK_EQ(0, slot_allocator_.Size());
+    slot_allocator_.AllocateUnaligned(offset);
   }
 
-  int NumStackSlots() const { return stack_offset_; }
+  int NumStackSlots() const { return slot_allocator_.Size(); }
+
+  void EndSlotArea() { slot_allocator_.AllocateUnaligned(0); }
 
  private:
   const int gp_count_;
@@ -234,18 +289,65 @@ class LinkageAllocator {
   const Register* const gp_regs_;
 
   const int fp_count_;
+#if V8_TARGET_ARCH_ARM
+  // Use an aligned slot allocator to model ARM FP register aliasing. The slots
+  // are 32 bits, so 2 slots are required for a D-register, 4 for a Q-register.
+  AlignedSlotAllocator fp_allocator_;
+#else
   int fp_offset_ = 0;
+#endif
   const DoubleRegister* const fp_regs_;
 
-#if V8_TARGET_ARCH_ARM
-  // Track fragments of registers below fp_offset_ here. There can only be one
-  // extra double register.
-  int extra_double_reg_ = -1;
-#endif
+  const int simd128_count_;
+  int simd128_offset_ = 0;
+  const Simd128Register* const simd128_regs_;
 
-  int stack_offset_ = 0;
+  AlignedSlotAllocator slot_allocator_;
 };
 
+// Helper for allocating either a GP, FP or Simd128 reg, or the next stack slot.
+class LinkageLocationAllocator {
+ public:
+  template <size_t kNumGpRegs, size_t kNumFpRegs, size_t kNumSimd128Regs>
+  constexpr LinkageLocationAllocator(
+      const Register (&gp)[kNumGpRegs], const DoubleRegister (&fp)[kNumFpRegs],
+      const std::array<Simd128Register, kNumSimd128Regs>& simd128,
+      int slot_offset)
+      : allocator_(LinkageAllocator(gp, kNumGpRegs, fp, kNumFpRegs,
+                                    simd128.data(), kNumSimd128Regs)),
+        slot_offset_(slot_offset) {}
+
+  LinkageLocation Next(MachineRepresentation rep) {
+    MachineType type = MachineType::TypeForRepresentation(rep);
+    if (IsSimd128(rep) && allocator_.HasSimd128Regs()) {
+      if (allocator_.CanAllocateSimd128(rep)) {
+        int reg_code = allocator_.NextSimd128Reg();
+        return LinkageLocation::ForRegister(reg_code, type);
+      }
+    } else if (IsFloatingPoint(rep)) {
+      if (allocator_.CanAllocateFP(rep)) {
+        int reg_code = allocator_.NextFpReg(rep);
+        return LinkageLocation::ForRegister(reg_code, type);
+      }
+    } else if (allocator_.CanAllocateGP()) {
+      int reg_code = allocator_.NextGpReg();
+      return LinkageLocation::ForRegister(reg_code, type);
+    }
+    // Cannot use register; use stack slot.
+    int index = -1 - (slot_offset_ + allocator_.NextStackSlot(rep));
+    return LinkageLocation::ForCallerFrameSlot(index, type);
+  }
+
+  int NumStackSlots() const { return allocator_.NumStackSlots(); }
+  void EndSlotArea() { allocator_.EndSlotArea(); }
+
+ private:
+  LinkageAllocator allocator_;
+  // Since params and returns are in different stack frames, we must allocate
+  // them separately. Parameter slots don't need an offset, but return slots
+  // must be offset to just before the param slots, using this |slot_offset_|.
+  int slot_offset_;
+};
 }  // namespace wasm
 }  // namespace internal
 }  // namespace v8

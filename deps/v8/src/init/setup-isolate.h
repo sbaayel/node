@@ -11,13 +11,12 @@ namespace v8 {
 namespace internal {
 
 class Builtins;
+enum class Builtin : int32_t;
+template <typename T>
+class Tagged;
 class Code;
 class Heap;
 class Isolate;
-
-namespace interpreter {
-class Interpreter;
-}  // namespace interpreter
 
 // This class is an abstraction layer around initialization of components
 // that are either deserialized from the snapshot or generated from scratch.
@@ -34,23 +33,21 @@ class Interpreter;
 // linked in by the latter two Delegate implementations.
 class V8_EXPORT_PRIVATE SetupIsolateDelegate {
  public:
-  explicit SetupIsolateDelegate(bool create_heap_objects)
-      : create_heap_objects_(create_heap_objects) {}
+  SetupIsolateDelegate() = default;
   virtual ~SetupIsolateDelegate() = default;
 
-  virtual void SetupBuiltins(Isolate* isolate);
-
-  virtual bool SetupHeap(Heap* heap);
+  virtual bool SetupHeap(Isolate* isolate, bool create_heap_objects);
+  virtual void SetupBuiltins(Isolate* isolate, bool compile_builtins);
 
  protected:
-  static void SetupBuiltinsInternal(Isolate* isolate);
-  static void AddBuiltin(Builtins* builtins, int index, Code code);
+  static void SetupBuiltinsInternal(Isolate* isolate,
+                                    bool compute_builtins_effects);
+  static void AddBuiltin(Builtins* builtins, Builtin builtin,
+                         Tagged<Code> code);
   static void PopulateWithPlaceholders(Isolate* isolate);
   static void ReplacePlaceholders(Isolate* isolate);
 
-  static bool SetupHeapInternal(Heap* heap);
-
-  const bool create_heap_objects_;
+  static bool SetupHeapInternal(Isolate* isolate);
 };
 
 }  // namespace internal

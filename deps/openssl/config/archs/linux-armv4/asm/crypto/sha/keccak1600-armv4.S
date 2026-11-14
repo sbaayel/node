@@ -1,6 +1,4 @@
-#include "arm_arch.h"
-
-.text
+#include "arch/arm_arch.h"
 
 #if defined(__thumb2__)
 .syntax	unified
@@ -8,6 +6,8 @@
 #else
 .code	32
 #endif
+
+.text
 
 .type	iotas32, %object
 .align	5
@@ -1825,7 +1825,14 @@ KeccakF1600_enter:
 #endif
 	blo	.Lround2x
 
+#if __ARM_ARCH__>=5
 	ldr	pc,[sp,#440]
+#else
+	ldr	lr,[sp,#440]
+	tst	lr,#1
+	moveq	pc,lr		@ be binary compatible with V4, yet
+.word	0xe12fff1e		@ interoperable with Thumb ISA:-)
+#endif
 .size	KeccakF1600_int,.-KeccakF1600_int
 
 .type	KeccakF1600, %function
@@ -1864,7 +1871,14 @@ KeccakF1600:
 	stmia	r11, {r0,r1,r2,r3,r4,r5,r6,r7,r8,r9}
 
 	add	sp,sp,#440+20
+#if __ARM_ARCH__>=5
 	ldmia	sp!,{r4,r5,r6,r7,r8,r9,r10,r11,pc}
+#else
+	ldmia	sp!,{r4,r5,r6,r7,r8,r9,r10,r11,lr}
+	tst	lr,#1
+	moveq	pc,lr		@ be binary compatible with V4, yet
+.word	0xe12fff1e		@ interoperable with Thumb ISA:-)
+#endif
 .size	KeccakF1600,.-KeccakF1600
 .globl	SHA3_absorb
 .type	SHA3_absorb,%function
@@ -2010,7 +2024,14 @@ SHA3_absorb:
 .Labsorb_abort:
 	add	sp,sp,#456+32
 	mov	r0,r12			@ return value
+#if __ARM_ARCH__>=5
 	ldmia	sp!,{r4,r5,r6,r7,r8,r9,r10,r11,r12,pc}
+#else
+	ldmia	sp!,{r4,r5,r6,r7,r8,r9,r10,r11,r12,lr}
+	tst	lr,#1
+	moveq	pc,lr		@ be binary compatible with V4, yet
+.word	0xe12fff1e		@ interoperable with Thumb ISA:-)
+#endif
 .size	SHA3_absorb,.-SHA3_absorb
 .globl	SHA3_squeeze
 .type	SHA3_squeeze,%function
@@ -2022,6 +2043,7 @@ SHA3_squeeze:
 	mov	r4,r1
 	mov	r5,r2
 	mov	r12,r3
+	ldr	r0, [sp, #40]  @ next is after the 10 pushed registers (10*4)
 
 #ifdef	__thumb2__
 	mov	r9,#0x00ff00ff
@@ -2043,6 +2065,8 @@ SHA3_squeeze:
 	stmdb	sp!,{r6,r7,r8,r9}
 
 	mov	r14,r10
+	cmp	r0, #1
+	beq	.Lnext_block
 	b	.Loop_squeeze
 
 .align	4
@@ -2114,7 +2138,7 @@ SHA3_squeeze:
 
 	subs	r12,r12,#8		@ bsz -= 8
 	bhi	.Loop_squeeze
-
+.Lnext_block:
 	mov	r0,r14			@ original r10
 
 	bl	KeccakF1600
@@ -2155,7 +2179,14 @@ SHA3_squeeze:
 .align	4
 .Lsqueeze_done:
 	add	sp,sp,#24
+#if __ARM_ARCH__>=5
 	ldmia	sp!,{r4,r5,r6,r7,r8,r9,r10,pc}
+#else
+	ldmia	sp!,{r4,r5,r6,r7,r8,r9,r10,lr}
+	tst	lr,#1
+	moveq	pc,lr		@ be binary compatible with V4, yet
+.word	0xe12fff1e		@ interoperable with Thumb ISA:-)
+#endif
 .size	SHA3_squeeze,.-SHA3_squeeze
 #if __ARM_MAX_ARCH__>=7
 .fpu	neon
@@ -2361,7 +2392,7 @@ KeccakF1600_neon:
 	subs	r3, r3, #1
 	bne	.Loop_neon
 
-.word	0xe12fff1e
+	bx	lr
 .size	KeccakF1600_neon,.-KeccakF1600_neon
 
 .globl	SHA3_absorb_neon
@@ -2660,6 +2691,6 @@ SHA3_squeeze_neon:
 	ldmia	sp!, {r4,r5,r6,pc}
 .size	SHA3_squeeze_neon,.-SHA3_squeeze_neon
 #endif
-.byte	75,101,99,99,97,107,45,49,54,48,48,32,97,98,115,111,114,98,32,97,110,100,32,115,113,117,101,101,122,101,32,102,111,114,32,65,82,77,118,52,47,78,69,79,78,44,32,67,82,89,80,84,79,71,65,77,83,32,98,121,32,60,97,112,112,114,111,64,111,112,101,110,115,115,108,46,111,114,103,62,0
+.byte	75,101,99,99,97,107,45,49,54,48,48,32,97,98,115,111,114,98,32,97,110,100,32,115,113,117,101,101,122,101,32,102,111,114,32,65,82,77,118,52,47,78,69,79,78,44,32,67,82,89,80,84,79,71,65,77,83,32,98,121,32,60,104,116,116,112,115,58,47,47,103,105,116,104,117,98,46,99,111,109,47,100,111,116,45,97,115,109,62,0
 .align	2
 .align	2

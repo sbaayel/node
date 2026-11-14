@@ -22,7 +22,6 @@
 #ifndef RUNNER_H_
 #define RUNNER_H_
 
-#include <limits.h> /* PATH_MAX */
 #include <stdio.h> /* FILE */
 
 
@@ -57,7 +56,7 @@ typedef struct {
   task_entry_t TASKS[] = {
 
 #define TASK_LIST_END                               \
-    { 0, 0, 0, 0, 0, 0 }                               \
+    { 0, 0, 0, 0, 0, 0 }                            \
   };
 
 #define TEST_DECLARE(name)                          \
@@ -68,6 +67,23 @@ typedef struct {
 
 #define TEST_ENTRY_CUSTOM(name, is_helper, show_output, timeout) \
     { #name, #name, &run_test_##name, is_helper, show_output, timeout },
+
+/*
+ * Macros for fs tests that, on linux, generate both normal and io_uring
+ * versions.
+ */
+#ifdef __linux__
+#define TEST_FS_DECLARE(name)                       \
+  TEST_DECLARE(name)                                \
+  TEST_DECLARE(name##_iouring)
+
+#define TEST_FS_ENTRY(name)                         \
+  TEST_ENTRY(name)                                  \
+  TEST_ENTRY(name##_iouring)
+#else
+#define TEST_FS_DECLARE(name) TEST_DECLARE(name)
+#define TEST_FS_ENTRY(name) TEST_ENTRY(name)
+#endif
 
 #define BENCHMARK_DECLARE(name)                     \
   int run_benchmark_##name(void);
@@ -84,11 +100,7 @@ typedef struct {
 #define TEST_HELPER       HELPER_ENTRY
 #define BENCHMARK_HELPER  HELPER_ENTRY
 
-#ifdef PATH_MAX
-extern char executable_path[PATH_MAX];
-#else
 extern char executable_path[4096];
-#endif
 
 /*
  * Include platform-dependent definitions
@@ -127,7 +139,7 @@ int run_test_part(const char* test, const char* part);
 void print_tests(FILE* stream);
 
 /* Print lines in |buffer| as TAP diagnostics to |stream|. */
-void print_lines(const char* buffer, size_t size, FILE* stream);
+int print_lines(const char* buffer, size_t size, FILE* stream, int partial);
 
 /*
  * Stuff that should be implemented by test-runner-<platform>.h
@@ -136,7 +148,7 @@ void print_lines(const char* buffer, size_t size, FILE* stream);
  */
 
 /* Do platform-specific initialization. */
-int platform_init(int argc, char** argv);
+void platform_init(int argc, char** argv);
 
 /* Invoke "argv[0] test-name [test-part]". Store process info in *p. Make sure
  * that all stdio output of the processes is buffered up. */

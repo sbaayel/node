@@ -29,18 +29,29 @@ const fs = require('fs');
 const path = require('path');
 
 const tmpdir = require('../common/tmpdir');
+const { isMainThread } = require('worker_threads');
 
-if (!common.isMainThread)
+if (!isMainThread) {
   common.skip('process.chdir is not available in Workers');
+}
 
 const expectFilePath = common.isWindows ||
                        common.isLinux ||
-                       common.isOSX ||
+                       common.isMacOS ||
                        common.isAIX;
 
 const testDir = tmpdir.path;
 
 tmpdir.refresh();
+
+// Because macOS (and possibly other operating systems) can return a watcher
+// before it is actually watching, we need to repeat the operation to avoid
+// a race condition.
+function repeat(fn) {
+  setImmediate(fn);
+  const interval = setInterval(fn, 5000);
+  return interval;
+}
 
 {
   const filepath = path.join(testDir, 'watch.txt');
@@ -54,12 +65,11 @@ tmpdir.refresh();
     if (expectFilePath) {
       assert.strictEqual(filename, 'watch.txt');
     }
+    clearInterval(interval);
     watcher.close();
   }));
 
-  setImmediate(function() {
-    fs.writeFileSync(filepath, 'world');
-  });
+  const interval = repeat(() => { fs.writeFileSync(filepath, 'world'); });
 }
 
 {
@@ -76,35 +86,45 @@ tmpdir.refresh();
       if (expectFilePath) {
         assert.strictEqual(filename, 'hasOwnProperty');
       }
+      clearInterval(interval);
       watcher.close();
     }));
 
-  setImmediate(function() {
-    fs.writeFileSync(filepathAbs, 'pardner');
-  });
+  const interval = repeat(() => { fs.writeFileSync(filepathAbs, 'pardner'); });
 }
 
 {
   const testsubdir = fs.mkdtempSync(testDir + path.sep);
   const filepath = path.join(testsubdir, 'newfile.txt');
 
-  const watcher =
-    fs.watch(testsubdir, common.mustCall(function(event, filename) {
-      const renameEv = common.isSunOS || common.isAIX ? 'change' : 'rename';
-      assert.strictEqual(event, renameEv);
-      if (expectFilePath) {
-        assert.strictEqual(filename, 'newfile.txt');
-      } else {
-        assert.strictEqual(filename, null);
-      }
-      watcher.close();
-    }));
+  function doWatch() {
+    const watcher =
+      fs.watch(testsubdir, common.mustCall(function(event, filename) {
+        const renameEv = common.isSunOS || common.isAIX ? 'change' : 'rename';
+        assert.strictEqual(event, renameEv);
+        if (expectFilePath) {
+          assert.strictEqual(filename, 'newfile.txt');
+        } else {
+          assert.strictEqual(filename, null);
+        }
+        clearInterval(interval);
+        watcher.close();
+      }));
 
-  setImmediate(function() {
-    const fd = fs.openSync(filepath, 'w');
-    fs.closeSync(fd);
-  });
+    const interval = repeat(() => {
+      fs.rmSync(filepath, { force: true });
+      const fd = fs.openSync(filepath, 'w');
+      fs.closeSync(fd);
+    });
+  }
 
+  if (common.isMacOS) {
+    // On macOS delay watcher start to avoid leaking previous events.
+    // Refs: https://github.com/libuv/libuv/pull/4503
+    setTimeout(doWatch, common.platformTimeout(100));
+  } else {
+    doWatch();
+  }
 }
 
 // https://github.com/joyent/node/issues/2293 - non-persistent watcher should
@@ -116,15 +136,45 @@ tmpdir.refresh();
 // Whitebox test to ensure that wrapped FSEvent is safe
 // https://github.com/joyent/node/issues/6690
 {
-  let oldhandle;
-  common.expectsInternalAssertion(
-    () => {
-      const w = fs.watch(__filename, common.mustNotCall());
-      oldhandle = w._handle;
-      w._handle = { close: w._handle.close };
-      w.close();
-    },
-    'handle must be a FSEvent'
-  );
-  oldhandle.close(); // clean up
+  if (common.isMacOS || common.isWindows) {
+    let oldhandle;
+    assert.throws(
+      () => {
+        const w = fs.watch(__filename, common.mustNotCall());
+        oldhandle = w._handle;
+        w._handle = { close: w._handle.close };
+        w.close();
+      },
+      {
+        name: 'Error',
+        code: 'ERR_INTERNAL_ASSERTION',
+        message: /^handle must be a FSEvent/,
+      }
+    );
+    oldhandle.close(); // clean up
+  }
+}
+
+{
+  if (common.isMacOS || common.isWindows) {
+    let oldhandle;
+    assert.throws(
+      () => {
+        const w = fs.watch(__filename, common.mustNotCall());
+        oldhandle = w._handle;
+        const protoSymbols =
+          Object.getOwnPropertySymbols(Object.getPrototypeOf(w));
+        const kFSWatchStart =
+          protoSymbols.find((val) => val.toString() === 'Symbol(kFSWatchStart)');
+        w._handle = {};
+        w[kFSWatchStart]();
+      },
+      {
+        name: 'Error',
+        code: 'ERR_INTERNAL_ASSERTION',
+        message: /^handle must be a FSEvent/,
+      }
+    );
+    oldhandle.close(); // clean up
+  }
 }

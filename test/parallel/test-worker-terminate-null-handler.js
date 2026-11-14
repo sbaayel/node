@@ -11,17 +11,10 @@ const { parentPort } = require('worker_threads');
 parentPort.postMessage({ hello: 'world' });
 `, { eval: true });
 
-process.once('beforeExit', common.mustCall(() => {
-  console.log('beforeExit');
-  worker.ref();
-}));
+process.once('beforeExit', common.mustCall(() => worker.ref()));
 
 worker.on('exit', common.mustCall(() => {
-  console.log('exit');
-  worker.terminate().then((res) => assert.strictEqual(res, undefined));
-  worker.terminate(() => null).then(
-    (res) => assert.strictEqual(res, undefined)
-  );
+  worker.terminate().then((res) => assert.strictEqual(res, undefined)).then(common.mustCall());
 }));
 
 worker.unref();

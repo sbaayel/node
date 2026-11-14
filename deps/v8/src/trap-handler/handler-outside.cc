@@ -15,7 +15,8 @@
 // 2. Any changes must be reviewed by someone from the crash reporting
 //    or security team. See OWNERS for suggested reviewers.
 //
-// For more information, see https://goo.gl/yMeyUY.
+// For more information, see:
+// https://docs.google.com/document/d/17y4kxuHFrVxAiuCP_FFtFA2HP5sNPsCD10KEx17Hz6M
 //
 // For the code that runs in the trap handler itself, see handler-inside.cc.
 
@@ -38,18 +39,16 @@ constexpr bool kEnableSlowChecks = true;
 #else
 constexpr bool kEnableSlowChecks = false;
 #endif
-}
+}  // namespace
 
-namespace v8 {
-namespace internal {
-namespace trap_handler {
+namespace v8::internal::trap_handler {
 
 constexpr size_t kInitialCodeObjectSize = 1024;
 constexpr size_t kCodeObjectGrowthFactor = 2;
 
-constexpr size_t HandlerDataSize(size_t num_protected_instructions) {
+constexpr size_t HandlerDataSize(size_t num_trapping_instructions) {
   return offsetof(CodeProtectionInfo, instructions) +
-         num_protected_instructions * sizeof(ProtectedInstructionData);
+         num_trapping_instructions * sizeof(TrappingInstructionData);
 }
 
 namespace {
@@ -66,7 +65,7 @@ bool IsDisjoint(const CodeProtectionInfo* a, const CodeProtectionInfo* b) {
 // registered.
 void VerifyCodeRangeIsDisjoint(const CodeProtectionInfo* code_info) {
   for (size_t i = 0; i < gNumCodeObjects; ++i) {
-    DCHECK(IsDisjoint(code_info, gCodeObjects[i].code_info));
+    TH_DCHECK(IsDisjoint(code_info, gCodeObjects[i].code_info));
   }
 }
 
@@ -77,25 +76,22 @@ void ValidateCodeObjects() {
 
     if (data == nullptr) continue;
 
-    // Do some sanity checks on the protected instruction data
-    for (unsigned i = 0; i < data->num_protected_instructions; ++i) {
-      DCHECK_GE(data->instructions[i].instr_offset, 0);
-      DCHECK_LT(data->instructions[i].instr_offset, data->size);
-      DCHECK_GE(data->instructions[i].landing_offset, 0);
-      DCHECK_LT(data->instructions[i].landing_offset, data->size);
-      DCHECK_GT(data->instructions[i].landing_offset,
-                data->instructions[i].instr_offset);
+    // Do some sanity checks on the trapping instruction data
+    for (unsigned j = 0; j < data->num_trapping_instructions; ++j) {
+      TH_DCHECK(data->instructions[j].instr_offset >= 0);
+      TH_DCHECK(data->instructions[j].instr_offset < data->size);
     }
   }
 
   // Check the validity of the free list.
+#ifdef DEBUG
   size_t free_count = 0;
   for (size_t i = gNextCodeObject; i != gNumCodeObjects;
        i = gCodeObjects[i].next_free) {
-    DCHECK_LT(i, gNumCodeObjects);
+    TH_DCHECK(i < gNumCodeObjects);
     ++free_count;
     // This check will fail if we encounter a cycle.
-    DCHECK_LE(free_count, gNumCodeObjects);
+    TH_DCHECK(free_count <= gNumCodeObjects);
   }
 
   // Check that all free entries are reachable via the free list.
@@ -105,14 +101,15 @@ void ValidateCodeObjects() {
       ++free_count2;
     }
   }
-  DCHECK_EQ(free_count, free_count2);
+  TH_DCHECK(free_count == free_count2);
+#endif
 }
 }  // namespace
 
 CodeProtectionInfo* CreateHandlerData(
-    Address base, size_t size, size_t num_protected_instructions,
-    const ProtectedInstructionData* protected_instructions) {
-  const size_t alloc_size = HandlerDataSize(num_protected_instructions);
+    uintptr_t base, size_t size, size_t num_trapping_instructions,
+    const TrappingInstructionData* trapping_instructions) {
+  const size_t alloc_size = HandlerDataSize(num_trapping_instructions);
   CodeProtectionInfo* data =
       reinterpret_cast<CodeProtectionInfo*>(malloc(alloc_size));
 
@@ -122,25 +119,27 @@ CodeProtectionInfo* CreateHandlerData(
 
   data->base = base;
   data->size = size;
-  data->num_protected_instructions = num_protected_instructions;
+  data->num_trapping_instructions = num_trapping_instructions;
 
-  memcpy(data->instructions, protected_instructions,
-         num_protected_instructions * sizeof(ProtectedInstructionData));
+  if (num_trapping_instructions > 0) {
+    memcpy(data->instructions, trapping_instructions,
+           num_trapping_instructions * sizeof(TrappingInstructionData));
+  }
 
   return data;
 }
 
-int RegisterHandlerData(
-    Address base, size_t size, size_t num_protected_instructions,
-    const ProtectedInstructionData* protected_instructions) {
-
+int RegisterHandlerData(uintptr_t base, size_t size,
+                        size_t num_trapping_instructions,
+                        const TrappingInstructionData* trapping_instructions) {
   CodeProtectionInfo* data = CreateHandlerData(
-      base, size, num_protected_instructions, protected_instructions);
+      base, size, num_trapping_instructions, trapping_instructions);
 
   if (data == nullptr) {
     abort();
   }
 
+  TrapHandlerGuard active_guard;
   MetadataLock lock;
 
   if (kEnableSlowChecks) {
@@ -188,7 +187,7 @@ int RegisterHandlerData(
     gNumCodeObjects = new_size;
   }
 
-  DCHECK(gCodeObjects[i].code_info == nullptr);
+  TH_DCHECK(gCodeObjects[i].code_info == nullptr);
 
   // Find out where the next entry should go.
   gNextCodeObject = gCodeObjects[i].next_free;
@@ -211,11 +210,12 @@ void ReleaseHandlerData(int index) {
   if (index == kInvalidIndex) {
     return;
   }
-  DCHECK_GE(index, 0);
+  TH_DCHECK(index >= 0);
 
   // Remove the data from the global list if it's there.
   CodeProtectionInfo* data = nullptr;
   {
+    TrapHandlerGuard active_guard;
     MetadataLock lock;
 
     data = gCodeObjects[index].code_info;
@@ -230,11 +230,121 @@ void ReleaseHandlerData(int index) {
   }
   // TODO(eholk): on debug builds, ensure there are no more copies in
   // the list.
-  DCHECK_NOT_NULL(data);  // make sure we're releasing legitimate handler data.
+  TH_DCHECK(data);  // make sure we're releasing legitimate handler data.
   free(data);
 }
 
-int* GetThreadInWasmThreadLocalAddress() { return &g_thread_in_wasm_code; }
+bool RegisterV8Sandbox(uintptr_t base, size_t size) {
+  TrapHandlerGuard active_guard;
+  SandboxRecordsLock lock;
+
+#ifdef DEBUG
+  for (SandboxRecord* current = gSandboxRecordsHead; current != nullptr;
+       current = current->next) {
+    TH_DCHECK(current->base != base);
+  }
+#endif
+
+  SandboxRecord* new_record =
+      reinterpret_cast<SandboxRecord*>(malloc(sizeof(SandboxRecord)));
+  if (new_record == nullptr) {
+    return false;
+  }
+
+  new_record->base = base;
+  new_record->size = size;
+  new_record->next = gSandboxRecordsHead;
+  gSandboxRecordsHead = new_record;
+  return true;
+}
+
+void UnregisterV8Sandbox(uintptr_t base, size_t size) {
+  TrapHandlerGuard active_guard;
+  SandboxRecordsLock lock;
+
+  SandboxRecord* current = gSandboxRecordsHead;
+  SandboxRecord* previous = nullptr;
+  while (current != nullptr) {
+    if (current->base == base) {
+      break;
+    }
+    previous = current;
+    current = current->next;
+  }
+
+  TH_CHECK(current != nullptr);
+  TH_CHECK(current->size == size);
+  if (previous) {
+    previous->next = current->next;
+  } else {
+    gSandboxRecordsHead = current->next;
+  }
+  free(current);
+}
+
+bool RegisterCoveredMemory(uintptr_t base, size_t reserved_size) {
+  TrapHandlerGuard active_guard;
+
+  TH_CHECK(base + reserved_size > base);
+
+  // First validity check: the memory must be within the sandbox (if enabled).
+  {
+    SandboxRecordsLock sandbox_lock;
+    if (gSandboxRecordsHead != nullptr) {
+      bool within_sandbox = false;
+      for (const SandboxRecord* s = gSandboxRecordsHead;
+           s != nullptr && !within_sandbox; s = s->next) {
+        within_sandbox =
+            base >= s->base && base + reserved_size <= s->base + s->size;
+      }
+      TH_CHECK(within_sandbox);
+    }
+  }
+
+  CoveredMemoryRecordsLock lock;
+
+  // Second validity check: the memory must not overlap with any existing
+  // memory.
+  for (CoveredMemoryRecord* current = gCoveredMemoryRecordsHead;
+       current != nullptr; current = current->next) {
+    bool disjoint = (base >= current->base + current->size) ||
+                    (base + reserved_size <= current->base);
+    TH_CHECK(disjoint);
+  }
+
+  // Now allocate and register the new record.
+  CoveredMemoryRecord* new_record = reinterpret_cast<CoveredMemoryRecord*>(
+      malloc(sizeof(CoveredMemoryRecord)));
+  if (new_record == nullptr) return false;
+
+  new_record->base = base;
+  new_record->size = reserved_size;
+  new_record->next = gCoveredMemoryRecordsHead;
+  gCoveredMemoryRecordsHead = new_record;
+  return true;
+}
+
+void UnregisterCoveredMemory(uintptr_t base, size_t reserved_size) {
+  TrapHandlerGuard active_guard;
+  CoveredMemoryRecordsLock lock;
+
+  CoveredMemoryRecord* current = gCoveredMemoryRecordsHead;
+  CoveredMemoryRecord* previous = nullptr;
+  while (current != nullptr && current->base != base) {
+    previous = current;
+    current = current->next;
+  }
+
+  // The unregistered memory must match an existing record exactly.
+  TH_CHECK(current != nullptr);
+  TH_CHECK(current->size == reserved_size);
+  if (previous) {
+    previous->next = current->next;
+  } else {
+    gCoveredMemoryRecordsHead = current->next;
+  }
+  free(current);
+}
 
 size_t GetRecoveredTrapCount() {
   return gRecoveredTrapCount.load(std::memory_order_relaxed);
@@ -249,12 +359,28 @@ bool RegisterDefaultTrapHandler() { return false; }
 void RemoveTrapHandler() {}
 #endif
 
-bool g_is_trap_handler_enabled;
+bool g_is_trap_handler_enabled{false};
+std::atomic<bool> g_can_enable_trap_handler{true};
 
 bool EnableTrapHandler(bool use_v8_handler) {
+  // We should only enable the trap handler once, and before any call to
+  // {IsTrapHandlerEnabled}. Enabling the trap handler late can lead to problems
+  // because code or objects might have been generated under the assumption that
+  // trap handlers are disabled.
+  bool can_enable =
+      g_can_enable_trap_handler.exchange(false, std::memory_order_relaxed);
+  // EnableTrapHandler called twice, or after IsTrapHandlerEnabled.
+  TH_CHECK(can_enable);
   if (!V8_TRAP_HANDLER_SUPPORTED) {
     return false;
   }
+
+  // "Warm-up" the TrapHandlerGuard mechanism to ensure that if any
+  // initialization is required for its thread-local storage, it is done now
+  // and not inside the signal handler. We're being extra cautious here, it's
+  // unclear if this is really necessary.
+  TrapHandlerGuard active_guard;
+
   if (use_v8_handler) {
     g_is_trap_handler_enabled = RegisterDefaultTrapHandler();
     return g_is_trap_handler_enabled;
@@ -263,6 +389,6 @@ bool EnableTrapHandler(bool use_v8_handler) {
   return true;
 }
 
-}  // namespace trap_handler
-}  // namespace internal
-}  // namespace v8
+void SetLandingPad(uintptr_t landing_pad) { gLandingPad.store(landing_pad); }
+
+}  // namespace v8::internal::trap_handler

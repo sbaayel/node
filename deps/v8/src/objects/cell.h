@@ -6,7 +6,6 @@
 #define V8_OBJECTS_CELL_H_
 
 #include "src/objects/heap-object.h"
-#include "torque-generated/class-definitions-tq.h"
 
 // Has to be the last include (doesn't have include guards):
 #include "src/objects/object-macros.h"
@@ -14,18 +13,34 @@
 namespace v8 {
 namespace internal {
 
-class Cell : public TorqueGeneratedCell<Cell, HeapObject> {
+V8_OBJECT class Cell : public HeapObject {
  public:
-  static inline Cell FromValueAddress(Address value);
+  // [maybe_value]: field containing a possibly weak reference to an object.
+  inline Tagged<MaybeObject> maybe_value() const;
+  inline Tagged<MaybeObject> maybe_value(RelaxedLoadTag) const;
+  inline void set_maybe_value(
+      Tagged<MaybeObject> value,
+      WriteBarrierMode mode = WriteBarrierMode::UPDATE_WRITE_BARRIER);
 
-  inline Address ValueAddress() { return address() + kValueOffset; }
+  // These strong accessors are for the cases when a Cell is known to contain
+  // only Objects.
+  inline Tagged<Object> value() const;
+  inline Tagged<Object> value(RelaxedLoadTag) const;
+  inline void set_value(
+      Tagged<Object> value,
+      WriteBarrierMode mode = WriteBarrierMode::UPDATE_WRITE_BARRIER);
 
-  // Dispatched behavior.
   DECL_PRINTER(Cell)
+  DECL_VERIFIER(Cell)
 
-  using BodyDescriptor = FixedBodyDescriptor<kValueOffset, kSize, kSize>;
+ public:
+  TaggedMember<MaybeObject> maybe_value_;
+} V8_OBJECT_END;
 
-  TQ_OBJECT_CONSTRUCTORS(Cell)
+template <>
+struct ObjectTraits<Cell> {
+  using BodyDescriptor = FixedWeakBodyDescriptor<offsetof(Cell, maybe_value_),
+                                                 sizeof(Cell), sizeof(Cell)>;
 };
 
 }  // namespace internal

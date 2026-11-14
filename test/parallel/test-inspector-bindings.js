@@ -92,7 +92,7 @@ function testSampleDebugSession() {
   });
 
   debuggedFunction();
-  assert.deepStrictEqual(cbAsSecondArgCalled, true);
+  assert.strictEqual(cbAsSecondArgCalled, true);
   assert.deepStrictEqual(failures, []);
   assert.strictEqual(cur, 5);
   scopeCallback = null;
@@ -127,4 +127,4 @@ async function doTests() {
   await testNoCrashConsoleLogBeforeThrow();
 }
 
-doTests();
+doTests().then(common.mustCall());

@@ -4,21 +4,19 @@ const common = require('../common.js');
 
 const bench = common.createBenchmark(main, {
   type: ['ascii', 'mixed', 'emojiseq', 'fullwidth'],
-  n: [10e4]
+  n: [10e4],
 }, {
-  flags: ['--expose-internals']
+  flags: ['--expose-internals'],
 });
 
 function main({ n, type }) {
-  // Default value for testing purposes.
-  type = type || 'ascii';
   const { getStringWidth } = require('internal/util/inspect');
 
   const str = ({
     ascii: 'foobar'.repeat(100),
     mixed: 'foo'.repeat(100) + '😀' + 'bar'.repeat(100),
     emojiseq: '👨‍👨‍👧‍👦👨‍👩‍👦‍👦👨‍👩‍👧‍👧👩‍👩‍👧‍👦'.repeat(10),
-    fullwidth: '你好'.repeat(150)
+    fullwidth: '你好'.repeat(150),
   })[type];
 
   bench.start();

@@ -6,12 +6,16 @@
 #define V8_EXECUTION_MICROTASK_QUEUE_H_
 
 #include <stdint.h>
-#include <memory>
+
 #include <vector>
 
 #include "include/v8-internal.h"  // For Address.
-#include "include/v8.h"
+#include "include/v8-microtask-queue.h"
 #include "src/base/macros.h"
+
+namespace cppgc {
+class Visitor;
+}  // namespace cppgc
 
 namespace v8 {
 namespace internal {
@@ -20,17 +24,23 @@ class Isolate;
 class Microtask;
 class Object;
 class RootVisitor;
+template <typename T>
+class Tagged;
 
 class V8_EXPORT_PRIVATE MicrotaskQueue final : public v8::MicrotaskQueue {
  public:
   static void SetUpDefaultMicrotaskQueue(Isolate* isolate);
-  static std::unique_ptr<MicrotaskQueue> New(Isolate* isolate);
+  static MicrotaskQueue* New(Isolate* isolate);
 
-  ~MicrotaskQueue();
+  ~MicrotaskQueue() override;
+
+  MicrotaskQueue();
+  void Trace(cppgc::Visitor* visitor) const override;
+  const char* GetHumanReadableName() const override { return "MicrotaskQueue"; }
 
   // Uses raw Address values because it's called via ExternalReference.
   // {raw_microtask} is a tagged Microtask pointer.
-  // Returns a tagged Object pointer.
+  // Returns Smi::kZero due to CallCFunction.
   static Address CallEnqueueMicrotask(Isolate* isolate,
                                       intptr_t microtask_queue_pointer,
                                       Address raw_microtask);
@@ -40,9 +50,17 @@ class V8_EXPORT_PRIVATE MicrotaskQueue final : public v8::MicrotaskQueue {
                         v8::Local<Function> microtask) override;
   void EnqueueMicrotask(v8::Isolate* isolate, v8::MicrotaskCallback callback,
                         void* data) override;
-  void PerformCheckpoint(v8::Isolate* isolate) override;
+  void EnqueueMicrotask(v8::Isolate* isolate,
+                        v8::MicrotaskCallbackWithData callback,
+                        v8::Local<v8::Data> data) override;
+  void PerformCheckpoint(v8::Isolate* isolate) override {
+    if (!ShouldPerformCheckpoint(isolate)) return;
+    PerformCheckpointInternal(isolate);
+  }
 
-  void EnqueueMicrotask(Microtask microtask);
+  bool ShouldPerformCheckpoint(v8::Isolate* isolate) const;
+
+  void EnqueueMicrotask(Tagged<Microtask> microtask);
   void AddMicrotasksCompletedCallback(
       MicrotasksCompletedCallbackWithData callback, void* data) override;
   void RemoveMicrotasksCompletedCallback(
@@ -58,11 +76,14 @@ class V8_EXPORT_PRIVATE MicrotaskQueue final : public v8::MicrotaskQueue {
   // builtins can update the queue directly without the write barrier.
   void IterateMicrotasks(RootVisitor* visitor);
 
+  // Clears the queue by discarding all queued Microtasks.
+  void ClearMicrotasks();
+
   // Microtasks scope depth represents nested scopes controlling microtasks
   // invocation, which happens when depth reaches zero.
   void IncrementMicrotasksScopeDepth() { ++microtasks_depth_; }
   void DecrementMicrotasksScopeDepth() { --microtasks_depth_; }
-  int GetMicrotasksScopeDepth() const override;
+  int GetMicrotasksScopeDepth() const override { return microtasks_depth_; }
 
   // Possibly nested microtasks suppression scopes prevent microtasks
   // from running.
@@ -87,16 +108,19 @@ class V8_EXPORT_PRIVATE MicrotaskQueue final : public v8::MicrotaskQueue {
   }
   v8::MicrotasksPolicy microtasks_policy() const { return microtasks_policy_; }
 
-  void FireMicrotasksCompletedCallback(Isolate* isolate) const;
+  // v8::MicrotaskQueue implementation of the above.
+  void SetMicrotasksPolicy(v8::MicrotasksPolicy policy) override {
+    set_microtasks_policy(policy);
+  }
+  v8::MicrotasksPolicy GetMicrotasksPolicy() const override {
+    return microtasks_policy();
+  }
 
   intptr_t capacity() const { return capacity_; }
   intptr_t size() const { return size_; }
   intptr_t start() const { return start_; }
 
-  Microtask get(intptr_t index) const;
-
-  MicrotaskQueue* next() const { return next_; }
-  MicrotaskQueue* prev() const { return prev_; }
+  Tagged<Microtask> get(intptr_t index) const;
 
   static const size_t kRingBufferOffset;
   static const size_t kCapacityOffset;
@@ -107,9 +131,10 @@ class V8_EXPORT_PRIVATE MicrotaskQueue final : public v8::MicrotaskQueue {
   static const intptr_t kMinimumCapacity;
 
  private:
+  void PerformCheckpointInternal(v8::Isolate* v8_isolate);
+
   void OnCompleted(Isolate* isolate);
 
-  MicrotaskQueue();
   void ResizeBuffer(intptr_t new_capacity);
 
   // A ring buffer to hold Microtask instances.
@@ -123,11 +148,6 @@ class V8_EXPORT_PRIVATE MicrotaskQueue final : public v8::MicrotaskQueue {
   // The number of finished microtask.
   intptr_t finished_microtask_count_ = 0;
 
-  // MicrotaskQueue instances form a doubly linked list loop, so that all
-  // instances are reachable through |next_|.
-  MicrotaskQueue* next_ = nullptr;
-  MicrotaskQueue* prev_ = nullptr;
-
   int microtasks_depth_ = 0;
   int microtasks_suppressions_ = 0;
 #ifdef DEBUG
@@ -137,9 +157,12 @@ class V8_EXPORT_PRIVATE MicrotaskQueue final : public v8::MicrotaskQueue {
   v8::MicrotasksPolicy microtasks_policy_ = v8::MicrotasksPolicy::kAuto;
 
   bool is_running_microtasks_ = false;
+  bool is_running_completed_callbacks_ = false;
   using CallbackWithData =
       std::pair<MicrotasksCompletedCallbackWithData, void*>;
   std::vector<CallbackWithData> microtasks_completed_callbacks_;
+  std::optional<std::vector<CallbackWithData>>
+      microtasks_completed_callbacks_cow_;
 };
 
 }  // namespace internal

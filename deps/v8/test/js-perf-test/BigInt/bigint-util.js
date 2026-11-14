@@ -4,6 +4,13 @@
 
 "use strict";
 
+// Test configuration.
+const TEST_ITERATIONS = 1000;
+const SLOW_TEST_ITERATIONS = 50;
+const BITS_CASES = [32, 64, 1024, 8192];
+const RANDOM_BIGINTS_MAX_BITS = 64 * 100;
+const BIGINT_MAX_BITS = %BigIntMaxBits();
+
 
 function RandomHexDigit(allow_zero) {
   const chars = allow_zero ? '0123456789ABCDEF' : '123456789ABCDEF';
@@ -40,9 +47,7 @@ function MaxBigIntWithBits(bits) {
   }
 
   let s = "0x";
-  for (; bits > 0; bits -= 4) {
-    s += "F";
-  }
+  s += "F".repeat(bits / 4);
   return BigInt(s);
 }
 

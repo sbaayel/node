@@ -3,31 +3,51 @@
 // found in the LICENSE file.
 
 #include "src/wasm/wasm-features.h"
-#include "src/execution/isolate.h"
+
+#include "src/execution/isolate-inl.h"
 #include "src/flags/flags.h"
 #include "src/handles/handles-inl.h"
+#include "src/objects/string.h"
 
 namespace v8 {
 namespace internal {
 namespace wasm {
 
+// static
+WasmEnabledFeatures WasmEnabledFeatures::FromFlags() {
+  WasmEnabledFeatures features = WasmEnabledFeatures::None();
 
-void UnionFeaturesInto(WasmFeatures* dst, const WasmFeatures& src) {
-#define DO_UNION(feat, desc, val) dst->feat |= src.feat;
-  FOREACH_WASM_FEATURE(DO_UNION);
-#undef DO_UNION
+#if V8_ENABLE_DRUMBRAKE
+  // DrumBrake supports only a subset or older versions of some Wasm features.
+  if (v8_flags.wasm_jitless) {
+    features.Add(WasmEnabledFeature::legacy_eh);
+  }
+#endif  // V8_ENABLE_DRUMBRAKE
+
+#define CHECK_FEATURE_FLAG(feat, ...)                 \
+  if (!v8_flags.wasm_jitless && v8_flags.wasm_##feat) \
+    features.Add(WasmEnabledFeature::feat);
+  FOREACH_WASM_FEATURE_FLAG(CHECK_FEATURE_FLAG)
+#undef CHECK_FEATURE_FLAG
+  return features;
 }
 
-WasmFeatures WasmFeaturesFromFlags() {
-#define FLAG_REF(feat, desc, val) FLAG_experimental_wasm_##feat,
-  return WasmFeatures(FOREACH_WASM_FEATURE(FLAG_REF){});
-#undef FLAG_REF
+// static
+WasmEnabledFeatures WasmEnabledFeatures::FromIsolate(Isolate* isolate) {
+  return FromContext(isolate, isolate->native_context());
 }
 
-WasmFeatures WasmFeaturesFromIsolate(Isolate* isolate) {
-  WasmFeatures features = WasmFeaturesFromFlags();
-  features.threads |=
-      isolate->AreWasmThreadsEnabled(handle(isolate->context(), isolate));
+// static
+WasmEnabledFeatures WasmEnabledFeatures::FromContext(
+    Isolate* isolate, DirectHandle<NativeContext> context) {
+  WasmEnabledFeatures features = WasmEnabledFeatures::FromFlags();
+
+  if (!v8_flags.wasm_jitless &&
+      isolate->IsWasmCustomDescriptorsEnabled(context)) {
+    features.Add(WasmEnabledFeature::custom_descriptors);
+  }
+
+  // This space intentionally left blank for future Wasm origin trials.
   return features;
 }
 

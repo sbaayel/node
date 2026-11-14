@@ -30,13 +30,6 @@ const util = require('util');
 
 const tls = require('tls');
 
-common.expectWarning('DeprecationWarning', [
-  ['The URI http://[a.b.a.com]/ found in cert.subjectaltname ' +
-  'is not a valid URI, and is supported in the tls module ' +
-  'solely for compatibility.',
-   'DEP0109'],
-]);
-
 const tests = [
   // False-y values.
   {
@@ -68,6 +61,11 @@ const tests = [
     host: 'a.com',
     cert: { subject: { CN: '.a.com' } },
     error: 'Host: a.com. is not cert\'s CN: .a.com'
+  },
+  {
+    host: 'bad.x.example.com',
+    cert: { subject: { CN: 'bad..example.com' } },
+    error: 'Host: bad.x.example.com. is not cert\'s CN: bad..example.com'
   },
 
   // IP address in CN. Technically allowed but so rare that we reject
@@ -102,6 +100,27 @@ const tests = [
     cert: { subject: { CN: '8.8.8.8' }, subjectaltname: 'IP Address:8.8.8.8' }
   },
 
+  // An "IP Address:" SAN also matches an IPv6 host. Regression test for the
+  // IDNA-normalization change: domainToASCII('::1') === '' (an IPv6 literal is
+  // not a domain), which made the normalized host skip IPv6 IP-SAN matching.
+  {
+    host: '::1',
+    cert: { subject: {}, subjectaltname: 'IP Address:::1' }
+  },
+
+  // IPv6 hosts and SANs are matched canonically.
+  {
+    host: '2001:db8::1',
+    cert: { subject: {}, subjectaltname: 'IP Address:2001:DB8:0:0:0:0:0:1' }
+  },
+
+  // A non-matching IPv6 "IP Address:" SAN is rejected.
+  {
+    host: '::1',
+    cert: { subject: {}, subjectaltname: 'IP Address:::2' },
+    error: 'IP: ::1 is not in the cert\'s list: ::2'
+  },
+
   // But not when it's a CIDR.
   {
     host: '8.8.8.8',
@@ -119,28 +138,42 @@ const tests = [
     cert: { subject: { CN: '*.a.com' } },
     error: 'Host: ba.com. is not cert\'s CN: *.a.com'
   },
+  // A hostname containing a forbidden host code point (here a line feed) is
+  // rejected instead of being silently normalized and matched: domainToASCII()
+  // would drop the control character, producing a host that was never asked for.
   {
     host: '\n.b.com',
     cert: { subject: { CN: '*n.b.com' } },
-    error: 'Host: \n.b.com. is not cert\'s CN: *n.b.com'
+    error: 'Host contains a forbidden host code point'
   },
-  { host: 'b.a.com', cert: {
-    subjectaltname: 'DNS:omg.com',
-    subject: { CN: '*.a.com' } },
+  { host: 'b.a.com',
+    cert: {
+      subjectaltname: 'DNS:omg.com',
+      subject: { CN: '*.a.com' },
+    },
     error: 'Host: b.a.com. is not in the cert\'s altnames: ' +
-           'DNS:omg.com'
-  },
+           'DNS:omg.com' },
   {
     host: 'b.a.com',
     cert: { subject: { CN: 'b*b.a.com' } },
     error: 'Host: b.a.com. is not cert\'s CN: b*b.a.com'
+  },
+  {
+    host: 'bxa.a.com',
+    cert: { subject: { CN: 'b**.a.com' } },
+    error: 'Host: bxa.a.com. is not cert\'s CN: b**.a.com'
+  },
+  {
+    host: 'xbcd.a.com',
+    cert: { subject: { CN: 'ab*cd.a.com' } },
+    error: 'Host: xbcd.a.com. is not cert\'s CN: ab*cd.a.com'
   },
 
   // Empty Cert
   {
     host: 'a.com',
     cert: { },
-    error: 'Cert is empty'
+    error: 'Cert does not contain a DNS name'
   },
 
   // Empty Subject w/DNS name
@@ -154,7 +187,8 @@ const tests = [
   {
     host: 'a.b.a.com', cert: {
       subjectaltname: 'URI:http://a.b.a.com/',
-    }
+    },
+    error: 'Cert does not contain a DNS name'
   },
 
   // Multiple CN fields
@@ -162,6 +196,11 @@ const tests = [
     host: 'foo.com', cert: {
       subject: { CN: ['foo.com', 'bar.com'] } // CN=foo.com; CN=bar.com;
     }
+  },
+  {
+    host: 'a.com',
+    cert: { subject: { CN: [''] } },
+    error: 'Host: a.com. is not cert\'s CN: '
   },
 
   // DNS names and CN
@@ -218,6 +257,46 @@ const tests = [
 
   // DNS names
   {
+    host: 'a.com',
+    cert: {
+      subjectaltname: 'DNS:',
+      subject: {}
+    },
+    error: 'Host: a.com. is not in the cert\'s altnames: DNS:'
+  },
+  {
+    host: 'bad.x.example.com',
+    cert: {
+      subjectaltname: 'DNS:bad..example.com',
+      subject: {}
+    },
+    error: 'Host: bad.x.example.com. is not in the cert\'s altnames: DNS:bad..example.com'
+  },
+  {
+    host: 'x.example.com',
+    cert: {
+      subjectaltname: 'DNS:caf\u00E9.example.com', // "café.example.com"
+      subject: {}
+    },
+    error: 'Host: x.example.com. is not in the cert\'s altnames: DNS:caf\u00E9.example.com'
+  },
+  {
+    host: 'xbcd.a.com',
+    cert: {
+      subjectaltname: 'DNS:ab*cd.a.com',
+      subject: {}
+    },
+    error: 'Host: xbcd.a.com. is not in the cert\'s altnames: DNS:ab*cd.a.com'
+  },
+  {
+    host: 'x.example.com',
+    cert: {
+      subjectaltname: 'DNS:bad label.com',
+      subject: {}
+    },
+    error: 'Host: x.example.com. is not in the cert\'s altnames: DNS:bad label.com'
+  },
+  {
     host: 'a.com', cert: {
       subjectaltname: 'DNS:*.a.com',
       subject: {}
@@ -266,27 +345,28 @@ const tests = [
       subject: {}
     }
   },
+  {
+    host: 'bxa.a.com',
+    cert: {
+      subjectaltname: 'DNS:b**.a.com',
+      subject: {}
+    },
+    error: 'Host: bxa.a.com. is not in the cert\'s altnames: DNS:b**.a.com'
+  },
   // URI names
   {
     host: 'a.b.a.com', cert: {
       subjectaltname: 'URI:http://a.b.a.com/',
       subject: {}
-    }
+    },
+    error: 'Cert does not contain a DNS name'
   },
   {
     host: 'a.b.a.com', cert: {
       subjectaltname: 'URI:http://*.b.a.com/',
       subject: {}
     },
-    error: 'Host: a.b.a.com. is not in the cert\'s altnames: ' +
-           'URI:http://*.b.a.com/'
-  },
-  // Invalid URI
-  {
-    host: 'a.b.a.com', cert: {
-      subjectaltname: 'URI:http://[a.b.a.com]/',
-      subject: {}
-    }
+    error: 'Cert does not contain a DNS name'
   },
   // IP addresses
   {
@@ -294,8 +374,7 @@ const tests = [
       subjectaltname: 'IP Address:127.0.0.1',
       subject: {}
     },
-    error: 'Host: a.b.a.com. is not in the cert\'s altnames: ' +
-           'IP Address:127.0.0.1'
+    error: 'Cert does not contain a DNS name'
   },
   {
     host: '127.0.0.1', cert: {
@@ -318,6 +397,66 @@ const tests = [
     },
     error: 'IP: 127.0.0.1 is not in the cert\'s list: '
   },
+  // Non-canonical IP addresses are rejected instead of being matched against
+  // an address produced by domainToASCII().
+  ...[
+    ['0127.0.0.1', '87.0.0.1'],
+    ['0177.0.0.1', '127.0.0.1'],
+    ['0x7f.0.0.1', '127.0.0.1'],
+    ['2130706433', '127.0.0.1'],
+    ['127.1', '127.0.0.1'],
+    ['\uFF11\uFF12\uFF17.0.0.1', '127.0.0.1'], // Fullwidth digits.
+    ['127\u30020.0.1', '127.0.0.1'], // Ideographic full stop.
+  ].map(([host, normalized]) => ({
+    host,
+    cert: {
+      subjectaltname: `DNS:${normalized}`,
+      subject: {},
+    },
+    error: 'Host is a non-canonical IP address',
+  })),
+  {
+    host: '0127.0.0.1', cert: {
+      subjectaltname: 'IP Address:87.0.0.1',
+      subject: { CN: '87.0.0.1' },
+    },
+    error: 'Host is a non-canonical IP address',
+  },
+  {
+    host: '0127.0.0.1', cert: {
+      subjectaltname: 'IP Address:87.0.0.1',
+      subject: { CN: 'Example Operator' },
+    },
+    error: 'Host is a non-canonical IP address',
+  },
+  {
+    host: '1.2.3.example', cert: {
+      subjectaltname: 'DNS:1.2.3.example',
+      subject: {},
+    },
+  },
+  // domainToASCII() is implemented on top of the URL host parser, which stops at
+  // path/query/fragment delimiters and percent-decodes. Reject hostnames that
+  // would be silently truncated or otherwise transformed, so the certificate is
+  // never validated against a host the application did not ask for (e.g.
+  // "agent1/.bank.example" must not be verified as "agent1").
+  ...[
+    ['agent1/.bank.example'],
+    ['agent1?.bank.example'],
+    ['agent1#.bank.example'],
+    ['agent1\\.bank.example'],
+    ['ag%65nt1'],
+    ['ag@ent1'],
+    ['ag:ent1'],
+    ['ag ent1'],
+  ].map(([host]) => ({
+    host,
+    cert: {
+      subjectaltname: 'DNS:agent1',
+      subject: {},
+    },
+    error: 'Host contains a forbidden host code point',
+  })),
   {
     host: 'localhost', cert: {
       subjectaltname: 'DNS:a.com',
@@ -325,6 +464,15 @@ const tests = [
     },
     error: 'Host: localhost. is not in the cert\'s altnames: ' +
            'DNS:a.com'
+  },
+  {
+    host: 'foo。bar.example.com',
+    cert: {
+      subjectaltname: 'DNS:*.example.com',
+      subject: {}
+    },
+    error: 'Host: foo。bar.example.com. is not in the cert\'s altnames: ' +
+           'DNS:*.example.com'
   },
   // IDNA
   {
@@ -344,8 +492,8 @@ const tests = [
 
 tests.forEach(function(test, i) {
   const err = tls.checkServerIdentity(test.host, test.cert);
-  assert.strictEqual(err && err.reason,
+  assert.strictEqual(err?.reason,
                      test.error,
                      `Test# ${i} failed: ${util.inspect(test)} \n` +
-                     `${test.error} != ${(err && err.reason)}`);
+                     `${test.error} != ${(err?.reason)}`);
 });

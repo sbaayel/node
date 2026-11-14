@@ -21,9 +21,12 @@ server.on('stream', (stream) => {
   stream.end('Hello, world!\n');
 });
 
-server.listen(0, () => {
+server.listen(0, common.mustCall(() => {
   const h2header = Buffer.alloc(9);
-  const conn = net.connect(server.address().port);
+  const conn = net.connect({
+    port: server.address().port,
+    allowHalfOpen: true
+  });
 
   conn.write('PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n');
 
@@ -83,4 +86,4 @@ server.listen(0, () => {
     conn.destroy();
     server.close();
   }));
-});
+}));

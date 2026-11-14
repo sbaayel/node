@@ -1,10 +1,11 @@
 'use strict';
-// Flags: --expose-gc
+// Flags: --expose-gc --no-concurrent-array-buffer-sweeping
 
 const common = require('../../common');
 const binding = require(`./build/${common.buildType}/test_buffer`);
 const assert = require('assert');
-const setImmediatePromise = require('util').promisify(setImmediate);
+const util = require('util');
+const tick = util.promisify(require('../../common/tick'));
 
 (async function() {
   assert.strictEqual(binding.newBuffer().toString(), binding.theText);
@@ -12,7 +13,7 @@ const setImmediatePromise = require('util').promisify(setImmediate);
   console.log('gc1');
   global.gc();
   assert.strictEqual(binding.getDeleterCallCount(), 0);
-  await setImmediatePromise();
+  await tick(10);
   assert.strictEqual(binding.getDeleterCallCount(), 1);
   assert.strictEqual(binding.copyBuffer().toString(), binding.theText);
 
@@ -22,7 +23,24 @@ const setImmediatePromise = require('util').promisify(setImmediate);
   buffer = null;
   global.gc();
   assert.strictEqual(binding.getDeleterCallCount(), 1);
-  await setImmediatePromise();
+  await tick(10);
   console.log('gc2');
   assert.strictEqual(binding.getDeleterCallCount(), 2);
+
+  // Caveat emptor: it's indeterminate when the SharedArrayBuffer's backing
+  // store is reclaimed; at least some of the time it happens even before
+  // calling gc().
+  let sab = binding.newExternalSharedArrayBuffer();
+  assert(util.types.isSharedArrayBuffer(sab));
+  sab = null;
+  global.gc();
+  await tick(10);
+  console.log('gc3');
+  assert.strictEqual(binding.getDeleterCallCount(), 3);
+
+  // To test this doesn't crash
+  binding.invalidObjectAsBuffer({});
+
+  const testBuffer = binding.bufferFromArrayBuffer();
+  assert(testBuffer instanceof Buffer, 'Expected a Buffer');
 })().then(common.mustCall());

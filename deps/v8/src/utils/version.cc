@@ -6,7 +6,9 @@
 
 #include "include/v8-version-string.h"
 #include "include/v8-version.h"
-#include "src/utils/utils.h"
+#include "src/base/hashing.h"
+#include "src/base/strings.h"
+#include "src/base/vector.h"
 
 // Define SONAME to have the build system put a specific SONAME into the
 // shared library instead the generic SONAME generated from the V8 version
@@ -25,20 +27,27 @@ bool Version::candidate_ = (V8_IS_CANDIDATE_VERSION != 0);
 const char* Version::soname_ = SONAME;
 const char* Version::version_string_ = V8_VERSION_STRING;
 
+uint32_t Version::Hash() {
+  base::Hasher hasher;
+  hasher.Add(major_).Add(minor_).Add(build_).Add(patch_);
+  hasher.AddRange(base::OneByteVector(embedder_));
+  return static_cast<uint32_t>(hasher.hash());
+}
+
 // Calculate the V8 version string.
-void Version::GetString(Vector<char> str) {
+void Version::GetString(base::Vector<char> str) {
   const char* candidate = IsCandidate() ? " (candidate)" : "";
   if (GetPatch() > 0) {
-    SNPrintF(str, "%d.%d.%d.%d%s%s", GetMajor(), GetMinor(), GetBuild(),
-             GetPatch(), GetEmbedder(), candidate);
+    base::SNPrintF(str, "%d.%d.%d.%d%s%s", GetMajor(), GetMinor(), GetBuild(),
+                   GetPatch(), GetEmbedder(), candidate);
   } else {
-    SNPrintF(str, "%d.%d.%d%s%s", GetMajor(), GetMinor(), GetBuild(),
-             GetEmbedder(), candidate);
+    base::SNPrintF(str, "%d.%d.%d%s%s", GetMajor(), GetMinor(), GetBuild(),
+                   GetEmbedder(), candidate);
   }
 }
 
 // Calculate the SONAME for the V8 shared library.
-void Version::GetSONAME(Vector<char> str) {
+void Version::GetSONAME(base::Vector<char> str) {
   if (soname_ == nullptr || *soname_ == '\0') {
     // Generate generic SONAME if no specific SONAME is defined.
     const char* candidate = IsCandidate() ? "-candidate" : "";

@@ -82,7 +82,7 @@ double AIXTimezoneCache::LocalTimeOffset(double time_ms, bool is_utc) {
 TimezoneCache* OS::CreateTimezoneCache() { return new AIXTimezoneCache(); }
 
 static unsigned StringToLong(char* buffer) {
-  return static_cast<unsigned>(strtol(buffer, nullptr, 16));  // NOLINT
+  return static_cast<unsigned>(strtol(buffer, nullptr, 16));
 }
 
 std::vector<OS::SharedLibraryAddress> OS::GetSharedLibraryAddresses() {
@@ -128,6 +128,74 @@ std::vector<OS::SharedLibraryAddress> OS::GetSharedLibraryAddresses() {
 void OS::SignalCodeMovingGC() {}
 
 void OS::AdjustSchedulingParams() {}
+
+std::optional<OS::MemoryRange> OS::GetFirstFreeMemoryRangeWithin(
+    OS::Address boundary_start, OS::Address boundary_end, size_t minimum_size,
+    size_t alignment) {
+  return std::nullopt;
+}
+
+// static
+Stack::StackSlot Stack::ObtainCurrentThreadStackStart() {
+  // pthread_getthrds_np creates 3 values:
+  // __pi_stackaddr, __pi_stacksize, __pi_stackend
+
+  // higher address ----- __pi_stackend, stack base
+  //
+  //   |
+  //   |  __pi_stacksize, stack grows downwards
+  //   |
+  //   V
+  //
+  // lower address -----  __pi_stackaddr, reserved stack limit
+
+  pthread_t tid = pthread_self();
+  struct __pthrdsinfo buf;
+  // clear buf
+  memset(&buf, 0, sizeof(buf));
+  char regbuf[1];
+  int regbufsize = sizeof(regbuf);
+  const int rc = pthread_getthrds_np(&tid, PTHRDSINFO_QUERY_ALL, &buf,
+                                     sizeof(buf), regbuf, &regbufsize);
+  CHECK(!rc);
+  if (buf.__pi_stackend == NULL || buf.__pi_stackaddr == NULL) {
+    return nullptr;
+  }
+  return reinterpret_cast<void*>(buf.__pi_stackend);
+}
+
+// static
+Stack::StackSlot Stack::ObtainCurrentThreadStackReservedLimit() {
+  pthread_t tid = pthread_self();
+  struct __pthrdsinfo buf;
+  memset(&buf, 0, sizeof(buf));
+  char regbuf[1];
+  int regbufsize = sizeof(regbuf);
+
+  const int rc = pthread_getthrds_np(&tid, PTHRDSINFO_QUERY_ALL, &buf,
+                                     sizeof(buf), regbuf, &regbufsize);
+  if (rc != 0) {
+    return nullptr;
+  }
+
+  if (buf.__pi_stackaddr == NULL) {
+    return nullptr;
+  }
+  return reinterpret_cast<void*>(buf.__pi_stackaddr);
+}
+
+// static
+bool OS::DecommitPages(void* address, size_t size) {
+  // The difference between this implementation and the alternative under
+  // platform-posix.cc is that on AIX, calling mmap on a pre-designated address
+  // with MAP_FIXED will fail and return -1 unless the application has requested
+  // SPEC1170 compliant behaviour:
+  // https://www.ibm.com/docs/en/aix/7.3?topic=m-mmap-mmap64-subroutine
+  DCHECK_EQ(0, reinterpret_cast<uintptr_t>(address) % CommitPageSize());
+  DCHECK_EQ(0, size % CommitPageSize());
+  if (mprotect(address, size, PROT_NONE) != 0) return false;
+  return true;
+}
 
 }  // namespace base
 }  // namespace v8

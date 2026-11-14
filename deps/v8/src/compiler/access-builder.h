@@ -6,10 +6,13 @@
 #define V8_COMPILER_ACCESS_BUILDER_H_
 
 #include "src/base/compiler-specific.h"
+#include "src/compiler/js-operator.h"
 #include "src/compiler/simplified-operator.h"
 #include "src/compiler/write-barrier-kind.h"
+#include "src/objects/bigint.h"
 #include "src/objects/elements-kind.h"
 #include "src/objects/js-objects.h"
+#include "src/objects/property-details.h"
 
 namespace v8 {
 namespace internal {
@@ -31,18 +34,30 @@ class V8_EXPORT_PRIVATE AccessBuilder final
   // Access to heap object fields and elements (based on tagged pointer).
 
   // Provides access to HeapObject::map() field.
-  static FieldAccess ForMap();
+  static FieldAccess ForMap(WriteBarrierKind write_barrier = kMapWriteBarrier);
 
   // Provides access to HeapNumber::value() field.
   static FieldAccess ForHeapNumberValue();
 
+  // Provides access to ContextCell fields.
+  static FieldAccess ForContextCellState();
+  static FieldAccess ForContextCellTaggedValue();
+  static FieldAccess ForContextCellInt32Value();
+  static FieldAccess ForContextCellFloat64Value();
+
+  // Provides access to HeapNumber::value() and Oddball::to_number_raw() fields.
+  // This is the same as ForHeapNumberValue, except it documents (and static
+  // asserts) that both inputs are valid.
+  static FieldAccess ForHeapNumberOrOddballValue();
+
   // Provides access to BigInt's bit field.
   static FieldAccess ForBigIntBitfield();
 
+#ifdef BIGINT_NEEDS_PADDING
   // Provides access to BigInt's 32 bit padding that is placed after the
-  // bitfield on 64 bit architectures without pointer compression. Do not use
-  // this on 32 bit architectures.
+  // bitfield on 64 bit architectures without pointer compression.
   static FieldAccess ForBigIntOptionalPadding();
+#endif
 
   // Provides access to BigInt's least significant digit on 64 bit
   // architectures. Do not use this on 32 bit architectures.
@@ -58,12 +73,18 @@ class V8_EXPORT_PRIVATE AccessBuilder final
   static FieldAccess ForJSObjectElements();
 
   // Provides access to JSObject inobject property fields.
-  static FieldAccess ForJSObjectInObjectProperty(const MapRef& map, int index);
+  static FieldAccess ForJSObjectInObjectProperty(
+      MapRef map, int index,
+      MachineType machine_type = MachineType::AnyTagged());
   static FieldAccess ForJSObjectOffset(
       int offset, WriteBarrierKind write_barrier_kind = kFullWriteBarrier);
 
   // Provides access to JSCollecton::table() field.
   static FieldAccess ForJSCollectionTable();
+
+  // Provides access to JSWeakCollection::table() field
+  // (an EphemeronHashTable for JSWeakMap/JSWeakSet).
+  static FieldAccess ForJSWeakCollectionTable();
 
   // Provides access to JSCollectionIterator::table() field.
   static FieldAccess ForJSCollectionIteratorTable();
@@ -71,8 +92,23 @@ class V8_EXPORT_PRIVATE AccessBuilder final
   // Provides access to JSCollectionIterator::index() field.
   static FieldAccess ForJSCollectionIteratorIndex();
 
+  // Provides access to an ExternalPointer through the JSExternalObject::value()
+  // field.
+  static FieldAccess ForJSExternalObjectValue();
+
+#ifdef V8_ENABLE_SANDBOX
+  // Provides access to JSExternalObject::value() field.
+  static FieldAccess ForJSExternalObjectPointerHandle();
+#endif
+
   // Provides access to JSFunction::prototype_or_initial_map() field.
   static FieldAccess ForJSFunctionPrototypeOrInitialMap();
+
+  // Provides access to JSProxy::target() field.
+  static FieldAccess ForJSProxyTarget();
+
+  // Provides access to JSProxy::handler() field.
+  static FieldAccess ForJSProxyHandler();
 
   // Provides access to JSFunction::context() field.
   static FieldAccess ForJSFunctionContext();
@@ -83,8 +119,8 @@ class V8_EXPORT_PRIVATE AccessBuilder final
   // Provides access to JSFunction::feedback_cell() field.
   static FieldAccess ForJSFunctionFeedbackCell();
 
-  // Provides access to JSFunction::code() field.
-  static FieldAccess ForJSFunctionCode();
+  // Provides access to JSFunction::dispatch_handle() field.
+  static FieldAccess ForJSFunctionDispatchHandleNoWriteBarrier();
 
   // Provides access to JSBoundFunction::bound_target_function() field.
   static FieldAccess ForJSBoundFunctionBoundTargetFunction();
@@ -116,8 +152,17 @@ class V8_EXPORT_PRIVATE AccessBuilder final
   // Provides access to JSGeneratorObject::resume_mode() field.
   static FieldAccess ForJSGeneratorObjectResumeMode();
 
+  // Provides access to JSGeneratorObject::yielded_value() field.
+  static FieldAccess ForJSGeneratorObjectYieldedValue();
+
   // Provides access to JSAsyncFunctionObject::promise() field.
   static FieldAccess ForJSAsyncFunctionObjectPromise();
+
+  // Provides access to JSAsyncFunctionObject::await_resolve_closure() field.
+  static FieldAccess ForJSAsyncFunctionObjectAwaitResolveClosure();
+
+  // Provides access to JSAsyncFunctionObject::await_reject_closure() field.
+  static FieldAccess ForJSAsyncFunctionObjectAwaitRejectClosure();
 
   // Provides access to JSAsyncGeneratorObject::queue() field.
   static FieldAccess ForJSAsyncGeneratorObjectQueue();
@@ -127,9 +172,13 @@ class V8_EXPORT_PRIVATE AccessBuilder final
 
   // Provides access to JSArray::length() field.
   static FieldAccess ForJSArrayLength(ElementsKind elements_kind);
+  static FieldAccess ForJSArrayLength();
 
   // Provides access to JSArrayBuffer::bit_field() field.
   static FieldAccess ForJSArrayBufferBitField();
+
+  // Provides access to JSArrayBuffer::byteLength() field.
+  static FieldAccess ForJSArrayBufferByteLength();
 
   // Provides access to JSArrayBufferView::buffer() field.
   static FieldAccess ForJSArrayBufferViewBuffer();
@@ -140,8 +189,13 @@ class V8_EXPORT_PRIVATE AccessBuilder final
   // Provides access to JSArrayBufferView::byteOffset() field.
   static FieldAccess ForJSArrayBufferViewByteOffset();
 
-  // Provides access to JSTypedArray::length() field.
-  static FieldAccess ForJSTypedArrayLength();
+  // Provides access to JSArrayBufferView::bitfield() field
+  static FieldAccess ForJSArrayBufferViewBitField();
+
+  // Provides access to JSTypedArray::byteLength() field.
+  static FieldAccess ForJSTypedArrayByteLength() {
+    return ForJSArrayBufferViewByteLength();
+  }
 
   // Provides access to JSTypedArray::base_pointer() field.
   static FieldAccess ForJSTypedArrayBasePointer();
@@ -151,6 +205,10 @@ class V8_EXPORT_PRIVATE AccessBuilder final
 
   // Provides access to JSDataView::data_pointer() field.
   static FieldAccess ForJSDataViewDataPointer();
+
+  static FieldAccess ForJSDataViewByteLength() {
+    return ForJSArrayBufferViewByteLength();
+  }
 
   // Provides access to JSDate::value() field.
   static FieldAccess ForJSDateValue();
@@ -164,6 +222,8 @@ class V8_EXPORT_PRIVATE AccessBuilder final
   // Provides access to JSIteratorResult::value() field.
   static FieldAccess ForJSIteratorResultValue();
 
+  static FieldAccess ForJSPrimitiveWrapperValue();
+
   // Provides access to JSRegExp::data() field.
   static FieldAccess ForJSRegExpData();
 
@@ -173,11 +233,27 @@ class V8_EXPORT_PRIVATE AccessBuilder final
   // Provides access to JSRegExp::last_index() field.
   static FieldAccess ForJSRegExpLastIndex();
 
-  // Provides access to JSRegExp::source() field.
-  static FieldAccess ForJSRegExpSource();
-
   // Provides access to FixedArray::length() field.
+  // TODO(dmercadier): get rid of ForFixedArrayLengthLegacy once we get rid of
+  // Turbofan. It's currently only used to make Turbofan's escape analysis
+  // happy.
+  static FieldAccess ForFixedArrayLengthLegacy();
   static FieldAccess ForFixedArrayLength();
+#if TAGGED_SIZE_8_BYTES
+  static FieldAccess ForFixedArrayLengthPadding();
+#endif
+
+  // Provides access to Context::length() field.
+  static FieldAccess ForContextLength();
+
+  // Provides access to WeakFixedArray::length() field.
+  static FieldAccess ForWeakFixedArrayLength();
+
+  // Provides access to SloppyArgumentsElements::context() field.
+  static FieldAccess ForSloppyArgumentsElementsContext();
+
+  // Provides access to SloppyArgumentsElements::arguments() field.
+  static FieldAccess ForSloppyArgumentsElementsArguments();
 
   // Provides access to PropertyArray::length() field.
   static FieldAccess ForPropertyArrayLengthAndHash();
@@ -203,14 +279,17 @@ class V8_EXPORT_PRIVATE AccessBuilder final
   // Provides access to Map::prototype() field.
   static FieldAccess ForMapPrototype();
 
+  // Provides access to Map::native_context() field.
+  static FieldAccess ForMapNativeContext();
+
   // Provides access to Module::regular_exports() field.
   static FieldAccess ForModuleRegularExports();
 
   // Provides access to Module::regular_imports() field.
   static FieldAccess ForModuleRegularImports();
 
-  // Provides access to Name::hash_field() field.
-  static FieldAccess ForNameHashField();
+  // Provides access to Name::raw_hash_field() field.
+  static FieldAccess ForNameRawHashField();
 
   // Provides access to String::length() field.
   static FieldAccess ForStringLength();
@@ -239,9 +318,6 @@ class V8_EXPORT_PRIVATE AccessBuilder final
   // Provides access to SeqTwoByteString characters.
   static ElementAccess ForSeqTwoByteStringCharacter();
 
-  // Provides access to JSGlobalProxy::native_context() field.
-  static FieldAccess ForJSGlobalProxyNativeContext();
-
   // Provides access to JSArrayIterator::iterated_object() field.
   static FieldAccess ForJSArrayIteratorIteratedObject();
 
@@ -268,20 +344,35 @@ class V8_EXPORT_PRIVATE AccessBuilder final
   static FieldAccess ForFixedArraySlot(
       size_t index, WriteBarrierKind write_barrier_kind = kFullWriteBarrier);
 
+  static FieldAccess ForFeedbackVectorSlot(int index);
+
+  // Provides access to PropertyArray slots.
+  static FieldAccess ForPropertyArraySlot(int index,
+                                          Representation representation,
+                                          bool can_optimize_smis);
+
+  // Provides access to ScopeInfo flags.
+  static FieldAccess ForScopeInfoFlags();
+
   // Provides access to Context slots.
   static FieldAccess ForContextSlot(size_t index);
 
   // Provides access to Context slots that are known to be pointers.
   static FieldAccess ForContextSlotKnownPointer(size_t index);
 
+  // Provides access to Context slots that are known to be Smis.
+  static FieldAccess ForContextSlotSmi(size_t index);
+
+  // Provides access to WeakFixedArray elements.
+  static ElementAccess ForWeakFixedArrayElement();
+  static FieldAccess ForWeakFixedArraySlot(int index);
+
   // Provides access to FixedArray elements.
   static ElementAccess ForFixedArrayElement();
-  static ElementAccess ForFixedArrayElement(
-      ElementsKind kind,
-      LoadSensitivity load_sensitivity = LoadSensitivity::kUnsafe);
+  static ElementAccess ForFixedArrayElement(ElementsKind kind);
 
-  // Provides access to stack arguments
-  static ElementAccess ForStackArgument();
+  // Provides access to SloppyArgumentsElements elements.
+  static ElementAccess ForSloppyArgumentsElementsMappedEntry();
 
   // Provides access to FixedDoubleArray elements.
   static ElementAccess ForFixedDoubleArrayElement();
@@ -293,9 +384,11 @@ class V8_EXPORT_PRIVATE AccessBuilder final
   static FieldAccess ForEnumCacheIndices();
 
   // Provides access to Fixed{type}TypedArray and External{type}Array elements.
-  static ElementAccess ForTypedArrayElement(
-      ExternalArrayType type, bool is_external,
-      LoadSensitivity load_sensitivity = LoadSensitivity::kUnsafe);
+  static ElementAccess ForTypedArrayElement(ExternalArrayType type,
+                                            bool is_external);
+
+  // Provides access to the for-in cache array.
+  static ElementAccess ForJSForInCacheArrayElement(ForInMode mode);
 
   // Provides access to HashTable fields.
   static FieldAccess ForHashTableBaseNumberOfElements();
@@ -314,6 +407,25 @@ class V8_EXPORT_PRIVATE AccessBuilder final
   // Provides access to Dictionary fields.
   static FieldAccess ForDictionaryNextEnumerationIndex();
   static FieldAccess ForDictionaryObjectHashIndex();
+
+  // Provides access to NameDictionary fields.
+  static FieldAccess ForNameDictionaryFlagsIndex();
+
+  // Provides access to FeedbackCell fields.
+  static FieldAccess ForFeedbackCellInterruptBudget();
+  static FieldAccess ForFeedbackCellDispatchHandleNoWriteBarrier();
+
+  // Provides access to a FeedbackVector fields.
+  static FieldAccess ForFeedbackVectorInvocationCount();
+  static FieldAccess ForFeedbackVectorFlags();
+  static FieldAccess ForFeedbackVectorClosureFeedbackCellArray();
+
+#if V8_ENABLE_WEBASSEMBLY
+  static FieldAccess ForWasmArrayLength();
+  static FieldAccess ForWasmDispatchTableLength();
+#endif
+
+  static FieldAccess ForContextSideProperty();
 
  private:
   DISALLOW_IMPLICIT_CONSTRUCTORS(AccessBuilder);

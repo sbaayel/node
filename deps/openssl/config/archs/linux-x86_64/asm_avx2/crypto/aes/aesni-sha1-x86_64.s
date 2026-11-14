@@ -5,6 +5,7 @@
 .type	aesni_cbc_sha1_enc,@function
 .align	32
 aesni_cbc_sha1_enc:
+.cfi_startproc	
 
 	movl	OPENSSL_ia32cap_P+0(%rip),%r10d
 	movq	OPENSSL_ia32cap_P+4(%rip),%r11
@@ -17,6 +18,7 @@ aesni_cbc_sha1_enc:
 	je	aesni_cbc_sha1_enc_avx
 	jmp	aesni_cbc_sha1_enc_ssse3
 	.byte	0xf3,0xc3
+.cfi_endproc	
 .size	aesni_cbc_sha1_enc,.-aesni_cbc_sha1_enc
 .type	aesni_cbc_sha1_enc_ssse3,@function
 .align	32
@@ -2716,6 +2718,7 @@ aesni_cbc_sha1_enc_avx:
 	.byte	0xf3,0xc3
 .cfi_endproc	
 .size	aesni_cbc_sha1_enc_avx,.-aesni_cbc_sha1_enc_avx
+.section	.rodata
 .align	64
 K_XX_XX:
 .long	0x5a827999,0x5a827999,0x5a827999,0x5a827999
@@ -2725,11 +2728,13 @@ K_XX_XX:
 .long	0x00010203,0x04050607,0x08090a0b,0x0c0d0e0f
 .byte	0xf,0xe,0xd,0xc,0xb,0xa,0x9,0x8,0x7,0x6,0x5,0x4,0x3,0x2,0x1,0x0
 
-.byte	65,69,83,78,73,45,67,66,67,43,83,72,65,49,32,115,116,105,116,99,104,32,102,111,114,32,120,56,54,95,54,52,44,32,67,82,89,80,84,79,71,65,77,83,32,98,121,32,60,97,112,112,114,111,64,111,112,101,110,115,115,108,46,111,114,103,62,0
+.byte	65,69,83,78,73,45,67,66,67,43,83,72,65,49,32,115,116,105,116,99,104,32,102,111,114,32,120,56,54,95,54,52,44,32,67,82,89,80,84,79,71,65,77,83,32,98,121,32,60,104,116,116,112,115,58,47,47,103,105,116,104,117,98,46,99,111,109,47,100,111,116,45,97,115,109,62,0
 .align	64
+.previous	
 .type	aesni_cbc_sha1_enc_shaext,@function
 .align	32
 aesni_cbc_sha1_enc_shaext:
+.cfi_startproc	
 	movq	8(%rsp),%r10
 	movdqu	(%r9),%xmm8
 	movd	16(%r9),%xmm9
@@ -3028,4 +3033,26 @@ aesni_cbc_sha1_enc_shaext:
 	movdqu	%xmm8,(%r9)
 	movd	%xmm9,16(%r9)
 	.byte	0xf3,0xc3
+.cfi_endproc	
 .size	aesni_cbc_sha1_enc_shaext,.-aesni_cbc_sha1_enc_shaext
+	.section ".note.gnu.property", "a"
+	.p2align 3
+	.long 1f - 0f
+	.long 4f - 1f
+	.long 5
+0:
+	# "GNU" encoded with .byte, since .asciz isn't supported
+	# on Solaris.
+	.byte 0x47
+	.byte 0x4e
+	.byte 0x55
+	.byte 0
+1:
+	.p2align 3
+	.long 0xc0000002
+	.long 3f - 2f
+2:
+	.long 3
+3:
+	.p2align 3
+4:

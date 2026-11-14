@@ -1,31 +1,56 @@
-#include "node.h"
+#include "async_context_frame.h"
 #include "async_wrap-inl.h"
 #include "env-inl.h"
+#include "node.h"
 #include "v8.h"
+
+#include <optional>
 
 namespace node {
 
 using v8::Context;
-using v8::EscapableHandleScope;
 using v8::Function;
+using v8::Global;
 using v8::HandleScope;
 using v8::Isolate;
 using v8::Local;
 using v8::MaybeLocal;
-using v8::MicrotasksScope;
-using v8::NewStringType;
+using v8::Number;
 using v8::Object;
 using v8::String;
+using v8::Undefined;
 using v8::Value;
 
 CallbackScope::CallbackScope(Isolate* isolate,
                              Local<Object> object,
+                             async_context async_context)
+  : CallbackScope(Environment::GetCurrent(isolate), object, async_context) {}
+
+CallbackScope::CallbackScope(Environment* env,
+                             Local<Object> object,
                              async_context asyncContext)
-  : private_(new InternalCallbackScope(Environment::GetCurrent(isolate),
-                                       object,
-                                       asyncContext)),
-    try_catch_(isolate) {
+    : resource_storage_({.local = object}),
+      private_(new InternalCallbackScope(
+          env, &resource_storage_.local, asyncContext)),
+      try_catch_(env->isolate()) {
   try_catch_.SetVerbose(true);
+}
+
+CallbackScope::CallbackScope(Environment* env,
+                             Global<Object>* object,
+                             async_context asyncContext)
+    : resource_storage_({.global_ptr = object}),
+      private_(new InternalCallbackScope(
+          env, resource_storage_.global_ptr, asyncContext)),
+      try_catch_(env->isolate()) {
+  try_catch_.SetVerbose(true);
+  // These checks can be removed in a future major version -- they ensure
+  // ABI compatibility with previous Node.js versions.
+  static_assert(sizeof(resource_storage_) == sizeof(Global<Object>*));
+  static_assert(sizeof(resource_storage_) == sizeof(Local<Object>));
+  static_assert(alignof(decltype(resource_storage_)) ==
+                alignof(Global<Object>*));
+  static_assert(alignof(decltype(resource_storage_)) == alignof(Local<Object>));
 }
 
 CallbackScope::~CallbackScope() {
@@ -35,23 +60,36 @@ CallbackScope::~CallbackScope() {
 }
 
 InternalCallbackScope::InternalCallbackScope(AsyncWrap* async_wrap, int flags)
-    : InternalCallbackScope(async_wrap->env(),
-                            async_wrap->object(),
-                            { async_wrap->get_async_id(),
-                              async_wrap->get_trigger_async_id() },
-                            flags) {}
+    : InternalCallbackScope(
+          async_wrap->env(),
+          async_wrap->object(),
+          {async_wrap->get_async_id(), async_wrap->get_trigger_async_id()},
+          flags,
+          async_wrap->context_frame()) {}
 
-InternalCallbackScope::InternalCallbackScope(Environment* env,
-                                             Local<Object> object,
-                                             const async_context& asyncContext,
-                                             int flags)
-  : env_(env),
-    async_context_(asyncContext),
-    object_(object),
-    skip_hooks_(flags & kSkipAsyncHooks),
-    skip_task_queues_(flags & kSkipTaskQueues) {
-  CHECK_IMPLIES(!(flags & kAllowEmptyResource), !object.IsEmpty());
+InternalCallbackScope::InternalCallbackScope(
+    Environment* env,
+    std::variant<Local<Object>, Local<Object>*, Global<Object>*> object_arg,
+    const async_context& asyncContext,
+    int flags,
+    Local<Value> context_frame)
+    : env_(env),
+      async_context_(asyncContext),
+      skip_hooks_(flags & kSkipAsyncHooks),
+      skip_task_queues_(flags & kSkipTaskQueues) {
   CHECK_NOT_NULL(env);
+
+  std::variant<v8::Local<v8::Object>*, v8::Global<v8::Object>*> object;
+  if (std::holds_alternative<Local<Object>>(object_arg)) {
+    object_storage_ = std::get<Local<Object>>(object_arg);
+    object = &object_storage_;
+  } else if (std::holds_alternative<Local<Object>*>(object_arg)) {
+    object = std::get<Local<Object>*>(object_arg);
+  } else {
+    object = std::get<Global<Object>*>(object_arg);
+  }
+  std::visit([](auto* ptr) { CHECK_NOT_NULL(ptr); }, object);
+
   env->PushAsyncCallbackScope();
 
   if (!env->can_call_into_js()) {
@@ -59,19 +97,39 @@ InternalCallbackScope::InternalCallbackScope(Environment* env,
     return;
   }
 
-  HandleScope handle_scope(env->isolate());
-  // If you hit this assertion, you forgot to enter the v8::Context first.
-  CHECK_EQ(Environment::GetCurrent(env->isolate()), env);
+  Isolate* isolate = env->isolate();
+  if (handle_cleanup_depth > 0) allow_js_.emplace(isolate);
+
+  HandleScope handle_scope(isolate);
+  Local<Context> current_context = isolate->GetCurrentContext();
+  // If you hit this assertion, the caller forgot to enter the right Node.js
+  // Environment's v8::Context first.
+  // We first check `env->context() != current_context` because the contexts
+  // likely *are* the same, in which case we can skip the slightly more
+  // expensive Environment::GetCurrent() call.
+  if (env->context() != current_context) [[unlikely]] {
+    CHECK_EQ(Environment::GetCurrent(isolate), env);
+  }
+
+  isolate->SetIdle(false);
+
+  // The prior frame is usually undefined: no global handle then.
+  Local<Value> prior_context_frame =
+      async_context_frame::exchange(env, context_frame);
+  if (!prior_context_frame->IsUndefined()) {
+    prior_context_frame_.Reset(isolate, prior_context_frame);
+  }
+
+  env->async_hooks()->push_async_context(
+      async_context_.async_id, async_context_.trigger_async_id, object);
+
+  pushed_ids_ = true;
 
   if (asyncContext.async_id != 0 && !skip_hooks_) {
     // No need to check a return value because the application will exit if
     // an exception occurs.
     AsyncWrap::EmitBefore(env, asyncContext.async_id);
   }
-
-  env->async_hooks()->push_async_ids(async_context_.async_id,
-                               async_context_.trigger_async_id);
-  pushed_ids_ = true;
 }
 
 InternalCallbackScope::~InternalCallbackScope() {
@@ -83,19 +141,33 @@ void InternalCallbackScope::Close() {
   if (closed_) return;
   closed_ = true;
 
-  if (!env_->can_call_into_js()) return;
-  if (failed_ && !env_->is_main_thread() && env_->is_stopping()) {
-    env_->async_hooks()->clear_async_id_stack();
-  }
+  // This function must ends up with either cleanup the
+  // async id stack or pop the topmost one from it
 
-  if (pushed_ids_)
-    env_->async_hooks()->pop_async_id(async_context_.async_id);
+  auto perform_stopping_check = [&]() {
+    if (env_->is_stopping()) {
+      MarkAsFailed();
+      env_->async_hooks()->clear_async_id_stack();
+    }
+  };
+  perform_stopping_check();
 
-  if (failed_) return;
+  if (env_->is_stopping()) return;
 
-  if (async_context_.async_id != 0 && !skip_hooks_) {
+  Isolate* isolate = env_->isolate();
+  auto idle = OnScopeLeave([&]() { isolate->SetIdle(true); });
+
+  if (!failed_ && async_context_.async_id != 0 && !skip_hooks_) {
     AsyncWrap::EmitAfter(env_, async_context_.async_id);
   }
+
+  if (pushed_ids_) {
+    env_->async_hooks()->pop_async_context(async_context_.async_id);
+
+    async_context_frame::set(env_, prior_context_frame_.Get(isolate));
+  }
+
+  if (failed_) return;
 
   if (env_->async_callback_scope_depth() > 1 || skip_task_queues_) {
     return;
@@ -107,8 +179,11 @@ void InternalCallbackScope::Close() {
 
   auto weakref_cleanup = OnScopeLeave([&]() { env_->RunWeakRefCleanup(); });
 
+  Local<Context> context = env_->context();
   if (!tick_info->has_tick_scheduled()) {
-    MicrotasksScope::PerformCheckpoint(env_->isolate());
+    context->GetMicrotaskQueue()->PerformCheckpoint(isolate);
+
+    perform_stopping_check();
   }
 
   // Make sure the stack unwound properly. If there are nested MakeCallback's
@@ -122,7 +197,7 @@ void InternalCallbackScope::Close() {
     return;
   }
 
-  HandleScope handle_scope(env_->isolate());
+  HandleScope handle_scope(isolate);
   Local<Object> process = env_->process_object();
 
   if (!env_->can_call_into_js()) return;
@@ -133,37 +208,60 @@ void InternalCallbackScope::Close() {
   // to initializes the tick callback during bootstrap.
   CHECK(!tick_callback.IsEmpty());
 
-  if (tick_callback->Call(env_->context(), process, 0, nullptr).IsEmpty()) {
+  if (tick_callback->Call(context, process, 0, nullptr).IsEmpty()) {
     failed_ = true;
   }
+  perform_stopping_check();
 }
 
 MaybeLocal<Value> InternalMakeCallback(Environment* env,
+                                       Local<Object> resource,
                                        Local<Object> recv,
                                        const Local<Function> callback,
                                        int argc,
                                        Local<Value> argv[],
-                                       async_context asyncContext) {
+                                       async_context asyncContext,
+                                       Local<Value> context_frame) {
   CHECK(!recv.IsEmpty());
 #ifdef DEBUG
   for (int i = 0; i < argc; i++)
     CHECK(!argv[i].IsEmpty());
 #endif
 
-  InternalCallbackScope scope(env, recv, asyncContext);
+  Local<Function> hook_cb = env->async_hooks_callback_trampoline();
+  int flags = InternalCallbackScope::kNoFlags;
+  bool use_async_hooks_trampoline = false;
+  AsyncHooks* async_hooks = env->async_hooks();
+  if (!hook_cb.IsEmpty()) {
+    // Use the callback trampoline if there are any before or after hooks, or
+    // we can expect some kind of usage of async_hooks.executionAsyncResource().
+    flags = InternalCallbackScope::kSkipAsyncHooks;
+    use_async_hooks_trampoline =
+        async_hooks->fields()[AsyncHooks::kBefore] +
+        async_hooks->fields()[AsyncHooks::kAfter] +
+        async_hooks->fields()[AsyncHooks::kUsesExecutionAsyncResource] > 0;
+  }
+
+  InternalCallbackScope scope(
+      env, resource, asyncContext, flags, context_frame);
   if (scope.Failed()) {
     return MaybeLocal<Value>();
   }
 
-  Local<Function> domain_cb = env->domain_callback();
   MaybeLocal<Value> ret;
-  if (asyncContext.async_id != 0 || domain_cb.IsEmpty() || recv.IsEmpty()) {
-    ret = callback->Call(env->context(), recv, argc, argv);
+
+  Local<Context> context = env->context();
+  if (use_async_hooks_trampoline) {
+    MaybeStackBuffer<Value, 16> args(env->isolate(), 3 + argc);
+    args[0] = Number::New(env->isolate(), asyncContext.async_id);
+    args[1] = resource;
+    args[2] = callback;
+    for (int i = 0; i < argc; i++) {
+      args[i + 3] = argv[i];
+    }
+    ret = hook_cb->Call(context, recv, args.length(), &args[0]);
   } else {
-    std::vector<Local<Value>> args(1 + argc);
-    args[0] = callback;
-    std::copy(&argv[0], &argv[argc], args.begin() + 1);
-    ret = domain_cb->Call(env->context(), recv, args.size(), &args[0]);
+    ret = callback->Call(context, recv, argc, argv);
   }
 
   if (ret.IsEmpty()) {
@@ -187,9 +285,10 @@ MaybeLocal<Value> MakeCallback(Isolate* isolate,
                                int argc,
                                Local<Value> argv[],
                                async_context asyncContext) {
-  Local<String> method_string =
-      String::NewFromUtf8(isolate, method, NewStringType::kNormal)
-          .ToLocalChecked();
+  Local<String> method_string;
+  if (!String::NewFromUtf8(isolate, method).ToLocal(&method_string)) {
+    return {};
+  }
   return MakeCallback(isolate, recv, method_string, argc, argv, asyncContext);
 }
 
@@ -199,10 +298,24 @@ MaybeLocal<Value> MakeCallback(Isolate* isolate,
                                int argc,
                                Local<Value> argv[],
                                async_context asyncContext) {
-  Local<Value> callback_v =
-      recv->Get(isolate->GetCurrentContext(), symbol).ToLocalChecked();
-  if (callback_v.IsEmpty()) return Local<Value>();
-  if (!callback_v->IsFunction()) return Local<Value>();
+  // Check can_call_into_js() first because calling Get() might do so.
+  Local<Context> context;
+  if (!recv->GetCreationContext().ToLocal(&context)) {
+    return {};
+  }
+  Environment* env = Environment::GetCurrent(context);
+  CHECK_NOT_NULL(env);
+  if (!env->can_call_into_js()) return {};
+
+  Local<Value> callback_v;
+  if (!recv->Get(isolate->GetCurrentContext(), symbol).ToLocal(&callback_v)) {
+    return {};
+  }
+  if (!callback_v->IsFunction()) {
+    // This used to return an empty value, but Undefined() makes more sense
+    // since no exception is pending here.
+    return Undefined(isolate);
+  }
   Local<Function> callback = callback_v.As<Function>();
   return MakeCallback(isolate, recv, callback, argc, argv, asyncContext);
 }
@@ -213,6 +326,17 @@ MaybeLocal<Value> MakeCallback(Isolate* isolate,
                                int argc,
                                Local<Value> argv[],
                                async_context asyncContext) {
+  return InternalMakeCallback(
+      isolate, recv, callback, argc, argv, asyncContext, Undefined(isolate));
+}
+
+MaybeLocal<Value> InternalMakeCallback(Isolate* isolate,
+                                       Local<Object> recv,
+                                       Local<Function> callback,
+                                       int argc,
+                                       Local<Value> argv[],
+                                       async_context asyncContext,
+                                       Local<Value> context_frame) {
   // Observe the following two subtleties:
   //
   // 1. The environment is retrieved from the callback function's context.
@@ -220,52 +344,65 @@ MaybeLocal<Value> MakeCallback(Isolate* isolate,
   //
   // Because of the AssignToContext() call in src/node_contextify.cc,
   // the two contexts need not be the same.
-  Environment* env = Environment::GetCurrent(callback->CreationContext());
+  Local<Context> context;
+  if (!callback->GetCreationContext().ToLocal(&context)) {
+    return {};
+  }
+  Environment* env = Environment::GetCurrent(context);
   CHECK_NOT_NULL(env);
-  Context::Scope context_scope(env->context());
-  MaybeLocal<Value> ret =
-      InternalMakeCallback(env, recv, callback, argc, argv, asyncContext);
+  // Entering the context changes nothing when it is already the entered and
+  // the current one, which is the common case for addons.
+  Local<Context> env_context = env->context();
+  std::optional<Context::Scope> context_scope;
+  if (isolate->GetEnteredOrMicrotaskContext() != env_context ||
+      isolate->GetCurrentContext() != env_context) {
+    context_scope.emplace(env_context);
+  }
+  MaybeLocal<Value> ret = InternalMakeCallback(
+      env, recv, recv, callback, argc, argv, asyncContext, context_frame);
   if (ret.IsEmpty() && env->async_callback_scope_depth() == 0) {
     // This is only for legacy compatibility and we may want to look into
     // removing/adjusting it.
-    return Undefined(env->isolate());
+    return Undefined(isolate);
   }
   return ret;
 }
 
-// Legacy MakeCallback()s
+// Use this if you just want to safely invoke some JS callback and
+// would like to retain the currently active async_context, if any.
+// In case none is available, a fixed default context will be
+// installed otherwise.
+MaybeLocal<Value> MakeSyncCallback(Isolate* isolate,
+                                   Local<Object> recv,
+                                   Local<Function> callback,
+                                   int argc,
+                                   Local<Value> argv[]) {
+  Local<Context> context;
+  if (!callback->GetCreationContext().ToLocal(&context)) {
+    return {};
+  }
+  Environment* env = Environment::GetCurrent(context);
+  CHECK_NOT_NULL(env);
+  if (!env->can_call_into_js()) return {};
 
-Local<Value> MakeCallback(Isolate* isolate,
-                          Local<Object> recv,
-                          const char* method,
-                          int argc,
-                          Local<Value>* argv) {
-  EscapableHandleScope handle_scope(isolate);
-  return handle_scope.Escape(
-      MakeCallback(isolate, recv, method, argc, argv, {0, 0})
-          .FromMaybe(Local<Value>()));
-}
+  Context::Scope context_scope(context);
+  if (env->async_callback_scope_depth()) {
+    // There's another MakeCallback() on the stack, piggy back on it.
+    // In particular, retain the current async_context.
+    return callback->Call(context, recv, argc, argv);
+  }
 
-Local<Value> MakeCallback(Isolate* isolate,
-                          Local<Object> recv,
-                          Local<String> symbol,
-                          int argc,
-                          Local<Value>* argv) {
-  EscapableHandleScope handle_scope(isolate);
-  return handle_scope.Escape(
-      MakeCallback(isolate, recv, symbol, argc, argv, {0, 0})
-          .FromMaybe(Local<Value>()));
-}
-
-Local<Value> MakeCallback(Isolate* isolate,
-                          Local<Object> recv,
-                          Local<Function> callback,
-                          int argc,
-                          Local<Value>* argv) {
-  EscapableHandleScope handle_scope(isolate);
-  return handle_scope.Escape(
-      MakeCallback(isolate, recv, callback, argc, argv, {0, 0})
-          .FromMaybe(Local<Value>()));
+  // This is a toplevel invocation and the caller (intentionally)
+  // didn't provide any async_context to run in. Install a default context.
+  MaybeLocal<Value> ret = InternalMakeCallback(env,
+                                               env->process_object(),
+                                               recv,
+                                               callback,
+                                               argc,
+                                               argv,
+                                               async_context{0, 0},
+                                               Undefined(isolate));
+  return ret;
 }
 
 }  // namespace node

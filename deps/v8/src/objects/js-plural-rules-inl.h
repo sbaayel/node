@@ -2,15 +2,17 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+#ifndef V8_OBJECTS_JS_PLURAL_RULES_INL_H_
+#define V8_OBJECTS_JS_PLURAL_RULES_INL_H_
+
 #ifndef V8_INTL_SUPPORT
 #error Internationalization is expected to be enabled.
 #endif  // V8_INTL_SUPPORT
 
-#ifndef V8_OBJECTS_JS_PLURAL_RULES_INL_H_
-#define V8_OBJECTS_JS_PLURAL_RULES_INL_H_
+#include "src/objects/js-plural-rules.h"
+// Include the non-inl header before the rest of the headers.
 
 #include "src/api/api-inl.h"
-#include "src/objects/js-plural-rules.h"
 #include "src/objects/objects-inl.h"
 
 // Has to be the last include (doesn't have include guards):
@@ -19,28 +21,45 @@
 namespace v8 {
 namespace internal {
 
-OBJECT_CONSTRUCTORS_IMPL(JSPluralRules, JSObject)
+Tagged<String> JSPluralRules::locale() const { return locale_.load(); }
+void JSPluralRules::set_locale(Tagged<String> value, WriteBarrierMode mode) {
+  locale_.store(this, value, mode);
+}
 
-ACCESSORS(JSPluralRules, locale, String, kLocaleOffset)
-SMI_ACCESSORS(JSPluralRules, flags, kFlagsOffset)
-ACCESSORS(JSPluralRules, icu_plural_rules, Managed<icu::PluralRules>,
-          kIcuPluralRulesOffset)
-ACCESSORS(JSPluralRules, icu_number_formatter,
-          Managed<icu::number::LocalizedNumberFormatter>,
-          kIcuNumberFormatterOffset)
+int JSPluralRules::flags() const { return flags_.load().value(); }
+void JSPluralRules::set_flags(int value) {
+  flags_.store(this, Smi::FromInt(value));
+}
+
+Tagged<Managed<icu::PluralRules>> JSPluralRules::icu_plural_rules() const {
+  return Cast<Managed<icu::PluralRules>>(icu_plural_rules_.load());
+}
+void JSPluralRules::set_icu_plural_rules(
+    Tagged<Managed<icu::PluralRules>> value, WriteBarrierMode mode) {
+  icu_plural_rules_.store(this, value, mode);
+}
+
+Tagged<Managed<icu::number::LocalizedNumberFormatter>>
+JSPluralRules::icu_number_formatter() const {
+  return Cast<Managed<icu::number::LocalizedNumberFormatter>>(
+      icu_number_formatter_.load());
+}
+void JSPluralRules::set_icu_number_formatter(
+    Tagged<Managed<icu::number::LocalizedNumberFormatter>> value,
+    WriteBarrierMode mode) {
+  icu_number_formatter_.store(this, value, mode);
+}
 
 inline void JSPluralRules::set_type(Type type) {
-  DCHECK_LE(type, TypeBits::kMax);
+  DCHECK(TypeBit::is_valid(type));
   int hints = flags();
-  hints = TypeBits::update(hints, type);
+  hints = TypeBit::update(hints, type);
   set_flags(hints);
 }
 
 inline JSPluralRules::Type JSPluralRules::type() const {
-  return TypeBits::decode(flags());
+  return TypeBit::decode(flags());
 }
-
-CAST_ACCESSOR(JSPluralRules)
 
 }  // namespace internal
 }  // namespace v8

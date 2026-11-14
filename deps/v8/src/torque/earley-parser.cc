@@ -2,27 +2,30 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+#include "src/torque/earley-parser.h"
+
 #include <algorithm>
+#include <optional>
 #include <set>
 #include <unordered_map>
 #include <unordered_set>
 
+#include "absl/container/node_hash_map.h"
+#include "src/base/iterator.h"
 #include "src/torque/ast.h"
-#include "src/torque/earley-parser.h"
 #include "src/torque/utils.h"
 
-namespace v8 {
-namespace internal {
-namespace torque {
+namespace v8::internal::torque {
 
 namespace {
 
 struct LineAndColumnTracker {
-  LineAndColumn previous{0, 0};
-  LineAndColumn current{0, 0};
+  LineAndColumn previous{0, 0, 0};
+  LineAndColumn current{0, 0, 0};
 
   void Advance(InputPosition from, InputPosition to) {
     previous = current;
+    current.offset += std::distance(from, to);
     while (from != to) {
       if (*from == '\n') {
         current.line += 1;
@@ -41,19 +44,22 @@ struct LineAndColumnTracker {
 
 }  // namespace
 
-base::Optional<ParseResult> Rule::RunAction(const Item* completed_item,
-                                            const LexerResult& tokens) const {
+std::optional<ParseResult> Rule::RunAction(const Item* completed_item,
+                                           const LexerResult& tokens) const {
   std::vector<ParseResult> results;
   for (const Item* child : completed_item->Children()) {
     if (!child) continue;
-    base::Optional<ParseResult> child_result =
+    std::optional<ParseResult> child_result =
         child->left()->RunAction(child, tokens);
     if (child_result) results.push_back(std::move(*child_result));
   }
   MatchedInput matched_input = completed_item->GetMatchedInput(tokens);
   CurrentSourcePosition::Scope pos_scope(matched_input.pos);
   ParseResultIterator iterator(std::move(results), matched_input);
-  return action_(&iterator);
+  auto result = action_(&iterator);
+  // Make sure the parse action consumed all the child results.
+  CHECK(!iterator.HasNext());
+  return result;
 }
 
 Symbol& Symbol::operator=(std::initializer_list<Rule> rules) {
@@ -77,8 +83,9 @@ std::vector<const Item*> Item::Children() const {
 
 std::string Item::SplitByChildren(const LexerResult& tokens) const {
   if (right().size() == 1) {
-    if (const Item* child = Children()[0])
+    if (const Item* child = Children()[0]) {
       return child->SplitByChildren(tokens);
+    }
   }
   std::stringstream s;
   bool first = true;
@@ -123,6 +130,7 @@ LexerResult Lexer::RunLexer(const std::string& input) {
   while (pos != end) {
     token_start = pos;
     Symbol* symbol = MatchToken(&pos, end);
+    DCHECK_IMPLIES(symbol != nullptr, pos != token_start);
     InputPosition token_end = pos;
     line_column_tracker.Advance(token_start, token_end);
     if (!symbol) {
@@ -164,13 +172,12 @@ Symbol* Lexer::MatchToken(InputPosition* pos, InputPosition end) {
   // Now check for keywords. Prefer keywords over patterns unless the pattern is
   // longer. Iterate from the end to ensure that if one keyword is a prefix of
   // another, we first try to match the longer one.
-  for (auto it = keywords_.rbegin(); it != keywords_.rend(); ++it) {
-    const std::string& keyword = it->first;
+  for (auto& [keyword, keyword_symbol] : base::Reversed(keywords_)) {
     if (static_cast<size_t>(end - token_start) < keyword.size()) continue;
     if (keyword.size() >= pattern_size &&
         keyword == std::string(token_start, token_start + keyword.size())) {
       *pos = token_start + keyword.size();
-      return &it->second;
+      return &keyword_symbol;
     }
   }
   if (pattern_size > 0) return symbol;
@@ -181,16 +188,17 @@ Symbol* Lexer::MatchToken(InputPosition* pos, InputPosition end) {
 // (https://en.wikipedia.org/wiki/Earley_parser).
 const Item* RunEarleyAlgorithm(
     Symbol* start, const LexerResult& tokens,
-    std::unordered_set<Item, base::hash<Item>>* processed) {
+    absl::node_hash_set<Item, base::hash<Item>>* processed) {
   // Worklist for items at the current position.
   std::vector<Item> worklist;
   // Worklist for items at the next position.
   std::vector<Item> future_items;
   CurrentSourcePosition::Scope source_position(
-      SourcePosition{CurrentSourceFile::Get(), {0, 0}, {0, 0}});
+      SourcePosition{CurrentSourceFile::Get(), LineAndColumn::Invalid(),
+                     LineAndColumn::Invalid()});
   std::vector<const Item*> completed_items;
-  std::unordered_map<std::pair<size_t, Symbol*>, std::set<const Item*>,
-                     base::hash<std::pair<size_t, Symbol*>>>
+  absl::node_hash_map<std::pair<size_t, Symbol*>, std::set<const Item*>,
+                      base::hash<std::pair<size_t, Symbol*>>>
       waiting;
 
   std::vector<const Item*> debug_trace;
@@ -277,6 +285,7 @@ const Item* RunEarleyAlgorithm(
 }
 
 // static
+DISABLE_CFI_ICALL
 bool Grammar::MatchChar(int (*char_class)(int), InputPosition* pos) {
   if (**pos && char_class(static_cast<unsigned char>(**pos))) {
     ++*pos;
@@ -309,6 +318,4 @@ bool Grammar::MatchAnyChar(InputPosition* pos) {
   return MatchChar([](char c) { return true; }, pos);
 }
 
-}  // namespace torque
-}  // namespace internal
-}  // namespace v8
+}  // namespace v8::internal::torque

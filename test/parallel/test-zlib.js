@@ -1,3 +1,4 @@
+// Flags: --no-warnings
 // Copyright Joyent, Inc. and other Node contributors.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
@@ -27,6 +28,14 @@ const stream = require('stream');
 const fs = require('fs');
 const fixtures = require('../common/fixtures');
 
+// Should not segfault.
+assert.throws(() => zlib.gzipSync(Buffer.alloc(0), { windowBits: 8 }), {
+  code: 'ERR_OUT_OF_RANGE',
+  name: 'RangeError',
+  message: 'The value of "options.windowBits" is out of range. ' +
+           'It must be >= 9 and <= 15. Received 8',
+});
+
 let zlibPairs = [
   [zlib.Deflate, zlib.Inflate],
   [zlib.Gzip, zlib.Gunzip],
@@ -34,6 +43,7 @@ let zlibPairs = [
   [zlib.Gzip, zlib.Unzip],
   [zlib.DeflateRaw, zlib.InflateRaw],
   [zlib.BrotliCompress, zlib.BrotliDecompress],
+  [zlib.ZstdCompress, zlib.ZstdDecompress],
 ];
 
 // How fast to trickle through the slowstream
@@ -171,7 +181,8 @@ zlib.createDeflateRaw({ windowBits: 8 });
       .pipe(zlib.createInflateRaw({ windowBits: 8 }))
       .on('data', (chunk) => reinflated.push(chunk))
       .on('end', common.mustCall(
-        () => assert(Buffer.concat(raw).equals(Buffer.concat(reinflated)))));
+        () => assert(Buffer.concat(raw).equals(Buffer.concat(reinflated)))))
+      .on('close', common.mustCall(1));
 }
 
 // For each of the files, make sure that compressing and
@@ -221,3 +232,11 @@ testKeys.forEach(common.mustCall((file) => {
     }, trickle.length));
   }, chunkSize.length));
 }, testKeys.length));
+
+{
+  // Instantiating without `new` is End-of-Life (DEP0184).
+  assert.throws(() => zlib.Gzip(), {
+    name: 'TypeError',
+    message: /Class constructor Gzip cannot be invoked without 'new'/,
+  });
+}

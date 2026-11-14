@@ -23,10 +23,9 @@
 const common = require('../common');
 const assert = require('assert');
 
-const path = require('path');
 const fs = require('fs');
 const tmpdir = require('../common/tmpdir');
-const fn = path.join(tmpdir.path, 'write.txt');
+const fn = tmpdir.resolve('write.txt');
 tmpdir.refresh();
 const file = fs.createWriteStream(fn, {
   highWaterMark: 10
@@ -41,12 +40,12 @@ const callbacks = {
 };
 
 file
-  .on('open', function(fd) {
+  .on('open', common.mustCall((fd) => {
     console.error('open!');
     callbacks.open++;
     assert.strictEqual(typeof fd, 'number');
-  })
-  .on('drain', function() {
+  }))
+  .on('drain', common.mustCallAtLeast(() => {
     console.error('drain!', callbacks.drain);
     callbacks.drain++;
     if (callbacks.drain === -1) {
@@ -56,22 +55,21 @@ file
       assert.strictEqual(fs.readFileSync(fn, 'utf8'), EXPECTED + EXPECTED);
       file.end();
     }
-  })
-  .on('close', function() {
+  }))
+  .on('close', common.mustCall(() => {
     console.error('close!');
     assert.strictEqual(file.bytesWritten, EXPECTED.length * 2);
 
     callbacks.close++;
-    console.error('write after end should not be allowed');
-    file.write('should not work anymore');
-    file.on('error', common.expectsError({
+    file.write('should not work anymore', common.expectsError({
       code: 'ERR_STREAM_WRITE_AFTER_END',
       name: 'Error',
       message: 'write after end'
     }));
+    file.on('error', common.mustNotCall());
 
     fs.unlinkSync(fn);
-  });
+  }));
 
 for (let i = 0; i < 11; i++) {
   file.write(`${i}`);

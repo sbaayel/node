@@ -11,6 +11,7 @@ global	aesni_cbc_sha1_enc
 ALIGN	32
 aesni_cbc_sha1_enc:
 
+
 	mov	r10d,DWORD[((OPENSSL_ia32cap_P+0))]
 	mov	r11,QWORD[((OPENSSL_ia32cap_P+4))]
 	bt	r11,61
@@ -22,6 +23,7 @@ aesni_cbc_sha1_enc:
 	je	NEAR aesni_cbc_sha1_enc_avx
 	jmp	NEAR aesni_cbc_sha1_enc_ssse3
 	DB	0F3h,0C3h		;repret
+
 
 
 ALIGN	32
@@ -2779,6 +2781,7 @@ $L$epilogue_avx:
 	DB	0F3h,0C3h		;repret
 
 $L$SEH_end_aesni_cbc_sha1_enc_avx:
+section	.rdata rdata align=64
 ALIGN	64
 K_XX_XX:
 	DD	0x5a827999,0x5a827999,0x5a827999,0x5a827999
@@ -2791,9 +2794,10 @@ DB	0xf,0xe,0xd,0xc,0xb,0xa,0x9,0x8,0x7,0x6,0x5,0x4,0x3,0x2,0x1,0x0
 DB	65,69,83,78,73,45,67,66,67,43,83,72,65,49,32,115
 DB	116,105,116,99,104,32,102,111,114,32,120,56,54,95,54,52
 DB	44,32,67,82,89,80,84,79,71,65,77,83,32,98,121,32
-DB	60,97,112,112,114,111,64,111,112,101,110,115,115,108,46,111
-DB	114,103,62,0
+DB	60,104,116,116,112,115,58,47,47,103,105,116,104,117,98,46
+DB	99,111,109,47,100,111,116,45,97,115,109,62,0
 ALIGN	64
+section .text
 
 ALIGN	32
 aesni_cbc_sha1_enc_shaext:
@@ -2807,6 +2811,7 @@ $L$SEH_begin_aesni_cbc_sha1_enc_shaext:
 	mov	rcx,r9
 	mov	r8,QWORD[40+rsp]
 	mov	r9,QWORD[48+rsp]
+
 
 
 	mov	r10,QWORD[56+rsp]
@@ -3133,6 +3138,7 @@ $L$epilogue_shaext:
 	mov	rdi,QWORD[8+rsp]	;WIN64 epilogue
 	mov	rsi,QWORD[16+rsp]
 	DB	0F3h,0C3h		;repret
+
 $L$SEH_end_aesni_cbc_sha1_enc_shaext:
 EXTERN	__imp_RtlVirtualUnwind
 

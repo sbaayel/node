@@ -7,7 +7,7 @@ const common = require('../common');
 const assert = require('assert');
 const zlib = require('zlib');
 
-[
+const inputs = [
   undefined,
   null,
   true,
@@ -15,8 +15,10 @@ const zlib = require('zlib');
   0,
   1,
   [1, 2, 3],
-  { foo: 'bar' }
-].forEach((input) => {
+  { foo: 'bar' },
+];
+
+for (const input of inputs) {
   assert.throws(
     () => zlib.deflateSync(input),
     {
@@ -27,4 +29,4 @@ const zlib = require('zlib');
                common.invalidArgTypeHelper(input)
     }
   );
-});
+}

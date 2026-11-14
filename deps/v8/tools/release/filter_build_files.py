@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # Copyright 2017 the V8 project authors. All rights reserved.
 # Use of this source code is governed by a BSD-style license that can be
 # found in the LICENSE file.
@@ -18,7 +18,6 @@ import glob
 import itertools
 import json
 import os
-import re
 import sys
 
 EXECUTABLE_FILES = [
@@ -32,7 +31,6 @@ REFBUILD_EXECUTABLE_FILES = [
 
 SUPPLEMENTARY_FILES = [
   'icudtl.dat',
-  'natives_blob.bin',
   'snapshot_blob.bin',
   'v8_build_config.json',
 ]

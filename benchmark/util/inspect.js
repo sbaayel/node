@@ -6,14 +6,15 @@ const common = require('../common.js');
 const opts = {
   showHidden: { showHidden: true },
   colors: { colors: true },
-  none: undefined
+  none: undefined,
 };
 const bench = common.createBenchmark(main, {
-  n: [2e4],
+  n: [8e4],
   method: [
     'Object',
     'Object_empty',
     'Object_deep_ln',
+    'Object_large',
     'String',
     'String_complex',
     'String_boxed',
@@ -25,7 +26,7 @@ const bench = common.createBenchmark(main, {
     'TypedArray_extra',
     'Number',
   ],
-  option: Object.keys(opts)
+  option: Object.keys(opts),
 });
 
 function benchmark(n, obj, options) {
@@ -37,7 +38,7 @@ function benchmark(n, obj, options) {
 }
 
 function main({ method, n, option }) {
-  var obj;
+  let obj;
   const options = opts[option];
   switch (method) {
     case 'Object':
@@ -60,6 +61,13 @@ function main({ method, n, option }) {
                     f: 'sixth',
                     g: 'seventh' } } } };
       benchmark(n, obj, options || { depth: Infinity });
+      break;
+    case 'Object_large':
+      obj = {};
+      for (let i = 0; i < 50; i++) {
+        obj[`key${i}`] = i;
+      }
+      benchmark(n, obj, options);
       break;
     case 'String':
       benchmark(n, 'Simple string', options);

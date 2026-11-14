@@ -9,6 +9,10 @@
 #include <cstdio>  // For FILE.
 #include <memory>
 
+#if V8_ENABLE_DRUMBRAKE
+#include <string>
+#endif  // V8_ENABLE_DRUMBRAKE
+
 namespace v8 {
 namespace internal {
 
@@ -26,10 +30,13 @@ int DataDirectiveSize(DataDirective directive);
 
 enum class EmbeddedTargetOs {
   kAIX,
+  kAndroid,
   kChromeOS,
   kFuchsia,
   kMac,
   kWin,
+  kStarboard,
+  kZOS,
   kGeneric,  // Everything not covered above falls in here.
 };
 
@@ -51,23 +58,25 @@ class PlatformEmbeddedFileWriterBase {
   FILE* fp() const { return fp_; }
 
   virtual void SectionText() = 0;
-  virtual void SectionData() = 0;
   virtual void SectionRoData() = 0;
 
   virtual void AlignToCodeAlignment() = 0;
+  virtual void AlignToPageSizeIfNeeded() {}
   virtual void AlignToDataAlignment() = 0;
 
   virtual void DeclareUint32(const char* name, uint32_t value) = 0;
-  virtual void DeclarePointerToSymbol(const char* name, const char* target) = 0;
 
+  virtual void DeclareSymbolGlobal(const char* name) = 0;
   virtual void DeclareLabel(const char* name) = 0;
+  virtual void DeclareLabelProlog(const char* name) {}
+  virtual void DeclareLabelEpilogue() {}
 
   virtual void SourceInfo(int fileid, const char* filename, int line) = 0;
-  virtual void DeclareFunctionBegin(const char* name) = 0;
+  virtual void DeclareFunctionBegin(const char* name, uint32_t size) = 0;
   virtual void DeclareFunctionEnd(const char* name) = 0;
 
   // Returns the number of printed characters.
-  virtual int HexLiteral(uint64_t value) = 0;
+  virtual int HexLiteral(uint64_t value);
 
   virtual void Comment(const char* string) = 0;
   virtual void Newline() { fprintf(fp_, "\n"); }
@@ -98,6 +107,16 @@ class PlatformEmbeddedFileWriterBase {
 // The factory function. Returns the appropriate platform-specific instance.
 std::unique_ptr<PlatformEmbeddedFileWriterBase> NewPlatformEmbeddedFileWriter(
     const char* target_arch, const char* target_os);
+
+#if V8_ENABLE_DRUMBRAKE
+inline bool IsDrumBrakeInstructionHandler(const char* name) {
+  std::string builtin_name(name);
+  return builtin_name.find("Builtins_r2r_") == 0 ||
+         builtin_name.find("Builtins_r2s_") == 0 ||
+         builtin_name.find("Builtins_s2r_") == 0 ||
+         builtin_name.find("Builtins_s2s_") == 0;
+}
+#endif  // V8_ENABLE_DRUMBRAKE
 
 }  // namespace internal
 }  // namespace v8

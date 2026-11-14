@@ -10,10 +10,13 @@ try {
   common.skip('missing trace events');
 }
 
+// Perfetto records nothing for a category enabled after the tracing session
+// started, so there is no dynamic enabling to test there yet.
+common.skipIfPerfettoEnabled();
+
 const assert = require('assert');
 const cp = require('child_process');
 const fs = require('fs');
-const path = require('path');
 
 const enable = `require("trace_events").createTracing(
 { categories: ["node.async_hooks"] }).enable();`;
@@ -21,7 +24,7 @@ const code =
   'setTimeout(() => { for (let i = 0; i < 100000; i++) { "test" + i } }, 1)';
 
 const tmpdir = require('../common/tmpdir');
-const filename = path.join(tmpdir.path, 'node_trace.1.log');
+const filename = tmpdir.resolve('node_trace.1.log');
 
 tmpdir.refresh();
 const proc = cp.spawnSync(
@@ -31,8 +34,7 @@ const proc = cp.spawnSync(
     cwd: tmpdir.path,
     env: { ...process.env,
            'NODE_DEBUG_NATIVE': 'tracing',
-           'NODE_DEBUG': 'tracing'
-    }
+           'NODE_DEBUG': 'tracing' }
   });
 
 console.log('process exit with signal:', proc.signal);

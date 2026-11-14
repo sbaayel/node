@@ -3,7 +3,7 @@ const common = require('../common');
 const assert = require('assert');
 const http = require('http');
 
-const server = http.Server(common.mustCall((req, res) => {
+const server = new http.Server(common.mustCall((req, res) => {
   res.writeHead(200);
   res.end('Hello, World!');
 }));
@@ -14,13 +14,15 @@ server.listen(0, common.mustCall(() => {
   http.globalAgent = agent;
 
   makeRequest();
-  assert(agent.sockets.hasOwnProperty(name)); // Agent has indeed been used
+  assert(name in agent.sockets); // Agent has indeed been used
 }));
 
 function makeRequest() {
   const req = http.get({
     port: server.address().port
   });
-  req.on('close', () =>
-    server.close());
+  req.on('close', common.mustCall(() => {
+    assert.strictEqual(req.destroyed, true);
+    server.close();
+  }));
 }

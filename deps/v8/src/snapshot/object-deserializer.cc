@@ -4,111 +4,145 @@
 
 #include "src/snapshot/object-deserializer.h"
 
-#include "src/codegen/assembler-inl.h"
 #include "src/execution/isolate.h"
 #include "src/heap/heap-inl.h"
+#include "src/heap/local-factory-inl.h"
 #include "src/objects/allocation-site-inl.h"
+#include "src/objects/allocation-site.h"
+#include "src/objects/bytecode-array-inl.h"
 #include "src/objects/objects.h"
-#include "src/objects/slots.h"
+#include "src/objects/trusted-object-inl.h"
+#include "src/sandbox/bytecode-verifier.h"
 #include "src/snapshot/code-serializer.h"
+#include "src/zone/zone.h"
 
 namespace v8 {
 namespace internal {
 
-ObjectDeserializer::ObjectDeserializer(const SerializedCodeData* data)
-    : Deserializer(data, true) {}
+ObjectDeserializer::ObjectDeserializer(Isolate* isolate,
+                                       const SerializedCodeData* data)
+    : Deserializer(isolate, data->Payload(), data->GetMagicNumber(), true,
+                   false) {}
 
-MaybeHandle<SharedFunctionInfo>
+MaybeDirectHandle<SharedFunctionInfo>
 ObjectDeserializer::DeserializeSharedFunctionInfo(
-    Isolate* isolate, const SerializedCodeData* data, Handle<String> source) {
-  ObjectDeserializer d(data);
+    Isolate* isolate, const SerializedCodeData* data,
+    DirectHandle<String> source) {
+  ObjectDeserializer d(isolate, data);
 
   d.AddAttachedObject(source);
 
-  Handle<HeapObject> result;
-  return d.Deserialize(isolate).ToHandle(&result)
-             ? Handle<SharedFunctionInfo>::cast(result)
-             : MaybeHandle<SharedFunctionInfo>();
+  DirectHandle<HeapObject> result;
+  return d.Deserialize().ToHandle(&result)
+             ? Cast<SharedFunctionInfo>(result)
+             : MaybeDirectHandle<SharedFunctionInfo>();
 }
 
-MaybeHandle<HeapObject> ObjectDeserializer::Deserialize(Isolate* isolate) {
-  Initialize(isolate);
-
-  if (!allocator()->ReserveSpace()) return MaybeHandle<HeapObject>();
-
+MaybeDirectHandle<HeapObject> ObjectDeserializer::Deserialize() {
   DCHECK(deserializing_user_code());
-  HandleScope scope(isolate);
-  Handle<HeapObject> result;
+  HandleScope scope(isolate());
+  DirectHandle<HeapObject> result;
   {
-    DisallowHeapAllocation no_gc;
-    Object root;
-    VisitRootPointer(Root::kPartialSnapshotCache, nullptr,
-                     FullObjectSlot(&root));
+    result = ReadObject();
     DeserializeDeferredObjects();
-    FlushICache();
+    CHECK(new_instruction_stream_objects().empty());
     LinkAllocationSites();
-    LogNewMapEvents();
-    result = handle(HeapObject::cast(root), isolate);
-    Rehash();
-    allocator()->RegisterDeserializedObjectsForBlackAllocation();
+    CHECK(new_maps().empty());
   }
+
+  Rehash();
   CommitPostProcessedObjects();
   return scope.CloseAndEscape(result);
 }
 
-void ObjectDeserializer::FlushICache() {
-  DCHECK(deserializing_user_code());
-  for (Code code : new_code_objects()) {
-    // Record all references to embedded objects in the new code object.
-#ifndef V8_DISABLE_WRITE_BARRIERS
-    WriteBarrierForCode(code);
-#endif
-    FlushInstructionCache(code.raw_instruction_start(),
-                          code.raw_instruction_size());
-  }
-}
-
 void ObjectDeserializer::CommitPostProcessedObjects() {
-  CHECK_LE(new_internalized_strings().size(), kMaxInt);
-  StringTable::EnsureCapacityForDeserialization(
-      isolate(), static_cast<int>(new_internalized_strings().size()));
-  for (Handle<String> string : new_internalized_strings()) {
-    DisallowHeapAllocation no_gc;
-    StringTableInsertionKey key(*string);
-    StringTable::AddKeyNoResize(isolate(), &key);
-  }
-
-  Heap* heap = isolate()->heap();
-  Factory* factory = isolate()->factory();
-  for (Handle<Script> script : new_scripts()) {
+  for (DirectHandle<Script> script : new_scripts()) {
     // Assign a new script id to avoid collision.
-    script->set_id(isolate()->heap()->NextScriptId());
+    script->set_id(isolate()->GetNextScriptId());
     LogScriptEvents(*script);
     // Add script to list.
-    Handle<WeakArrayList> list = factory->script_list();
+    Handle<WeakArrayList> list = isolate()->factory()->script_list();
     list = WeakArrayList::AddToEnd(isolate(), list,
-                                   MaybeObjectHandle::Weak(script));
-    heap->SetRootScriptList(*list);
+                                   MaybeObjectDirectHandle::Weak(script));
+    isolate()->heap()->SetRootScriptList(*list);
   }
+  PostProcessExposedTrustedObjects();
 }
 
 void ObjectDeserializer::LinkAllocationSites() {
-  DisallowHeapAllocation no_gc;
+  DisallowGarbageCollection no_gc;
   Heap* heap = isolate()->heap();
   // Allocation sites are present in the snapshot, and must be linked into
   // a list at deserialization time.
-  for (AllocationSite site : new_allocation_sites()) {
-    if (!site.HasWeakNext()) continue;
+  for (DirectHandle<AllocationSite> site : new_allocation_sites()) {
+    if (!site->HasWeakNext()) continue;
+    DirectHandle<AllocationSiteWithWeakNext> site_with_next =
+        Cast<AllocationSiteWithWeakNext>(site);
     // TODO(mvstanton): consider treating the heap()->allocation_sites_list()
     // as a (weak) root. If this root is relocated correctly, this becomes
     // unnecessary.
-    if (heap->allocation_sites_list() == Smi::kZero) {
-      site.set_weak_next(ReadOnlyRoots(heap).undefined_value());
+    if (heap->allocation_sites_list() == Smi::zero()) {
+      site_with_next->set_weak_next(ReadOnlyRoots(heap).undefined_value());
     } else {
-      site.set_weak_next(heap->allocation_sites_list());
+      site_with_next->set_weak_next(
+          Cast<UnionOf<Undefined, AllocationSiteWithWeakNext>>(
+              heap->allocation_sites_list()));
     }
-    heap->set_allocation_sites_list(site);
+    heap->set_allocation_sites_list(*site_with_next);
   }
+}
+
+OffThreadObjectDeserializer::OffThreadObjectDeserializer(
+    LocalIsolate* isolate, const SerializedCodeData* data)
+    : Deserializer(isolate, data->Payload(), data->GetMagicNumber(), true,
+                   false) {}
+
+MaybeDirectHandle<SharedFunctionInfo>
+OffThreadObjectDeserializer::DeserializeSharedFunctionInfo(
+    LocalIsolate* isolate, const SerializedCodeData* data,
+    std::vector<IndirectHandle<Script>>* deserialized_scripts) {
+  OffThreadObjectDeserializer d(isolate, data);
+
+  // Attach the empty string as the source.
+  d.AddAttachedObject(isolate->factory()->empty_string());
+
+  DirectHandle<HeapObject> result;
+  if (!d.Deserialize(deserialized_scripts).ToHandle(&result)) {
+    return MaybeDirectHandle<SharedFunctionInfo>();
+  }
+  return Cast<SharedFunctionInfo>(result);
+}
+
+MaybeDirectHandle<HeapObject> OffThreadObjectDeserializer::Deserialize(
+    std::vector<IndirectHandle<Script>>* deserialized_scripts) {
+  DCHECK(deserializing_user_code());
+  LocalHandleScope scope(isolate());
+  DirectHandle<HeapObject> result;
+  {
+    result = ReadObject();
+    DeserializeDeferredObjects();
+    CHECK(new_instruction_stream_objects().empty());
+    CHECK(new_allocation_sites().empty());
+    CHECK(new_maps().empty());
+  }
+
+  Rehash();
+  CommitPostProcessedObjects(deserialized_scripts);
+  return scope.CloseAndEscape(result);
+}
+
+void OffThreadObjectDeserializer::CommitPostProcessedObjects(
+    std::vector<IndirectHandle<Script>>* deserialized_scripts) {
+  // TODO(leszeks): Figure out a better way of dealing with scripts.
+  CHECK_EQ(new_scripts().size(), 1);
+  for (DirectHandle<Script> script : new_scripts()) {
+    // Assign a new script id to avoid collision.
+    script->set_id(isolate()->GetNextScriptId());
+    LogScriptEvents(*script);
+    deserialized_scripts->push_back(
+        isolate()->heap()->NewPersistentHandle(script));
+  }
+  PostProcessExposedTrustedObjects();
 }
 
 }  // namespace internal

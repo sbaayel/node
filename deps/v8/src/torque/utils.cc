@@ -2,20 +2,24 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+#include "src/torque/utils.h"
+
 #include <algorithm>
 #include <fstream>
 #include <iostream>
+#include <optional>
 #include <string>
 
+#include "src/base/bits.h"
+#include "src/base/iterator.h"
 #include "src/base/logging.h"
 #include "src/torque/ast.h"
-#include "src/torque/utils.h"
+#include "src/torque/constants.h"
+#include "src/torque/declarable.h"
 
-namespace v8 {
-namespace internal {
-namespace torque {
+EXPORT_CONTEXTUAL_VARIABLE(v8::internal::torque::TorqueMessages)
 
-DEFINE_CONTEXTUAL_VARIABLE(TorqueMessages)
+namespace v8::internal::torque {
 
 std::string StringLiteralUnquote(const std::string& s) {
   DCHECK(('"' == s.front() && '"' == s.back()) ||
@@ -88,15 +92,15 @@ static int HexCharToInt(unsigned char c) {
   return c - 'a' + 10;
 }
 
-base::Optional<std::string> FileUriDecode(const std::string& uri) {
+std::optional<std::string> FileUriDecode(std::string_view uri) {
   // Abort decoding of URIs that don't start with "file://".
-  if (uri.rfind(kFileUriPrefix) != 0) return base::nullopt;
+  if (uri.rfind(kFileUriPrefix) != 0) return std::nullopt;
 
-  const std::string path = uri.substr(kFileUriPrefixLength);
+  const std::string_view path = uri.substr(kFileUriPrefixLength);
   std::ostringstream decoded;
 
   for (auto iter = path.begin(), end = path.end(); iter != end; ++iter) {
-    std::string::value_type c = (*iter);
+    std::string_view::value_type c = (*iter);
 
     // Normal characters are appended.
     if (c != '%') {
@@ -105,11 +109,11 @@ base::Optional<std::string> FileUriDecode(const std::string& uri) {
     }
 
     // If '%' is not followed by at least two hex digits, we abort.
-    if (std::distance(iter, end) <= 2) return base::nullopt;
+    if (std::distance(iter, end) <= 2) return std::nullopt;
 
     unsigned char first = (*++iter);
     unsigned char second = (*++iter);
-    if (!isxdigit(first) || !isxdigit(second)) return base::nullopt;
+    if (!isxdigit(first) || !isxdigit(second)) return std::nullopt;
 
     // An escaped hex value needs converting.
     unsigned char value = HexCharToInt(first) * 16 + HexCharToInt(second);
@@ -119,21 +123,39 @@ base::Optional<std::string> FileUriDecode(const std::string& uri) {
   return decoded.str();
 }
 
-std::string CurrentPositionAsString() {
-  return PositionAsString(CurrentSourcePosition::Get());
-}
-
 MessageBuilder::MessageBuilder(const std::string& message,
                                TorqueMessage::Kind kind) {
-  base::Optional<SourcePosition> position;
+  std::optional<SourcePosition> position;
   if (CurrentSourcePosition::HasScope()) {
     position = CurrentSourcePosition::Get();
   }
   message_ = TorqueMessage{message, position, kind};
+  if (CurrentScope::HasScope()) {
+    // Traverse the parent scopes to find one that was created to represent a
+    // specialization of something generic. If we find one, then log it and
+    // continue walking the scope tree of the code that requested that
+    // specialization. This allows us to collect the stack of locations that
+    // caused a specialization.
+    Scope* scope = CurrentScope::Get();
+    while (scope) {
+      SpecializationRequester requester = scope->GetSpecializationRequester();
+      if (!requester.IsNone()) {
+        extra_messages_.push_back(
+            {"Note: in specialization " + requester.name + " requested here",
+             requester.position, kind});
+        scope = requester.scope;
+      } else {
+        scope = scope->ParentScope();
+      }
+    }
+  }
 }
 
 void MessageBuilder::Report() const {
   TorqueMessages::Get().push_back(message_);
+  for (const auto& message : extra_messages_) {
+    TorqueMessages::Get().push_back(message);
+  }
 }
 
 [[noreturn]] void MessageBuilder::Throw() const {
@@ -142,7 +164,7 @@ void MessageBuilder::Report() const {
 
 namespace {
 
-bool ContainsUnderscore(const std::string& s) {
+bool ContainsUnderscore(std::string_view s) {
   if (s.empty()) return false;
   return s.find("_") != std::string::npos;
 }
@@ -155,9 +177,10 @@ bool ContainsUpperCase(const std::string& s) {
 // Torque has some namespace constants that are used like language level
 // keywords, e.g.: 'True', 'Undefined', etc.
 // These do not need to follow the default naming convention for constants.
-bool IsKeywordLikeName(const std::string& s) {
-  static const char* const keyword_like_constants[]{"True", "False", "TheHole",
-                                                    "Null", "Undefined"};
+bool IsKeywordLikeName(std::string_view s) {
+  static const char* const keyword_like_constants[]{
+      "True",        "False", "TheHole",  "TdzHole",
+      "PromiseHole", "Null",  "Undefined"};
 
   return std::find(std::begin(keyword_like_constants),
                    std::end(keyword_like_constants),
@@ -168,28 +191,47 @@ bool IsKeywordLikeName(const std::string& s) {
 // naming convention and are those exempt from the normal type convention.
 bool IsMachineType(const std::string& s) {
   static const char* const machine_types[]{
-      "void",    "never", "int8",   "uint8", "int16",  "uint16",  "int31",
-      "uint31",  "int32", "uint32", "int64", "intptr", "uintptr", "float32",
-      "float64", "bool",  "string", "bint",  "char8",  "char16"};
-
+      VOID_TYPE_STRING,
+      NEVER_TYPE_STRING,
+      INT8_TYPE_STRING,
+      UINT8_TYPE_STRING,
+      INT16_TYPE_STRING,
+      UINT16_TYPE_STRING,
+      INT31_TYPE_STRING,
+      UINT31_TYPE_STRING,
+      INT32_TYPE_STRING,
+      UINT32_TYPE_STRING,
+      INT64_TYPE_STRING,
+      UINT64_TYPE_STRING,
+      INTPTR_TYPE_STRING,
+      UINTPTR_TYPE_STRING,
+      FLOAT16_RAW_BITS_TYPE_STRING,
+      FLOAT32_TYPE_STRING,
+      FLOAT64_TYPE_STRING,
+      FLOAT64_OR_UNDEFINED_OR_HOLE_TYPE_STRING,
+      BOOL_TYPE_STRING,
+      "string",
+      BINT_TYPE_STRING,
+      CHAR8_TYPE_STRING,
+      CHAR16_TYPE_STRING};
   return std::find(std::begin(machine_types), std::end(machine_types), s) !=
          std::end(machine_types);
 }
 
 }  // namespace
 
-bool IsLowerCamelCase(const std::string& s) {
+bool IsLowerCamelCase(std::string_view s) {
   if (s.empty()) return false;
   size_t start = 0;
   if (s[0] == '_') start = 1;
   return islower(s[start]) && !ContainsUnderscore(s.substr(start));
 }
 
-bool IsUpperCamelCase(const std::string& s) {
+bool IsUpperCamelCase(std::string_view s) {
   if (s.empty()) return false;
   size_t start = 0;
   if (s[0] == '_') start = 1;
-  return isupper(s[start]) && !ContainsUnderscore(s.substr(1));
+  return isupper(s[start]);
 }
 
 bool IsSnakeCase(const std::string& s) {
@@ -197,7 +239,7 @@ bool IsSnakeCase(const std::string& s) {
   return !ContainsUpperCase(s);
 }
 
-bool IsValidNamespaceConstName(const std::string& s) {
+bool IsValidNamespaceConstName(std::string_view s) {
   if (s.empty()) return false;
   if (IsKeywordLikeName(s)) return true;
 
@@ -280,17 +322,23 @@ std::string UnderlinifyPath(std::string path) {
   return path;
 }
 
+bool StartsWithSingleUnderscore(const std::string& str) {
+  return str.length() >= 2 && str[0] == '_' && str[1] != '_';
+}
+
 void ReplaceFileContentsIfDifferent(const std::string& file_path,
                                     const std::string& contents) {
   std::ifstream old_contents_stream(file_path.c_str());
   std::string old_contents;
+  bool file_exists = false;
   if (old_contents_stream.good()) {
+    file_exists = true;
     std::istreambuf_iterator<char> eos;
     old_contents =
         std::string(std::istreambuf_iterator<char>(old_contents_stream), eos);
     old_contents_stream.close();
   }
-  if (old_contents.length() == 0 || old_contents != contents) {
+  if (!file_exists || old_contents != contents) {
     std::ofstream new_contents_stream;
     new_contents_stream.open(file_path.c_str());
     new_contents_stream << contents;
@@ -312,8 +360,8 @@ NamespaceScope::NamespaceScope(std::ostream& os,
   }
 }
 NamespaceScope::~NamespaceScope() {
-  for (auto i = d_.rbegin(); i != d_.rend(); ++i) {
-    os_ << "}  // namespace " << *i << "\n";
+  for (const std::string& ns : base::Reversed(d_)) {
+    os_ << "}  // namespace " << ns << "\n";
   }
 }
 
@@ -334,6 +382,16 @@ IncludeObjectMacrosScope::~IncludeObjectMacrosScope() {
   os_ << "\n#include \"src/objects/object-macros-undef.h\"\n";
 }
 
-}  // namespace torque
-}  // namespace internal
-}  // namespace v8
+size_t ResidueClass::AlignmentLog2() const {
+  if (value_ == 0) return modulus_log_2_;
+  return base::bits::CountTrailingZeros(value_);
+}
+
+const size_t ResidueClass::kMaxModulusLog2;
+
+std::ostream& operator<<(std::ostream& os, const ResidueClass& a) {
+  if (a.SingleValue().has_value()) return os << *a.SingleValue();
+  return os << "[" << a.value_ << " mod 2^" << a.modulus_log_2_ << "]";
+}
+
+}  // namespace v8::internal::torque

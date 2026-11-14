@@ -5,10 +5,12 @@
 #ifndef V8_PARSING_REWRITER_H_
 #define V8_PARSING_REWRITER_H_
 
-#include "src/base/macros.h"
+#include <optional>
 
-namespace v8 {
-namespace internal {
+#include "src/base/macros.h"
+#include "src/zone/zone-type-traits.h"
+
+namespace v8::internal {
 
 class AstValueFactory;
 class Isolate;
@@ -16,6 +18,8 @@ class ParseInfo;
 class Parser;
 class DeclarationScope;
 class Scope;
+class Statement;
+class VariableProxy;
 
 class Rewriter {
  public:
@@ -25,11 +29,18 @@ class Rewriter {
   //
   // Assumes code has been parsed and scopes have been analyzed.  Mutates the
   // AST, so the AST should not continue to be used in the case of failure.
-  V8_EXPORT_PRIVATE static bool Rewrite(ParseInfo* info);
+  V8_EXPORT_PRIVATE static bool Rewrite(ParseInfo* info,
+                                        bool* out_has_stack_overflow);
+
+  // Helper that does the actual re-writing. Extracted so REPL scripts can
+  // rewrite the body but then use the ".result" VariableProxy to resolve
+  // the async promise that is the result of running a REPL script.
+  // Returns std::nullopt in case something went wrong.
+  static std::optional<VariableProxy*> RewriteBody(
+      ParseInfo* info, Scope* scope, ZonePtrList<Statement>* body,
+      bool* out_has_stack_overflow);
 };
 
-
-}  // namespace internal
-}  // namespace v8
+}  // namespace v8::internal
 
 #endif  // V8_PARSING_REWRITER_H_

@@ -24,7 +24,7 @@ bool OperatorProperties::NeedsExactContext(const Operator* op) {
   DCHECK(HasContextInput(op));
   IrOpcode::Value const opcode = static_cast<IrOpcode::Value>(op->opcode());
   switch (opcode) {
-#define CASE(Name) case IrOpcode::k##Name:
+#define CASE(Name, ...) case IrOpcode::k##Name:
     // Binary/unary operators, calls and constructor calls only
     // need the context to generate exceptions or lookup fields
     // on the native context, so passing any context is fine.
@@ -42,10 +42,12 @@ bool OperatorProperties::NeedsExactContext(const Operator* op) {
     case IrOpcode::kJSCreateArrayFromIterable:
     case IrOpcode::kJSCreateLiteralRegExp:
     case IrOpcode::kJSGetTemplateObject:
+    case IrOpcode::kJSDetachContextCell:
     case IrOpcode::kJSForInEnumerate:
     case IrOpcode::kJSForInNext:
     case IrOpcode::kJSForInPrepare:
-    case IrOpcode::kJSGeneratorRestoreContext:
+    case IrOpcode::kJSForOfNext:
+    case IrOpcode::kJSGeneratorRestoreContextNoCell:
     case IrOpcode::kJSGeneratorRestoreContinuation:
     case IrOpcode::kJSGeneratorRestoreInputOrDebugPos:
     case IrOpcode::kJSGeneratorRestoreRegister:
@@ -53,7 +55,6 @@ bool OperatorProperties::NeedsExactContext(const Operator* op) {
     case IrOpcode::kJSLoadGlobal:
     case IrOpcode::kJSLoadMessage:
     case IrOpcode::kJSStackCheck:
-    case IrOpcode::kJSStoreGlobal:
     case IrOpcode::kJSStoreMessage:
     case IrOpcode::kJSGetIterator:
       return false;
@@ -73,22 +74,32 @@ bool OperatorProperties::NeedsExactContext(const Operator* op) {
     case IrOpcode::kJSCreateCatchContext:
     case IrOpcode::kJSCreateWithContext:
     case IrOpcode::kJSDebugger:
+    case IrOpcode::kJSDefineKeyedOwnProperty:
     case IrOpcode::kJSDeleteProperty:
     case IrOpcode::kJSGeneratorStore:
+    case IrOpcode::kJSGetImportMeta:
     case IrOpcode::kJSHasProperty:
+    case IrOpcode::kJSHasContextExtension:
+    case IrOpcode::kJSLoadContextNoCell:
     case IrOpcode::kJSLoadContext:
     case IrOpcode::kJSLoadModule:
     case IrOpcode::kJSLoadNamed:
+    case IrOpcode::kJSLoadNamedFromSuper:
     case IrOpcode::kJSLoadProperty:
+    case IrOpcode::kJSStoreContextNoCell:
     case IrOpcode::kJSStoreContext:
-    case IrOpcode::kJSStoreDataPropertyInLiteral:
+    case IrOpcode::kJSDefineKeyedOwnPropertyInLiteral:
+    case IrOpcode::kJSStoreGlobal:
     case IrOpcode::kJSStoreInArrayLiteral:
     case IrOpcode::kJSStoreModule:
-    case IrOpcode::kJSStoreNamed:
-    case IrOpcode::kJSStoreNamedOwn:
-    case IrOpcode::kJSStoreProperty:
+    case IrOpcode::kJSSetNamedProperty:
+    case IrOpcode::kJSDefineNamedOwnProperty:
+    case IrOpcode::kJSSetKeyedProperty:
+    case IrOpcode::kJSFindNonDefaultConstructorOrConstruct:
+    case IrOpcode::kJSSetPrototypeProperties:
       return true;
 
+    case IrOpcode::kJSAsyncFunctionAwait:
     case IrOpcode::kJSAsyncFunctionEnter:
     case IrOpcode::kJSAsyncFunctionReject:
     case IrOpcode::kJSAsyncFunctionResolve:
@@ -100,6 +111,7 @@ bool OperatorProperties::NeedsExactContext(const Operator* op) {
     case IrOpcode::kJSCreateStringIterator:
     case IrOpcode::kJSCreateKeyValueArray:
     case IrOpcode::kJSCreateObject:
+    case IrOpcode::kJSCreateStringWrapper:
     case IrOpcode::kJSCreatePromise:
     case IrOpcode::kJSCreateTypedArray:
     case IrOpcode::kJSCreateArray:
@@ -117,11 +129,12 @@ bool OperatorProperties::NeedsExactContext(const Operator* op) {
       break;
 
 #define CASE(Name) case IrOpcode::k##Name:
-      // Non-JavaScript operators don't have a notion of "context"
+      // Non-JavaScript operators don't have a notion of "context".
       COMMON_OP_LIST(CASE)
       CONTROL_OP_LIST(CASE)
       MACHINE_OP_LIST(CASE)
-      MACHINE_SIMD_OP_LIST(CASE)
+      MACHINE_SIMD128_OP_LIST(CASE)
+      IF_SIMD256(MACHINE_SIMD256_OP_LIST, CASE)
       SIMPLIFIED_OP_LIST(CASE)
       break;
 #undef CASE
@@ -132,6 +145,8 @@ bool OperatorProperties::NeedsExactContext(const Operator* op) {
 // static
 bool OperatorProperties::HasFrameStateInput(const Operator* op) {
   switch (op->opcode()) {
+    case IrOpcode::kJSSetPrototypeProperties:
+      return true;
     case IrOpcode::kCheckpoint:
     case IrOpcode::kFrameState:
       return true;
@@ -142,10 +157,6 @@ bool OperatorProperties::HasFrameStateInput(const Operator* op) {
 
     // Strict equality cannot lazily deoptimize.
     case IrOpcode::kJSStrictEqual:
-      return false;
-
-    // Generator creation cannot call back into arbitrary JavaScript.
-    case IrOpcode::kJSCreateGeneratorObject:
       return false;
 
     // Binary operations
@@ -188,23 +199,29 @@ bool OperatorProperties::HasFrameStateInput(const Operator* op) {
     case IrOpcode::kJSCreateLiteralRegExp:
     case IrOpcode::kJSCreateObject:
     case IrOpcode::kJSCloneObject:
+    case IrOpcode::kJSCreateGeneratorObject:
 
     // Property access operations
-    case IrOpcode::kJSLoadNamed:
-    case IrOpcode::kJSStoreNamed:
-    case IrOpcode::kJSLoadProperty:
-    case IrOpcode::kJSStoreProperty:
-    case IrOpcode::kJSLoadGlobal:
-    case IrOpcode::kJSStoreGlobal:
-    case IrOpcode::kJSStoreNamedOwn:
-    case IrOpcode::kJSStoreDataPropertyInLiteral:
     case IrOpcode::kJSDeleteProperty:
+    case IrOpcode::kJSLoadGlobal:
+    case IrOpcode::kJSLoadNamed:
+    case IrOpcode::kJSLoadNamedFromSuper:
+    case IrOpcode::kJSLoadProperty:
+    case IrOpcode::kJSDefineKeyedOwnPropertyInLiteral:
+    case IrOpcode::kJSStoreInArrayLiteral:
+    case IrOpcode::kJSStoreGlobal:
+    case IrOpcode::kJSSetNamedProperty:
+    case IrOpcode::kJSDefineNamedOwnProperty:
+    case IrOpcode::kJSSetKeyedProperty:
+    case IrOpcode::kJSDefineKeyedOwnProperty:
 
     // Conversions
     case IrOpcode::kJSToLength:
     case IrOpcode::kJSToName:
     case IrOpcode::kJSToNumber:
     case IrOpcode::kJSToNumberConvertBigInt:
+    case IrOpcode::kJSToBigInt:
+    case IrOpcode::kJSToBigIntConvertNumber:
     case IrOpcode::kJSToNumeric:
     case IrOpcode::kJSToObject:
     case IrOpcode::kJSToString:
@@ -215,20 +232,27 @@ bool OperatorProperties::HasFrameStateInput(const Operator* op) {
     case IrOpcode::kJSConstruct:
     case IrOpcode::kJSConstructWithArrayLike:
     case IrOpcode::kJSConstructWithSpread:
+    case IrOpcode::kJSConstructForwardAllArgs:
     case IrOpcode::kJSCallForwardVarargs:
     case IrOpcode::kJSCall:
     case IrOpcode::kJSCallWithArrayLike:
     case IrOpcode::kJSCallWithSpread:
+#if V8_ENABLE_WEBASSEMBLY
+    case IrOpcode::kJSWasmCall:
+#endif  // V8_ENABLE_WEBASSEMBLY
 
     // Misc operations
+    case IrOpcode::kJSAsyncFunctionAwait:
     case IrOpcode::kJSAsyncFunctionEnter:
     case IrOpcode::kJSAsyncFunctionReject:
     case IrOpcode::kJSAsyncFunctionResolve:
+    case IrOpcode::kJSDetachContextCell:
     case IrOpcode::kJSForInEnumerate:
     case IrOpcode::kJSForInNext:
     case IrOpcode::kJSStackCheck:
     case IrOpcode::kJSDebugger:
     case IrOpcode::kJSGetSuperConstructor:
+    case IrOpcode::kJSFindNonDefaultConstructorOrConstruct:
     case IrOpcode::kJSBitwiseNot:
     case IrOpcode::kJSDecrement:
     case IrOpcode::kJSIncrement:
@@ -239,9 +263,12 @@ bool OperatorProperties::HasFrameStateInput(const Operator* op) {
     case IrOpcode::kJSPerformPromiseThen:
     case IrOpcode::kJSObjectIsArray:
     case IrOpcode::kJSRegExpTest:
+    case IrOpcode::kJSGetImportMeta:
+    case IrOpcode::kJSStoreContext:
 
     // Iterator protocol operations
     case IrOpcode::kJSGetIterator:
+    case IrOpcode::kJSForOfNext:
       return true;
 
     default:

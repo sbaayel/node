@@ -12,7 +12,7 @@ const methods = [
 
 const bench = createBenchmark(main, {
   method: methods,
-  n: [1e6]
+  n: [1e6],
 });
 
 function usingRestAndSpread(...args) {
@@ -34,8 +34,6 @@ function usingPredefined() {
 function main({ n, method, args }) {
   let fn;
   switch (method) {
-    // '' is a default case for tests
-    case '':
     case 'restAndSpread':
       fn = usingRestAndSpread;
       break;

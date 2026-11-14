@@ -3,7 +3,11 @@
 // found in the LICENSE file.
 
 // Flags: --allow-natives-syntax --expose-gc --turbo-inline-array-builtins
-// Flags: --opt --no-always-opt
+// Flags: --turbofan --no-lazy-feedback-allocation
+
+// TODO(v8:10195): Fix these tests s.t. we assert deoptimization occurs when
+// expected (e.g. in a %DeoptimizeNow call), then remove
+// --no-lazy-feedback-allocation.
 
 var a = [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,0,0];
 var b = [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25];
@@ -579,8 +583,8 @@ var c = [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25];
   species_breakage();
   a.constructor = {};
   a.constructor[Symbol.species] = function() {};
-  species_breakage();
   assertUnoptimized(species_breakage);
+  species_breakage();
   assertEquals(24, result);
 })();
 

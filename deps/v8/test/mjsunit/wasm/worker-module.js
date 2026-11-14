@@ -2,9 +2,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-// Flags: --wasm-shared-engine --no-wasm-disable-structured-cloning
-
-load("test/mjsunit/wasm/wasm-module-builder.js");
+d8.file.execute("test/mjsunit/wasm/wasm-module-builder.js");
 
 (function TestPostModule() {
   let builder = new WasmModuleBuilder();
@@ -14,8 +12,8 @@ load("test/mjsunit/wasm/wasm-module-builder.js");
 
   let module = builder.toModule();
 
-  let workerScript = `
-    onmessage = function(module) {
+  function workerCode() {
+    onmessage = function({data:module}) {
       try {
         let instance = new WebAssembly.Instance(module);
         let result = instance.exports.add(40, 2);
@@ -24,9 +22,9 @@ load("test/mjsunit/wasm/wasm-module-builder.js");
         postMessage('ERROR: ' + e);
       }
     }
-  `;
+  }
 
-  let worker = new Worker(workerScript, {type: 'string'});
+  let worker = new Worker(workerCode, {type: 'function'});
   worker.postMessage(module);
   assertEquals(42, worker.getMessage());
   worker.terminate();

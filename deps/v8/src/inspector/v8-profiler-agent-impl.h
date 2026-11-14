@@ -15,13 +15,12 @@
 namespace v8 {
 class CpuProfiler;
 class Isolate;
-}
+}  // namespace v8
 
 namespace v8_inspector {
 
 class V8InspectorSessionImpl;
 
-using protocol::Maybe;
 using protocol::Response;
 
 class V8ProfilerAgentImpl : public protocol::Profiler::Backend {
@@ -29,6 +28,8 @@ class V8ProfilerAgentImpl : public protocol::Profiler::Backend {
   V8ProfilerAgentImpl(V8InspectorSessionImpl*, protocol::FrontendChannel*,
                       protocol::DictionaryValue* state);
   ~V8ProfilerAgentImpl() override;
+  V8ProfilerAgentImpl(const V8ProfilerAgentImpl&) = delete;
+  V8ProfilerAgentImpl& operator=(const V8ProfilerAgentImpl&) = delete;
 
   bool enabled() const { return m_enabled; }
   void restore();
@@ -39,24 +40,23 @@ class V8ProfilerAgentImpl : public protocol::Profiler::Backend {
   Response start() override;
   Response stop(std::unique_ptr<protocol::Profiler::Profile>*) override;
 
-  Response startPreciseCoverage(Maybe<bool> binary,
-                                Maybe<bool> detailed) override;
+  Response startPreciseCoverage(std::optional<bool> binary,
+                                std::optional<bool> detailed,
+                                std::optional<bool> allow_triggered_updates,
+                                double* out_timestamp) override;
   Response stopPreciseCoverage() override;
   Response takePreciseCoverage(
       std::unique_ptr<protocol::Array<protocol::Profiler::ScriptCoverage>>*
-          out_result) override;
+          out_result,
+      double* out_timestamp) override;
   Response getBestEffortCoverage(
       std::unique_ptr<protocol::Array<protocol::Profiler::ScriptCoverage>>*
           out_result) override;
 
-  Response startTypeProfile() override;
-  Response stopTypeProfile() override;
-  Response takeTypeProfile(
-      std::unique_ptr<protocol::Array<protocol::Profiler::ScriptTypeProfile>>*
-          out_result) override;
-
   void consoleProfile(const String16& title);
   void consoleProfileEnd(const String16& title);
+
+  void triggerPreciseCoverageDeltaUpdate(const String16& occasion);
 
  private:
   String16 nextProfileId();
@@ -76,8 +76,6 @@ class V8ProfilerAgentImpl : public protocol::Profiler::Backend {
   std::vector<ProfileDescriptor> m_startedProfiles;
   String16 m_frontendInitiatedProfileId;
   int m_startedProfilesCount = 0;
-
-  DISALLOW_COPY_AND_ASSIGN(V8ProfilerAgentImpl);
 };
 
 }  // namespace v8_inspector

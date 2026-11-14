@@ -3,7 +3,11 @@
 // found in the LICENSE file.
 
 // Flags: --allow-natives-syntax --expose-gc --turbo-inline-array-builtins
-// Flags: --opt --no-always-opt
+// Flags: --turbofan --no-lazy-feedback-allocation
+
+// TODO(v8:10195): Fix these tests s.t. we assert deoptimization occurs when
+// expected (e.g. in a %DeoptimizeNow call), then remove
+// --no-lazy-feedback-allocation.
 
 // Unknown field access leads to soft-deopt unrelated to filter, should still
 // lead to correct result.
@@ -507,7 +511,7 @@
   species_breakage();
   a.constructor = {};
   a.constructor[Symbol.species] = function() {};
-  species_breakage();
   assertUnoptimized(species_breakage);
+  species_breakage();
   assertEquals(24, result);
 })();

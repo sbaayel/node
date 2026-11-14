@@ -6,10 +6,8 @@
 #define V8_COMPILER_ZONE_STATS_H_
 
 #include <map>
-#include <set>
 #include <vector>
 
-#include "src/common/globals.h"
 #include "src/zone/zone.h"
 
 namespace v8 {
@@ -18,11 +16,34 @@ namespace compiler {
 
 class V8_EXPORT_PRIVATE ZoneStats final {
  public:
-  class Scope final {
+  class V8_NODISCARD Scope final {
    public:
-    explicit Scope(ZoneStats* zone_stats, const char* zone_name)
-        : zone_name_(zone_name), zone_stats_(zone_stats), zone_(nullptr) {}
+    explicit Scope(ZoneStats* zone_stats, const char* zone_name,
+                   bool support_zone_compression = false)
+        : zone_name_(zone_name),
+          zone_stats_(zone_stats),
+          zone_(nullptr),
+          support_zone_compression_(support_zone_compression) {}
     ~Scope() { Destroy(); }
+
+    Scope(const Scope&) = delete;
+    Scope(Scope&& other) V8_NOEXCEPT
+        : zone_name_(other.zone_name_),
+          zone_stats_(other.zone_stats_),
+          zone_(nullptr),
+          support_zone_compression_(other.support_zone_compression_) {
+      std::swap(zone_, other.zone_);
+    }
+    Scope& operator=(const Scope&) = delete;
+    Scope& operator=(Scope&& other) V8_NOEXCEPT {
+      Destroy();
+      zone_name_ = other.zone_name_;
+      zone_stats_ = other.zone_stats_;
+      support_zone_compression_ = other.support_zone_compression_;
+      DCHECK_NULL(zone_);
+      std::swap(zone_, other.zone_);
+      return *this;
+    }
 
     Zone* zone() {
       if (zone_ == nullptr) zone_ = zone_stats_->NewEmptyZone(zone_name_);
@@ -37,15 +58,17 @@ class V8_EXPORT_PRIVATE ZoneStats final {
 
    private:
     const char* zone_name_;
-    ZoneStats* const zone_stats_;
+    ZoneStats* zone_stats_;
     Zone* zone_;
-    DISALLOW_COPY_AND_ASSIGN(Scope);
+    bool support_zone_compression_;
   };
 
-  class V8_EXPORT_PRIVATE StatsScope final {
+  class V8_EXPORT_PRIVATE V8_NODISCARD StatsScope final {
    public:
     explicit StatsScope(ZoneStats* zone_stats);
     ~StatsScope();
+    StatsScope(const StatsScope&) = delete;
+    StatsScope& operator=(const StatsScope&) = delete;
 
     size_t GetMaxAllocatedBytes();
     size_t GetCurrentAllocatedBytes();
@@ -61,12 +84,12 @@ class V8_EXPORT_PRIVATE ZoneStats final {
     InitialValues initial_values_;
     size_t total_allocated_bytes_at_start_;
     size_t max_allocated_bytes_;
-
-    DISALLOW_COPY_AND_ASSIGN(StatsScope);
   };
 
   explicit ZoneStats(AccountingAllocator* allocator);
   ~ZoneStats();
+  ZoneStats(const ZoneStats&) = delete;
+  ZoneStats& operator=(const ZoneStats&) = delete;
 
   size_t GetMaxAllocatedBytes() const;
   size_t GetTotalAllocatedBytes() const;
@@ -85,8 +108,6 @@ class V8_EXPORT_PRIVATE ZoneStats final {
   size_t max_allocated_bytes_;
   size_t total_deleted_bytes_;
   AccountingAllocator* allocator_;
-
-  DISALLOW_COPY_AND_ASSIGN(ZoneStats);
 };
 
 }  // namespace compiler

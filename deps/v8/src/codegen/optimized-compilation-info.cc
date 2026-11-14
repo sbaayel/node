@@ -5,6 +5,7 @@
 #include "src/codegen/optimized-compilation-info.h"
 
 #include "src/api/api.h"
+#include "src/builtins/builtins.h"
 #include "src/codegen/source-position.h"
 #include "src/debug/debug.h"
 #include "src/execution/isolate.h"
@@ -12,119 +13,143 @@
 #include "src/objects/shared-function-info.h"
 #include "src/tracing/trace-event.h"
 #include "src/tracing/traced-value.h"
+
+#if V8_ENABLE_WEBASSEMBLY
 #include "src/wasm/function-compiler.h"
+#endif  // V8_ENABLE_WEBASSEMBLY
 
 namespace v8 {
 namespace internal {
 
 OptimizedCompilationInfo::OptimizedCompilationInfo(
-    Zone* zone, Isolate* isolate, Handle<SharedFunctionInfo> shared,
-    Handle<JSFunction> closure)
-    : OptimizedCompilationInfo(Code::OPTIMIZED_FUNCTION, zone) {
+    Zone* zone, Isolate* isolate, IndirectHandle<SharedFunctionInfo> shared,
+    IndirectHandle<JSFunction> closure, CodeKind code_kind,
+    BytecodeOffset osr_offset)
+    : isolate_unsafe_(isolate),
+      code_kind_(code_kind),
+      osr_offset_(osr_offset),
+      zone_(zone),
+      optimization_id_(isolate->NextOptimizationId()) {
   DCHECK_EQ(*shared, closure->shared());
   DCHECK(shared->is_compiled());
-  bytecode_array_ = handle(shared->GetBytecodeArray(), isolate);
+  DCHECK_IMPLIES(is_osr(), IsOptimizing());
+  // TODO(dmercadier): get the BytecodeArray from a trusted place rather than
+  // from the SharedFunctionInfo.
+  bytecode_array_ = handle(shared->GetBytecodeArray(isolate), isolate);
+
   shared_info_ = shared;
   closure_ = closure;
-  optimization_id_ = isolate->NextOptimizationId();
+  canonical_handles_ = std::make_unique<CanonicalHandlesMap>(
+      isolate->heap(), ZoneAllocationPolicy(zone));
 
   // Collect source positions for optimized code when profiling or if debugger
   // is active, to be able to get more precise source positions at the price of
   // more memory consumption.
   if (isolate->NeedsDetailedOptimizedCodeLineInfo()) {
-    MarkAsSourcePositionsEnabled();
+    // We might not have source positions if collection fails (e.g. because we
+    // run out of stack space).
+    if (bytecode_array_->HasSourcePositionTable()) {
+      set_source_positions();
+    }
   }
 
-  SetTracingFlags(shared->PassesFilter(FLAG_trace_turbo_filter));
+  SetTracingFlags(shared->PassesFilter(v8_flags.trace_turbo_filter));
+  ConfigureFlags();
+
+  if (isolate->node_observer()) {
+    SetNodeObserver(isolate->node_observer());
+  }
 }
 
 OptimizedCompilationInfo::OptimizedCompilationInfo(
-    Vector<const char> debug_name, Zone* zone, Code::Kind code_kind)
-    : OptimizedCompilationInfo(code_kind, zone) {
-  debug_name_ = debug_name;
-
+    base::Vector<const char> debug_name, Zone* zone, CodeKind code_kind,
+    Builtin builtin)
+    : isolate_unsafe_(nullptr),
+      code_kind_(code_kind),
+      builtin_(builtin),
+      zone_(zone),
+      optimization_id_(kNoOptimizationId),
+      debug_name_(debug_name.begin(), debug_name.end()) {
+  DCHECK_IMPLIES(builtin_ != Builtin::kNoBuiltinId,
+                 (code_kind_ == CodeKind::BUILTIN ||
+                  code_kind_ == CodeKind::BYTECODE_HANDLER));
   SetTracingFlags(
-      PassesFilter(debug_name, CStrVector(FLAG_trace_turbo_filter)));
-}
-
-OptimizedCompilationInfo::OptimizedCompilationInfo(Code::Kind code_kind,
-                                                   Zone* zone)
-    : code_kind_(code_kind), zone_(zone) {
+      PassesFilter(debug_name, base::CStrVector(v8_flags.trace_turbo_filter)));
   ConfigureFlags();
+  DCHECK(!has_shared_info());
 }
 
 void OptimizedCompilationInfo::ConfigureFlags() {
-  if (FLAG_untrusted_code_mitigations) SetFlag(kUntrustedCodeMitigations);
+  if (v8_flags.turbo_inline_js_wasm_calls) set_inline_js_wasm_calls();
 
-  switch (code_kind_) {
-    case Code::OPTIMIZED_FUNCTION:
-      SetFlag(kCalledWithCodeStartRegister);
-      SetFlag(kSwitchJumpTableEnabled);
-      if (FLAG_function_context_specialization) {
-        MarkAsFunctionContextSpecializing();
-      }
-      if (FLAG_turbo_splitting) {
-        MarkAsSplittingEnabled();
-      }
-      if (FLAG_untrusted_code_mitigations) {
-        MarkAsPoisoningRegisterArguments();
-      }
-      if (FLAG_analyze_environment_liveness) {
-        // TODO(yangguo): Disable this in case of debugging for crbug.com/826613
-        MarkAsAnalyzeEnvironmentLiveness();
-      }
-      break;
-    case Code::BYTECODE_HANDLER:
-      SetFlag(kCalledWithCodeStartRegister);
-      if (FLAG_turbo_splitting) {
-        MarkAsSplittingEnabled();
-      }
-      break;
-    case Code::BUILTIN:
-    case Code::STUB:
-      if (FLAG_turbo_splitting) {
-        MarkAsSplittingEnabled();
-      }
-#if ENABLE_GDB_JIT_INTERFACE && DEBUG
-      MarkAsSourcePositionsEnabled();
-#endif  // ENABLE_GDB_JIT_INTERFACE && DEBUG
-      break;
-    case Code::WASM_FUNCTION:
-    case Code::WASM_TO_CAPI_FUNCTION:
-      SetFlag(kSwitchJumpTableEnabled);
-      break;
-    default:
-      break;
+  if (v8_flags.cet_compatible) {
+    set_shadow_stack_compliant_lazy_deopt();
   }
 
-  if (FLAG_turbo_control_flow_aware_allocation) {
-    MarkAsTurboControlFlowAwareAllocation();
-  } else {
-    MarkAsTurboPreprocessRanges();
+  switch (code_kind_) {
+    case CodeKind::TURBOFAN_JS:
+      set_called_with_code_start_register();
+      set_switch_jump_table();
+      if (v8_flags.analyze_environment_liveness) {
+        set_analyze_environment_liveness();
+      }
+      if (v8_flags.turbo_splitting) set_splitting();
+      break;
+    case CodeKind::BYTECODE_HANDLER:
+      set_called_with_code_start_register();
+#ifdef V8_ENABLE_BUILTIN_JUMP_TABLE_SWITCH
+      set_switch_jump_table();
+#endif  // V8_ENABLE_BUILTIN_JUMP_TABLE_SWITCH
+      if (v8_flags.turbo_splitting) set_splitting();
+      if (v8_flags.enable_allocation_folding) set_allocation_folding();
+      break;
+    case CodeKind::BUILTIN:
+#ifdef V8_ENABLE_BUILTIN_JUMP_TABLE_SWITCH
+      set_switch_jump_table();
+#endif  // V8_ENABLE_BUILTIN_JUMP_TABLE_SWITCH
+      [[fallthrough]];
+    case CodeKind::FOR_TESTING:
+    case CodeKind::FOR_TESTING_JS:
+      if (v8_flags.turbo_splitting) set_splitting();
+      if (v8_flags.enable_allocation_folding) set_allocation_folding();
+#if ENABLE_GDB_JIT_INTERFACE && DEBUG
+      set_source_positions();
+#endif  // ENABLE_GDB_JIT_INTERFACE && DEBUG
+      break;
+    case CodeKind::WASM_FUNCTION:
+    case CodeKind::WASM_TO_CAPI_FUNCTION:
+      set_switch_jump_table();
+      break;
+    case CodeKind::C_WASM_ENTRY:
+    case CodeKind::JS_TO_WASM_FUNCTION:
+    case CodeKind::WASM_TO_JS_FUNCTION:
+    case CodeKind::WASM_STACK_ENTRY:
+      break;
+    case CodeKind::BASELINE:
+    case CodeKind::MAGLEV:
+    case CodeKind::INTERPRETED_FUNCTION:
+    case CodeKind::REGEXP:
+      UNREACHABLE();
   }
 }
 
 OptimizedCompilationInfo::~OptimizedCompilationInfo() {
-  if (GetFlag(kDisableFutureOptimization) && has_shared_info()) {
-    shared_info()->DisableOptimization(bailout_reason());
+  if (disable_future_optimization() && has_shared_info()) {
+    DCHECK_NOT_NULL(isolate_unsafe_);
+    shared_info()->DisableOptimization(isolate_unsafe_, bailout_reason());
   }
 }
 
-void OptimizedCompilationInfo::set_deferred_handles(
-    std::unique_ptr<DeferredHandles> deferred_handles) {
-  DCHECK_NULL(deferred_handles_);
-  deferred_handles_ = std::move(deferred_handles);
-}
-
-void OptimizedCompilationInfo::ReopenHandlesInNewHandleScope(Isolate* isolate) {
+void OptimizedCompilationInfo::ReopenAndCanonicalizeHandlesInNewScope(
+    Isolate* isolate) {
   if (!shared_info_.is_null()) {
-    shared_info_ = Handle<SharedFunctionInfo>(*shared_info_, isolate);
+    shared_info_ = CanonicalHandle(*shared_info_, isolate);
   }
   if (!bytecode_array_.is_null()) {
-    bytecode_array_ = Handle<BytecodeArray>(*bytecode_array_, isolate);
+    bytecode_array_ = CanonicalHandle(*bytecode_array_, isolate);
   }
   if (!closure_.is_null()) {
-    closure_ = Handle<JSFunction>(*closure_, isolate);
+    closure_ = CanonicalHandle(*closure_, isolate);
   }
   DCHECK(code_.is_null());
 }
@@ -132,76 +157,79 @@ void OptimizedCompilationInfo::ReopenHandlesInNewHandleScope(Isolate* isolate) {
 void OptimizedCompilationInfo::AbortOptimization(BailoutReason reason) {
   DCHECK_NE(reason, BailoutReason::kNoReason);
   if (bailout_reason_ == BailoutReason::kNoReason) {
-    TRACE_EVENT_INSTANT2(TRACE_DISABLED_BY_DEFAULT("v8.compile"),
-                         "V8.AbortOptimization", TRACE_EVENT_SCOPE_THREAD,
-                         "reason", GetBailoutReason(reason), "function",
-                         shared_info()->TraceIDRef());
     bailout_reason_ = reason;
   }
-  SetFlag(kDisableFutureOptimization);
+  if (IsTerminalBailoutReasonForTurbofan(reason)) {
+    set_disable_future_optimization();
+  }
 }
 
 void OptimizedCompilationInfo::RetryOptimization(BailoutReason reason) {
   DCHECK_NE(reason, BailoutReason::kNoReason);
-  if (GetFlag(kDisableFutureOptimization)) return;
-  TRACE_EVENT_INSTANT2(TRACE_DISABLED_BY_DEFAULT("v8.compile"),
-                       "V8.RetryOptimization", TRACE_EVENT_SCOPE_THREAD,
-                       "reason", GetBailoutReason(reason), "function",
-                       shared_info()->TraceIDRef());
+  if (disable_future_optimization()) return;
   bailout_reason_ = reason;
 }
 
 std::unique_ptr<char[]> OptimizedCompilationInfo::GetDebugName() const {
   if (!shared_info().is_null()) {
-    return shared_info()->DebugName().ToCString();
+    return shared_info()->DebugNameCStr();
   }
-  Vector<const char> name_vec = debug_name_;
-  if (name_vec.empty()) name_vec = ArrayVector("unknown");
-  std::unique_ptr<char[]> name(new char[name_vec.length() + 1]);
-  memcpy(name.get(), name_vec.begin(), name_vec.length());
-  name[name_vec.length()] = '\0';
+  const std::string& name_str = debug_name_.empty() ? "unknown" : debug_name_;
+  std::unique_ptr<char[]> name(new char[name_str.length() + 1]);
+  memcpy(name.get(), name_str.c_str(), name_str.length() + 1);
   return name;
 }
 
 StackFrame::Type OptimizedCompilationInfo::GetOutputStackFrameType() const {
   switch (code_kind()) {
-    case Code::STUB:
-    case Code::BYTECODE_HANDLER:
-    case Code::BUILTIN:
+    case CodeKind::FOR_TESTING:
+    case CodeKind::FOR_TESTING_JS:
+    case CodeKind::BYTECODE_HANDLER:
+    case CodeKind::BUILTIN:
       return StackFrame::STUB;
-    case Code::WASM_FUNCTION:
-      return StackFrame::WASM_COMPILED;
-    case Code::WASM_TO_CAPI_FUNCTION:
+#if V8_ENABLE_WEBASSEMBLY
+    case CodeKind::WASM_FUNCTION:
+      return StackFrame::WASM;
+    case CodeKind::WASM_TO_CAPI_FUNCTION:
       return StackFrame::WASM_EXIT;
-    case Code::JS_TO_WASM_FUNCTION:
+    case CodeKind::JS_TO_WASM_FUNCTION:
       return StackFrame::JS_TO_WASM;
-    case Code::WASM_TO_JS_FUNCTION:
+    case CodeKind::WASM_TO_JS_FUNCTION:
       return StackFrame::WASM_TO_JS;
-    case Code::WASM_INTERPRETER_ENTRY:
-      return StackFrame::WASM_INTERPRETER_ENTRY;
-    case Code::C_WASM_ENTRY:
+    case CodeKind::C_WASM_ENTRY:
       return StackFrame::C_WASM_ENTRY;
-    default:
+    case CodeKind::WASM_STACK_ENTRY:
+      return StackFrame::WASM_STACK_ENTRY;
+#else
+    case CodeKind::WASM_FUNCTION:
+    case CodeKind::WASM_TO_CAPI_FUNCTION:
+    case CodeKind::JS_TO_WASM_FUNCTION:
+    case CodeKind::WASM_TO_JS_FUNCTION:
+    case CodeKind::C_WASM_ENTRY:
+    case CodeKind::WASM_STACK_ENTRY:
+      UNREACHABLE();
+#endif  // V8_ENABLE_WEBASSEMBLY
+
+    case CodeKind::REGEXP:
+    case CodeKind::INTERPRETED_FUNCTION:
+    case CodeKind::BASELINE:
+    case CodeKind::MAGLEV:
+    case CodeKind::TURBOFAN_JS:
       UNIMPLEMENTED();
-      return StackFrame::NONE;
   }
+  UNREACHABLE();
 }
 
-void OptimizedCompilationInfo::SetWasmCompilationResult(
-    std::unique_ptr<wasm::WasmCompilationResult> wasm_compilation_result) {
-  wasm_compilation_result_ = std::move(wasm_compilation_result);
-}
-
-std::unique_ptr<wasm::WasmCompilationResult>
-OptimizedCompilationInfo::ReleaseWasmCompilationResult() {
-  return std::move(wasm_compilation_result_);
+void OptimizedCompilationInfo::SetCode(IndirectHandle<Code> code) {
+  DCHECK_EQ(code->kind(), code_kind());
+  code_ = code;
 }
 
 bool OptimizedCompilationInfo::has_context() const {
   return !closure().is_null();
 }
 
-Context OptimizedCompilationInfo::context() const {
+Tagged<Context> OptimizedCompilationInfo::context() const {
   DCHECK(has_context());
   return closure()->context();
 }
@@ -210,7 +238,7 @@ bool OptimizedCompilationInfo::has_native_context() const {
   return !closure().is_null() && !closure()->native_context().is_null();
 }
 
-NativeContext OptimizedCompilationInfo::native_context() const {
+Tagged<NativeContext> OptimizedCompilationInfo::native_context() const {
   DCHECK(has_native_context());
   return closure()->native_context();
 }
@@ -219,14 +247,14 @@ bool OptimizedCompilationInfo::has_global_object() const {
   return has_native_context();
 }
 
-JSGlobalObject OptimizedCompilationInfo::global_object() const {
+Tagged<JSGlobalObject> OptimizedCompilationInfo::global_object() const {
   DCHECK(has_global_object());
-  return native_context().global_object();
+  return native_context()->global_object();
 }
 
 int OptimizedCompilationInfo::AddInlinedFunction(
-    Handle<SharedFunctionInfo> inlined_function,
-    Handle<BytecodeArray> inlined_bytecode, SourcePosition pos) {
+    IndirectHandle<SharedFunctionInfo> inlined_function,
+    IndirectHandle<BytecodeArray> inlined_bytecode, SourcePosition pos) {
   int id = static_cast<int>(inlined_functions_.size());
   inlined_functions_.push_back(
       InlinedFunctionHolder(inlined_function, inlined_bytecode, pos));
@@ -235,48 +263,25 @@ int OptimizedCompilationInfo::AddInlinedFunction(
 
 void OptimizedCompilationInfo::SetTracingFlags(bool passes_filter) {
   if (!passes_filter) return;
-  if (FLAG_trace_turbo) SetFlag(kTraceTurboJson);
-  if (FLAG_trace_turbo_graph) SetFlag(kTraceTurboGraph);
-  if (FLAG_trace_turbo_scheduled) SetFlag(kTraceTurboScheduled);
-  if (FLAG_trace_turbo_alloc) SetFlag(kTraceTurboAllocation);
-  if (FLAG_trace_heap_broker) SetFlag(kTraceHeapBroker);
+  if (v8_flags.trace_turbo) set_trace_turbo_json();
+  if (v8_flags.trace_turbo_graph) set_trace_turbo_graph();
+  if (v8_flags.trace_turbo_scheduled) set_trace_turbo_scheduled();
+  if (v8_flags.trace_turbo_alloc) set_trace_turbo_allocation();
+  if (v8_flags.trace_heap_broker) set_trace_heap_broker();
+  if (v8_flags.turboshaft_trace_reduction) set_turboshaft_trace_reduction();
+}
+
+void OptimizedCompilationInfo::mark_cancelled() {
+  was_cancelled_.store(true, std::memory_order_relaxed);
 }
 
 OptimizedCompilationInfo::InlinedFunctionHolder::InlinedFunctionHolder(
-    Handle<SharedFunctionInfo> inlined_shared_info,
-    Handle<BytecodeArray> inlined_bytecode, SourcePosition pos)
+    IndirectHandle<SharedFunctionInfo> inlined_shared_info,
+    IndirectHandle<BytecodeArray> inlined_bytecode, SourcePosition pos)
     : shared_info(inlined_shared_info), bytecode_array(inlined_bytecode) {
   position.position = pos;
   // initialized when generating the deoptimization literals
   position.inlined_function_id = DeoptimizationData::kNotInlinedIndex;
-}
-
-std::unique_ptr<v8::tracing::TracedValue>
-OptimizedCompilationInfo::ToTracedValue() {
-  auto value = v8::tracing::TracedValue::Create();
-  value->SetBoolean("osr", is_osr());
-  value->SetBoolean("functionContextSpecialized",
-                    is_function_context_specializing());
-  if (has_shared_info()) {
-    value->SetValue("function", shared_info()->TraceIDRef());
-  }
-  if (bailout_reason() != BailoutReason::kNoReason) {
-    value->SetString("bailoutReason", GetBailoutReason(bailout_reason()));
-    value->SetBoolean("disableFutureOptimization",
-                      is_disable_future_optimization());
-  } else {
-    value->SetInteger("optimizationId", optimization_id());
-    value->BeginArray("inlinedFunctions");
-    for (auto const& inlined_function : inlined_functions()) {
-      value->BeginDictionary();
-      value->SetValue("function", inlined_function.shared_info->TraceIDRef());
-      // TODO(bmeurer): Also include the source position from the
-      // {inlined_function} here as dedicated "sourcePosition" field.
-      value->EndDictionary();
-    }
-    value->EndArray();
-  }
-  return value;
 }
 
 }  // namespace internal

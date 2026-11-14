@@ -6,17 +6,21 @@
 #define V8_DEBUG_INTERFACE_TYPES_H_
 
 #include <cstdint>
-#include <string>
-#include <vector>
 
-#include "include/v8.h"
-#include "src/common/globals.h"
+#include "include/cppgc/garbage-collected.h"
+#include "include/v8-function-callback.h"
+#include "include/v8-isolate.h"
+#include "include/v8-local-handle.h"
+#include "src/base/logging.h"
+#include "src/base/macros.h"
 
 namespace v8 {
 
+class String;
+
 namespace internal {
 class BuiltinArguments;
-}  // internal
+}  // namespace internal
 
 namespace debug {
 
@@ -42,41 +46,14 @@ class V8_EXPORT_PRIVATE Location {
   bool is_empty_;
 };
 
-/**
- * The result of disassembling a wasm function.
- * Consists of the disassembly string and an offset table mapping wasm byte
- * offsets to line and column in the disassembly.
- * The offset table entries are ordered by the byte_offset.
- * All numbers are 0-based.
- */
-struct WasmDisassemblyOffsetTableEntry {
-  WasmDisassemblyOffsetTableEntry(uint32_t byte_offset, int line, int column)
-      : byte_offset(byte_offset), line(line), column(column) {}
-
-  uint32_t byte_offset;
-  int line;
-  int column;
-};
-
-struct WasmDisassembly {
-  using OffsetTable = std::vector<WasmDisassemblyOffsetTableEntry>;
-  WasmDisassembly() = default;
-  WasmDisassembly(std::string disassembly, OffsetTable offset_table)
-      : disassembly(std::move(disassembly)),
-        offset_table(std::move(offset_table)) {}
-
-  std::string disassembly;
-  OffsetTable offset_table;
-};
-
 enum DebugAsyncActionType {
+  kDebugAwait,
   kDebugPromiseThen,
   kDebugPromiseCatch,
   kDebugPromiseFinally,
   kDebugWillHandle,
   kDebugDidHandle,
-  kAsyncFunctionSuspended,
-  kAsyncFunctionFinished
+  kDebugStackTraceCaptured
 };
 
 enum BreakLocationType {
@@ -100,14 +77,10 @@ enum class CoverageMode {
   // precise binary coverage resets counters for incremental updates.
   kPreciseBinary,
   // Similar to the precise coverage modes but provides coverage at a
-  // lower granularity. Design doc: goo.gl/lA2swZ.
+  // lower granularity. Design doc:
+  // https://docs.google.com/document/d/1wCydi2HEZRF0skDeLb6CH0abZnTyVo5Vz5u-jhwi7es
   kBlockCount,
   kBlockBinary,
-};
-
-enum class TypeProfileMode {
-  kNone,
-  kCollect,
 };
 
 class V8_EXPORT_PRIVATE BreakLocation : public Location {
@@ -121,15 +94,30 @@ class V8_EXPORT_PRIVATE BreakLocation : public Location {
   BreakLocationType type_;
 };
 
-class ConsoleCallArguments : private v8::FunctionCallbackInfo<v8::Value> {
+class ConsoleCallArguments {
  public:
-  int Length() const { return v8::FunctionCallbackInfo<v8::Value>::Length(); }
-  V8_INLINE Local<Value> operator[](int i) const {
-    return v8::FunctionCallbackInfo<v8::Value>::operator[](i);
+  int Length() const { return length_; }
+  /**
+   * Accessor for the available arguments. Returns `undefined` if the index
+   * is out of bounds.
+   */
+  V8_INLINE v8::Local<v8::Value> operator[](int i) const {
+    // values_ points to the first argument.
+    if (i < 0 || length_ <= i) return Undefined(GetIsolate());
+    DCHECK_NOT_NULL(values_);
+    return Local<Value>::FromSlot(values_ + i);
   }
 
+  V8_INLINE v8::Isolate* GetIsolate() const { return isolate_; }
+
   explicit ConsoleCallArguments(const v8::FunctionCallbackInfo<v8::Value>&);
-  explicit ConsoleCallArguments(const internal::BuiltinArguments&);
+  explicit ConsoleCallArguments(internal::Isolate* isolate,
+                                const internal::BuiltinArguments&);
+
+ private:
+  v8::Isolate* isolate_;
+  internal::Address* values_;
+  int length_;
 };
 
 class ConsoleContext {
@@ -145,7 +133,7 @@ class ConsoleContext {
   v8::Local<v8::String> name_;
 };
 
-class ConsoleDelegate {
+class V8_EXPORT_PRIVATE ConsoleDelegate : public cppgc::GarbageCollectedMixin {
  public:
   virtual void Debug(const ConsoleCallArguments& args,
                      const ConsoleContext& context) {}
@@ -191,6 +179,7 @@ class ConsoleDelegate {
                        const ConsoleContext& context) {}
   virtual void TimeStamp(const ConsoleCallArguments& args,
                          const ConsoleContext& context) {}
+  void Trace(cppgc::Visitor* visitor) const override {}
   virtual ~ConsoleDelegate() = default;
 };
 

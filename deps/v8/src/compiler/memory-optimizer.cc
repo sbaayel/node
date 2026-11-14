@@ -4,11 +4,11 @@
 
 #include "src/compiler/memory-optimizer.h"
 
-#include "src/codegen/interface-descriptors.h"
+#include "src/base/logging.h"
 #include "src/codegen/tick-counter.h"
+#include "src/compiler/common-operator.h"
 #include "src/compiler/js-graph.h"
 #include "src/compiler/linkage.h"
-#include "src/compiler/node-matchers.h"
 #include "src/compiler/node-properties.h"
 #include "src/compiler/node.h"
 #include "src/roots/roots-inl.h"
@@ -21,42 +21,51 @@ namespace {
 
 bool CanAllocate(const Node* node) {
   switch (node->opcode()) {
+    case IrOpcode::kAbortCSADcheck:
     case IrOpcode::kBitcastTaggedToWord:
     case IrOpcode::kBitcastWordToTagged:
-    case IrOpcode::kChangeCompressedToTagged:
-    case IrOpcode::kChangeCompressedSignedToTaggedSigned:
-    case IrOpcode::kChangeCompressedPointerToTaggedPointer:
-    case IrOpcode::kChangeTaggedToCompressed:
-    case IrOpcode::kChangeTaggedSignedToCompressedSigned:
-    case IrOpcode::kChangeTaggedPointerToCompressedPointer:
+    case IrOpcode::kCheckTurboshaftTypeOf:
     case IrOpcode::kComment:
-    case IrOpcode::kAbortCSAAssert:
     case IrOpcode::kDebugBreak:
     case IrOpcode::kDeoptimizeIf:
     case IrOpcode::kDeoptimizeUnless:
     case IrOpcode::kEffectPhi:
     case IrOpcode::kIfException:
     case IrOpcode::kLoad:
+    case IrOpcode::kLoadImmutable:
     case IrOpcode::kLoadElement:
     case IrOpcode::kLoadField:
     case IrOpcode::kLoadFromObject:
-    case IrOpcode::kPoisonedLoad:
-    case IrOpcode::kProtectedLoad:
-    case IrOpcode::kProtectedStore:
+    case IrOpcode::kLoadImmutableFromObject:
+    case IrOpcode::kMemoryBarrier:
+    case IrOpcode::kTrappingLoad:
+    case IrOpcode::kLoadTrapOnNull:
+    case IrOpcode::kTrappingStore:
+    case IrOpcode::kStoreTrapOnNull:
     case IrOpcode::kRetain:
-    // TODO(tebbi): Store nodes might do a bump-pointer allocation.
+    case IrOpcode::kStackPointerGreaterThan:
+#if V8_ENABLE_WEBASSEMBLY
+    case IrOpcode::kLoadLane:
+    case IrOpcode::kLoadTransform:
+    case IrOpcode::kStoreLane:
+    case IrOpcode::kLoadStackPointer:
+    case IrOpcode::kSetStackPointer:
+#endif  // V8_ENABLE_WEBASSEMBLY
+    case IrOpcode::kStaticAssert:
+    // TODO(turbofan): Store nodes might do a bump-pointer allocation.
     //              We should introduce a special bump-pointer store node to
     //              differentiate that.
     case IrOpcode::kStore:
     case IrOpcode::kStoreElement:
     case IrOpcode::kStoreField:
     case IrOpcode::kStoreToObject:
-    case IrOpcode::kTaggedPoisonOnSpeculation:
+    case IrOpcode::kTraceInstruction:
+    case IrOpcode::kInitializeImmutableInObject:
+    case IrOpcode::kTrapIf:
+    case IrOpcode::kTrapUnless:
     case IrOpcode::kUnalignedLoad:
     case IrOpcode::kUnalignedStore:
-    case IrOpcode::kUnsafePointerAdd:
     case IrOpcode::kUnreachable:
-    case IrOpcode::kStaticAssert:
     case IrOpcode::kWord32AtomicAdd:
     case IrOpcode::kWord32AtomicAnd:
     case IrOpcode::kWord32AtomicCompareExchange:
@@ -75,7 +84,6 @@ bool CanAllocate(const Node* node) {
     case IrOpcode::kWord32AtomicStore:
     case IrOpcode::kWord32AtomicSub:
     case IrOpcode::kWord32AtomicXor:
-    case IrOpcode::kWord32PoisonOnSpeculation:
     case IrOpcode::kWord64AtomicAdd:
     case IrOpcode::kWord64AtomicAnd:
     case IrOpcode::kWord64AtomicCompareExchange:
@@ -85,7 +93,6 @@ bool CanAllocate(const Node* node) {
     case IrOpcode::kWord64AtomicStore:
     case IrOpcode::kWord64AtomicSub:
     case IrOpcode::kWord64AtomicXor:
-    case IrOpcode::kWord64PoisonOnSpeculation:
       return false;
 
     case IrOpcode::kCall:
@@ -181,11 +188,14 @@ void WriteBarrierAssertFailed(Node* node, Node* object, const char* name,
 }  // namespace
 
 MemoryOptimizer::MemoryOptimizer(
-    JSGraph* jsgraph, Zone* zone, PoisoningMitigationLevel poisoning_level,
+    JSHeapBroker* broker, JSGraph* jsgraph, Zone* zone,
     MemoryLowering::AllocationFolding allocation_folding,
-    const char* function_debug_name, TickCounter* tick_counter)
-    : memory_lowering_(jsgraph, zone, poisoning_level, allocation_folding,
-                       WriteBarrierAssertFailed, function_debug_name),
+    const char* function_debug_name, TickCounter* tick_counter, bool is_wasm)
+    : graph_assembler_(broker, jsgraph, zone, BranchSemantics::kMachine),
+      memory_lowering_(jsgraph, zone, &graph_assembler_, is_wasm,
+                       allocation_folding, WriteBarrierAssertFailed,
+                       function_debug_name),
+      wasm_address_reassociation_(jsgraph, zone),
       jsgraph_(jsgraph),
       empty_state_(AllocationState::Empty(zone)),
       pending_(zone),
@@ -194,18 +204,22 @@ MemoryOptimizer::MemoryOptimizer(
       tick_counter_(tick_counter) {}
 
 void MemoryOptimizer::Optimize() {
-  EnqueueUses(graph()->start(), empty_state());
+  EnqueueUses(graph()->start(), empty_state(), graph()->start()->id());
   while (!tokens_.empty()) {
     Token const token = tokens_.front();
     tokens_.pop();
-    VisitNode(token.node, token.state);
+    VisitNode(token.node, token.state, token.effect_chain);
+  }
+  if (v8_flags.turbo_wasm_address_reassociation) {
+    wasm_address_reassociation()->Optimize();
   }
   DCHECK(pending_.empty());
   DCHECK(tokens_.empty());
 }
 
-void MemoryOptimizer::VisitNode(Node* node, AllocationState const* state) {
-  tick_counter_->DoTick();
+void MemoryOptimizer::VisitNode(Node* node, AllocationState const* state,
+                                NodeId effect_chain) {
+  tick_counter_->TickAndMaybeEnterSafepoint();
   DCHECK(!node->IsDead());
   DCHECK_LT(0, node->op()->EffectInputCount());
   switch (node->opcode()) {
@@ -214,27 +228,36 @@ void MemoryOptimizer::VisitNode(Node* node, AllocationState const* state) {
       // linearization.
       UNREACHABLE();
     case IrOpcode::kAllocateRaw:
-      return VisitAllocateRaw(node, state);
+      return VisitAllocateRaw(node, state, effect_chain);
     case IrOpcode::kCall:
-      return VisitCall(node, state);
+      return VisitCall(node, state, effect_chain);
     case IrOpcode::kLoadFromObject:
-      return VisitLoadFromObject(node, state);
+    case IrOpcode::kLoadImmutableFromObject:
+      return VisitLoadFromObject(node, state, effect_chain);
     case IrOpcode::kLoadElement:
-      return VisitLoadElement(node, state);
+      return VisitLoadElement(node, state, effect_chain);
     case IrOpcode::kLoadField:
-      return VisitLoadField(node, state);
+      return VisitLoadField(node, state, effect_chain);
+    case IrOpcode::kTrappingLoad:
+      return VisitTrappingLoad(node, state, effect_chain);
+    case IrOpcode::kTrappingStore:
+      return VisitTrappingStore(node, state, effect_chain);
     case IrOpcode::kStoreToObject:
-      return VisitStoreToObject(node, state);
+    case IrOpcode::kInitializeImmutableInObject:
+      return VisitStoreToObject(node, state, effect_chain);
     case IrOpcode::kStoreElement:
-      return VisitStoreElement(node, state);
+      return VisitStoreElement(node, state, effect_chain);
     case IrOpcode::kStoreField:
-      return VisitStoreField(node, state);
+      return VisitStoreField(node, state, effect_chain);
     case IrOpcode::kStore:
-      return VisitStore(node, state);
+      return VisitStore(node, state, effect_chain);
+    case IrOpcode::kStorePair:
+      // Store pairing should happen after this pass.
+      UNREACHABLE();
     default:
       if (!CanAllocate(node)) {
         // These operations cannot trigger GC.
-        return VisitOtherEffect(node, state);
+        return VisitOtherEffect(node, state, effect_chain);
       }
   }
   DCHECK_EQ(0, node->op()->EffectOutputCount());
@@ -242,21 +265,6 @@ void MemoryOptimizer::VisitNode(Node* node, AllocationState const* state) {
 
 bool MemoryOptimizer::AllocationTypeNeedsUpdateToOld(Node* const node,
                                                      const Edge edge) {
-  if (COMPRESS_POINTERS_BOOL && IrOpcode::IsCompressOpcode(node->opcode())) {
-    // In Pointer Compression we might have a Compress node between an
-    // AllocateRaw and the value used as input. This case is trickier since we
-    // have to check all of the Compress node edges to test for a StoreField.
-    for (Edge const new_edge : node->use_edges()) {
-      if (AllocationTypeNeedsUpdateToOld(new_edge.from(), new_edge)) {
-        return true;
-      }
-    }
-
-    // If we arrived here, we tested all the edges of the Compress node and
-    // didn't find it necessary to update the AllocationType.
-    return false;
-  }
-
   // Test to see if we need to update the AllocationType.
   if (node->opcode() == IrOpcode::kStoreField && edge.index() == 1) {
     Node* parent = node->InputAt(0);
@@ -269,8 +277,17 @@ bool MemoryOptimizer::AllocationTypeNeedsUpdateToOld(Node* const node,
   return false;
 }
 
-void MemoryOptimizer::VisitAllocateRaw(Node* node,
-                                       AllocationState const* state) {
+void MemoryOptimizer::ReplaceUsesAndKillNode(Node* node, Node* replacement) {
+  // Replace all uses of node and kill the node to make sure we don't leave
+  // dangling dead uses.
+  DCHECK_NE(replacement, node);
+  NodeProperties::ReplaceUses(node, replacement, graph_assembler_.effect(),
+                              graph_assembler_.control());
+  node->Kill();
+}
+
+void MemoryOptimizer::VisitAllocateRaw(Node* node, AllocationState const* state,
+                                       NodeId effect_chain) {
   DCHECK_EQ(IrOpcode::kAllocateRaw, node->opcode());
   const AllocateParameters& allocation = AllocateParametersOf(node->op());
   AllocationType allocation_type = allocation.allocation_type();
@@ -284,14 +301,6 @@ void MemoryOptimizer::VisitAllocateRaw(Node* node,
       Node* const user = edge.from();
       if (user->opcode() == IrOpcode::kStoreField && edge.index() == 0) {
         Node* child = user->InputAt(1);
-        // In Pointer Compression we might have a Compress node between an
-        // AllocateRaw and the value used as input. If so, we need to update
-        // child to point to the StoreField.
-        if (COMPRESS_POINTERS_BOOL &&
-            IrOpcode::IsCompressOpcode(child->opcode())) {
-          child = child->InputAt(0);
-        }
-
         if (child->opcode() == IrOpcode::kAllocateRaw &&
             AllocationTypeOf(child->op()) == AllocationType::kYoung) {
           NodeProperties::ChangeOp(child, node->op());
@@ -310,69 +319,121 @@ void MemoryOptimizer::VisitAllocateRaw(Node* node,
     }
   }
 
-  memory_lowering()->ReduceAllocateRaw(
-      node, allocation_type, allocation.allow_large_objects(), &state);
-  EnqueueUses(state->effect(), state);
+  Reduction reduction =
+      memory_lowering()->ReduceAllocateRaw(node, allocation_type, &state);
+  CHECK(reduction.Changed() && reduction.replacement() != node);
+
+  ReplaceUsesAndKillNode(node, reduction.replacement());
+
+  EnqueueUses(state->effect(), state, effect_chain);
 }
 
 void MemoryOptimizer::VisitLoadFromObject(Node* node,
-                                          AllocationState const* state) {
-  DCHECK_EQ(IrOpcode::kLoadFromObject, node->opcode());
-  memory_lowering()->ReduceLoadFromObject(node);
-  EnqueueUses(node, state);
+                                          AllocationState const* state,
+                                          NodeId effect_chain) {
+  DCHECK(node->opcode() == IrOpcode::kLoadFromObject ||
+         node->opcode() == IrOpcode::kLoadImmutableFromObject);
+  Reduction reduction = memory_lowering()->ReduceLoadFromObject(node);
+  EnqueueUses(node, state, effect_chain);
+  if (V8_MAP_PACKING_BOOL && reduction.replacement() != node) {
+    ReplaceUsesAndKillNode(node, reduction.replacement());
+  }
 }
 
 void MemoryOptimizer::VisitStoreToObject(Node* node,
-                                         AllocationState const* state) {
-  DCHECK_EQ(IrOpcode::kStoreToObject, node->opcode());
+                                         AllocationState const* state,
+                                         NodeId effect_chain) {
+  DCHECK(node->opcode() == IrOpcode::kStoreToObject ||
+         node->opcode() == IrOpcode::kInitializeImmutableInObject);
   memory_lowering()->ReduceStoreToObject(node, state);
-  EnqueueUses(node, state);
+  EnqueueUses(node, state, effect_chain);
 }
 
-void MemoryOptimizer::VisitLoadElement(Node* node,
-                                       AllocationState const* state) {
+void MemoryOptimizer::VisitLoadElement(Node* node, AllocationState const* state,
+                                       NodeId effect_chain) {
   DCHECK_EQ(IrOpcode::kLoadElement, node->opcode());
   memory_lowering()->ReduceLoadElement(node);
-  EnqueueUses(node, state);
+  EnqueueUses(node, state, effect_chain);
 }
 
-void MemoryOptimizer::VisitLoadField(Node* node, AllocationState const* state) {
+void MemoryOptimizer::VisitLoadField(Node* node, AllocationState const* state,
+                                     NodeId effect_chain) {
   DCHECK_EQ(IrOpcode::kLoadField, node->opcode());
-  memory_lowering()->ReduceLoadField(node);
-  EnqueueUses(node, state);
+  Reduction reduction = memory_lowering()->ReduceLoadField(node);
+  DCHECK(reduction.Changed());
+  // In case of replacement, the replacement graph should not require futher
+  // lowering, so we can proceed iterating the graph from the node uses.
+  EnqueueUses(node, state, effect_chain);
+
+  // Node can be replaced under two cases:
+  //   1. V8_ENABLE_SANDBOX is true and loading an external pointer value.
+  //   2. V8_MAP_PACKING_BOOL is enabled.
+  DCHECK_IMPLIES(!V8_ENABLE_SANDBOX_BOOL && !V8_MAP_PACKING_BOOL,
+                 reduction.replacement() == node);
+  if ((V8_ENABLE_SANDBOX_BOOL || V8_MAP_PACKING_BOOL) &&
+      reduction.replacement() != node) {
+    ReplaceUsesAndKillNode(node, reduction.replacement());
+  }
+}
+
+void MemoryOptimizer::VisitTrappingLoad(Node* node,
+                                        AllocationState const* state,
+                                        NodeId effect_chain) {
+  DCHECK_EQ(IrOpcode::kTrappingLoad, node->opcode());
+  if (v8_flags.turbo_wasm_address_reassociation) {
+    wasm_address_reassociation()->VisitTrappingMemOp(node, effect_chain);
+    EnqueueUses(node, state, effect_chain);
+  } else {
+    VisitOtherEffect(node, state, effect_chain);
+  }
+}
+
+void MemoryOptimizer::VisitTrappingStore(Node* node,
+                                         AllocationState const* state,
+                                         NodeId effect_chain) {
+  DCHECK_EQ(IrOpcode::kTrappingStore, node->opcode());
+  if (v8_flags.turbo_wasm_address_reassociation) {
+    wasm_address_reassociation()->VisitTrappingMemOp(node, effect_chain);
+    EnqueueUses(node, state, effect_chain);
+  } else {
+    VisitOtherEffect(node, state, effect_chain);
+  }
 }
 
 void MemoryOptimizer::VisitStoreElement(Node* node,
-                                        AllocationState const* state) {
+                                        AllocationState const* state,
+                                        NodeId effect_chain) {
   DCHECK_EQ(IrOpcode::kStoreElement, node->opcode());
   memory_lowering()->ReduceStoreElement(node, state);
-  EnqueueUses(node, state);
+  EnqueueUses(node, state, effect_chain);
 }
 
-void MemoryOptimizer::VisitStoreField(Node* node,
-                                      AllocationState const* state) {
+void MemoryOptimizer::VisitStoreField(Node* node, AllocationState const* state,
+                                      NodeId effect_chain) {
   DCHECK_EQ(IrOpcode::kStoreField, node->opcode());
   memory_lowering()->ReduceStoreField(node, state);
-  EnqueueUses(node, state);
+  EnqueueUses(node, state, effect_chain);
 }
-void MemoryOptimizer::VisitStore(Node* node, AllocationState const* state) {
+void MemoryOptimizer::VisitStore(Node* node, AllocationState const* state,
+                                 NodeId effect_chain) {
   DCHECK_EQ(IrOpcode::kStore, node->opcode());
   memory_lowering()->ReduceStore(node, state);
-  EnqueueUses(node, state);
+  EnqueueUses(node, state, effect_chain);
 }
 
-void MemoryOptimizer::VisitCall(Node* node, AllocationState const* state) {
+void MemoryOptimizer::VisitCall(Node* node, AllocationState const* state,
+                                NodeId effect_chain) {
   DCHECK_EQ(IrOpcode::kCall, node->opcode());
   // If the call can allocate, we start with a fresh state.
   if (!(CallDescriptorOf(node->op())->flags() & CallDescriptor::kNoAllocate)) {
     state = empty_state();
   }
-  EnqueueUses(node, state);
+  EnqueueUses(node, state, effect_chain);
 }
 
-void MemoryOptimizer::VisitOtherEffect(Node* node,
-                                       AllocationState const* state) {
-  EnqueueUses(node, state);
+void MemoryOptimizer::VisitOtherEffect(Node* node, AllocationState const* state,
+                                       NodeId effect_chain) {
+  EnqueueUses(node, state, effect_chain);
 }
 
 MemoryOptimizer::AllocationState const* MemoryOptimizer::MergeStates(
@@ -404,6 +465,7 @@ MemoryOptimizer::AllocationState const* MemoryOptimizer::MergeStates(
 void MemoryOptimizer::EnqueueMerge(Node* node, int index,
                                    AllocationState const* state) {
   DCHECK_EQ(IrOpcode::kEffectPhi, node->opcode());
+  NodeId effect_chain = node->id();
   int const input_count = node->InputCount() - 1;
   DCHECK_LT(0, input_count);
   Node* const control = node->InputAt(input_count);
@@ -412,11 +474,11 @@ void MemoryOptimizer::EnqueueMerge(Node* node, int index,
       if (CanLoopAllocate(node, zone())) {
         // If the loop can allocate,  we start with an empty state at the
         // beginning.
-        EnqueueUses(node, empty_state());
+        EnqueueUses(node, empty_state(), effect_chain);
       } else {
         // If the loop cannot allocate, we can just propagate the state from
         // before the loop.
-        EnqueueUses(node, state);
+        EnqueueUses(node, state, effect_chain);
       }
     } else {
       // Do not revisit backedges.
@@ -438,34 +500,36 @@ void MemoryOptimizer::EnqueueMerge(Node* node, int index,
       // input constraints, drop the pending merge and enqueue uses of the
       // EffectPhi {node}.
       state = MergeStates(it->second);
-      EnqueueUses(node, state);
+      EnqueueUses(node, state, effect_chain);
       pending_.erase(it);
     }
   }
 }
 
-void MemoryOptimizer::EnqueueUses(Node* node, AllocationState const* state) {
+void MemoryOptimizer::EnqueueUses(Node* node, AllocationState const* state,
+                                  NodeId effect_chain) {
   for (Edge const edge : node->use_edges()) {
     if (NodeProperties::IsEffectEdge(edge)) {
-      EnqueueUse(edge.from(), edge.index(), state);
+      EnqueueUse(edge.from(), edge.index(), state, effect_chain);
     }
   }
 }
 
 void MemoryOptimizer::EnqueueUse(Node* node, int index,
-                                 AllocationState const* state) {
+                                 AllocationState const* state,
+                                 NodeId effect_chain) {
   if (node->opcode() == IrOpcode::kEffectPhi) {
     // An EffectPhi represents a merge of different effect chains, which
     // needs special handling depending on whether the merge is part of a
     // loop or just a normal control join.
     EnqueueMerge(node, index, state);
   } else {
-    Token token = {node, state};
+    Token token = {node, state, effect_chain};
     tokens_.push(token);
   }
 }
 
-Graph* MemoryOptimizer::graph() const { return jsgraph()->graph(); }
+TFGraph* MemoryOptimizer::graph() const { return jsgraph()->graph(); }
 
 }  // namespace compiler
 }  // namespace internal

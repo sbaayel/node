@@ -7,13 +7,16 @@
 
 #include <cstdint>
 
-#include "src/base/functional.h"
+#include "include/v8config.h"
 
 namespace v8 {
-namespace internal {
 
+namespace base {
 template <typename T>
 class Vector;
+}  // namespace base
+
+namespace internal {
 
 class V8_EXPORT Version {
  public:
@@ -24,16 +27,13 @@ class V8_EXPORT Version {
   static int GetPatch() { return patch_; }
   static const char* GetEmbedder() { return embedder_; }
   static bool IsCandidate() { return candidate_; }
-  static uint32_t Hash() {
-    return static_cast<uint32_t>(
-        base::hash_combine(major_, minor_, build_, patch_));
-  }
+  static uint32_t Hash();
 
   // Calculate the V8 version string.
-  static void GetString(Vector<char> str);
+  static void GetString(base::Vector<char> str);
 
   // Calculate the SONAME for the V8 shared library.
-  static void GetSONAME(Vector<char> str);
+  static void GetSONAME(base::Vector<char> str);
 
   static const char* GetVersion() { return version_string_; }
 
@@ -52,6 +52,7 @@ class V8_EXPORT Version {
   friend void SetVersion(int major, int minor, int build, int patch,
                          const char* embedder, bool candidate,
                          const char* soname);
+  friend class ScopedVersionEmbedderString;
 };
 
 }  // namespace internal

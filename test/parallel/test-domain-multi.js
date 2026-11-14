@@ -19,6 +19,8 @@
 // OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
 // USE OR OTHER DEALINGS IN THE SOFTWARE.
 
+// Flags: --no-deprecation
+
 'use strict';
 // Tests of multiple domains happening at once.
 
@@ -26,12 +28,14 @@ const common = require('../common');
 const domain = require('domain');
 const http = require('http');
 
+process.on('warning', common.mustNotCall());
+
 const a = domain.create();
 a.enter(); // This will be our "root" domain
 
 a.on('error', common.mustNotCall());
 
-const server = http.createServer((req, res) => {
+const server = http.createServer(common.mustCallAtLeast((req, res) => {
   // child domain of a.
   const b = domain.create();
   a.add(b);
@@ -44,8 +48,9 @@ const server = http.createServer((req, res) => {
 
   b.on('error', common.mustCall((er) => {
     if (res) {
-      res.writeHead(500);
-      res.end('An error occurred');
+      // Introduce an error on the client by writing unexpected data.
+      // The client is now expecting a chunk header so any letter will have the parser throw an error.
+      res.socket.write('H');
     }
     // res.writeHead(500), res.destroy, etc.
     server.close();
@@ -58,7 +63,7 @@ const server = http.createServer((req, res) => {
     throw new Error('this kills domain B, not A');
   }));
 
-}).listen(0, () => {
+})).listen(0, common.mustCall(() => {
   const c = domain.create();
   const req = http.get({ host: 'localhost', port: server.address().port });
 
@@ -71,5 +76,5 @@ const server = http.createServer((req, res) => {
     res.pipe(process.stdout);
   });
 
-  c.on('error', common.mustCall((er) => { }));
-});
+  c.on('error', common.mustCall());
+}));

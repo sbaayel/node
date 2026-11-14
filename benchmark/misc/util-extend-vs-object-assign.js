@@ -5,14 +5,10 @@ const util = require('util');
 
 const bench = common.createBenchmark(main, {
   type: ['extend', 'assign'],
-  n: [10e4]
+  n: [10e4],
 });
 
 function main({ n, type }) {
-  // Default value for tests.
-  if (type === '')
-    type = 'extend';
-
   let fn;
   if (type === 'extend') {
     fn = util._extend;

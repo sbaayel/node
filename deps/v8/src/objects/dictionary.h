@@ -5,9 +5,12 @@
 #ifndef V8_OBJECTS_DICTIONARY_H_
 #define V8_OBJECTS_DICTIONARY_H_
 
+#include <optional>
+
 #include "src/base/export-template.h"
 #include "src/common/globals.h"
 #include "src/objects/hash-table.h"
+#include "src/objects/objects.h"
 #include "src/objects/property-array.h"
 #include "src/objects/smi.h"
 #include "src/roots/roots.h"
@@ -15,13 +18,14 @@
 // Has to be the last include (doesn't have include guards):
 #include "src/objects/object-macros.h"
 
-namespace v8 {
-namespace internal {
+namespace v8::internal {
 
-template <typename T>
-class Handle;
-
-class Isolate;
+#ifdef V8_ENABLE_SWISS_NAME_DICTIONARY
+class SwissNameDictionary;
+using PropertyDictionary = SwissNameDictionary;
+#else
+using PropertyDictionary = NameDictionary;
+#endif
 
 template <typename Derived, typename Shape>
 class EXPORT_TEMPLATE_DECLARE(V8_EXPORT_PRIVATE) Dictionary
@@ -29,84 +33,151 @@ class EXPORT_TEMPLATE_DECLARE(V8_EXPORT_PRIVATE) Dictionary
   using DerivedHashTable = HashTable<Derived, Shape>;
 
  public:
-  using Key = typename Shape::Key;
-  // Returns the value at entry.
-  inline Object ValueAt(int entry);
-  inline Object ValueAt(Isolate* isolate, int entry);
+  using TodoShape = Shape;
+  using Key = typename TodoShape::Key;
+  inline Tagged<Object> ValueAt(InternalIndex entry);
+  inline Tagged<Object> ValueAt(InternalIndex entry, SeqCstAccessTag);
+  // Returns {} if we would be reading out of the bounds of the object.
+  inline std::optional<Tagged<Object>> TryValueAt(InternalIndex entry);
 
   // Set the value for entry.
-  inline void ValueAtPut(int entry, Object value);
+  inline void ValueAtPut(
+      InternalIndex entry, Tagged<Object> value,
+      WriteBarrierMode write_barrier_mode = UPDATE_WRITE_BARRIER);
+  inline void ValueAtPut(InternalIndex entry, Tagged<Object> value,
+                         SeqCstAccessTag);
+
+  // Swap the value for the entry.
+  inline Tagged<Object> ValueAtSwap(InternalIndex entry, Tagged<Object> value,
+                                    SeqCstAccessTag);
+
+  // Compare and swap the value for the entry.
+  inline Tagged<Object> ValueAtCompareAndSwap(InternalIndex entry,
+                                              Tagged<Object> expected,
+                                              Tagged<Object> value,
+                                              SeqCstAccessTag);
 
   // Returns the property details for the property at entry.
-  inline PropertyDetails DetailsAt(int entry);
+  inline PropertyDetails DetailsAt(InternalIndex entry);
 
   // Set the details for entry.
-  inline void DetailsAtPut(Isolate* isolate, int entry, PropertyDetails value);
+  inline void DetailsAtPut(InternalIndex entry, PropertyDetails value);
+
+  static const bool kIsOrderedDictionaryType = false;
 
   // Delete a property from the dictionary.
-  V8_WARN_UNUSED_RESULT static Handle<Derived> DeleteEntry(
-      Isolate* isolate, Handle<Derived> dictionary, int entry);
+  template <template <typename> typename HandleType>
+    requires(std::is_convertible_v<HandleType<Derived>, DirectHandle<Derived>>)
+  V8_WARN_UNUSED_RESULT static HandleType<Derived> DeleteEntry(
+      Isolate* isolate, HandleType<Derived> dictionary, InternalIndex entry);
 
   // Attempt to shrink the dictionary after deletion of key.
-  V8_WARN_UNUSED_RESULT static inline Handle<Derived> Shrink(
-      Isolate* isolate, Handle<Derived> dictionary) {
+  template <template <typename> typename HandleType>
+  V8_WARN_UNUSED_RESULT static inline HandleType<Derived> Shrink(
+      Isolate* isolate, HandleType<Derived> dictionary)
+    requires(std::is_convertible_v<HandleType<Derived>, DirectHandle<Derived>>)
+  {
     return DerivedHashTable::Shrink(isolate, dictionary);
   }
 
   int NumberOfEnumerableProperties();
 
-#ifdef OBJECT_PRINT
-  // For our gdb macros, we should perhaps change these in the future.
-  void Print();
-
-  void Print(std::ostream& os);  // NOLINT
-#endif
   // Returns the key (slow).
-  Object SlowReverseLookup(Object value);
+  Tagged<Object> SlowReverseLookup(Tagged<Object> value);
+
+  inline void ClearEntry(InternalIndex entry);
 
   // Sets the entry to (key, value) pair.
-  inline void ClearEntry(Isolate* isolate, int entry);
-  inline void SetEntry(Isolate* isolate, int entry, Object key, Object value,
-                       PropertyDetails details);
+  inline void SetEntry(InternalIndex entry, Tagged<Object> key,
+                       Tagged<Object> value, PropertyDetails details);
+  inline void SetEntry(InternalIndex entry, Tagged<Object> key,
+                       Tagged<Object> value, PropertyDetails details,
+                       WriteBarrierMode mode,
+                       const DisallowGarbageCollection& no_gc);
 
-  V8_WARN_UNUSED_RESULT static Handle<Derived> Add(
-      Isolate* isolate, Handle<Derived> dictionary, Key key,
-      Handle<Object> value, PropertyDetails details, int* entry_out = nullptr);
+  // Garbage collection support.
+  inline ObjectSlot RawFieldOfValueAt(InternalIndex entry);
+
+  template <typename IsolateT, template <typename> typename HandleType,
+            AllocationType key_allocation = std::is_same_v<IsolateT, Isolate>
+                                                ? AllocationType::kYoung
+                                                : AllocationType::kOld>
+    requires(std::is_convertible_v<HandleType<Derived>, DirectHandle<Derived>>)
+  V8_WARN_UNUSED_RESULT static HandleType<Derived> Add(
+      IsolateT* isolate, HandleType<Derived> dictionary, Key key,
+      DirectHandle<Object> value, PropertyDetails details,
+      InternalIndex* entry_out = nullptr);
+
+  // This method is only safe to use when it is guaranteed that the dictionary
+  // doesn't need to grow.
+  // The number of elements stored is not updated. Use
+  // |SetInitialNumberOfElements| to update the number in one go.
+  template <typename IsolateT, template <typename> typename HandleType,
+            AllocationType key_allocation = std::is_same_v<IsolateT, Isolate>
+                                                ? AllocationType::kYoung
+                                                : AllocationType::kOld>
+    requires(std::is_convertible_v<HandleType<Derived>, DirectHandle<Derived>>)
+  static void UncheckedAdd(IsolateT* isolate, HandleType<Derived> dictionary,
+                           Key key, DirectHandle<Object> value,
+                           PropertyDetails details);
+
+  static Handle<Derived> ShallowCopy(
+      Isolate* isolate, DirectHandle<Derived> dictionary,
+      AllocationType allocation = AllocationType::kYoung);
 
  protected:
   // Generic at put operation.
-  V8_WARN_UNUSED_RESULT static Handle<Derived> AtPut(Isolate* isolate,
-                                                     Handle<Derived> dictionary,
-                                                     Key key,
-                                                     Handle<Object> value,
-                                                     PropertyDetails details);
-
-  OBJECT_CONSTRUCTORS(Dictionary, HashTable<Derived, Shape>);
+  template <template <typename> typename HandleType>
+    requires(std::is_convertible_v<HandleType<Derived>, DirectHandle<Derived>>)
+  V8_WARN_UNUSED_RESULT static auto AtPut(Isolate* isolate,
+                                          HandleType<Derived> dictionary,
+                                          Key key, DirectHandle<Object> value,
+                                          PropertyDetails details);
+  static void UncheckedAtPut(Isolate* isolate, DirectHandle<Derived> dictionary,
+                             Key key, DirectHandle<Object> value,
+                             PropertyDetails details);
 };
+
+#define EXTERN_DECLARE_DICTIONARY(DERIVED, SHAPE)                  \
+  EXTERN_DECLARE_HASH_TABLE(DERIVED, SHAPE)                        \
+  extern template class EXPORT_TEMPLATE_DECLARE(V8_EXPORT_PRIVATE) \
+      Dictionary<DERIVED, SHAPE>;
 
 template <typename Key>
 class BaseDictionaryShape : public BaseShape<Key> {
  public:
   static const bool kHasDetails = true;
   template <typename Dictionary>
-  static inline PropertyDetails DetailsAt(Dictionary dict, int entry);
+  static inline PropertyDetails DetailsAt(Tagged<Dictionary> dict,
+                                          InternalIndex entry);
 
   template <typename Dictionary>
-  static inline void DetailsAtPut(Isolate* isolate, Dictionary dict, int entry,
+  static inline void DetailsAtPut(Tagged<Dictionary> dict, InternalIndex entry,
                                   PropertyDetails value);
+  static const bool kDoHashSpreading = false;
+  static const uint32_t kHashBits = 0;
 };
 
-class NameDictionaryShape : public BaseDictionaryShape<Handle<Name>> {
+class BaseNameDictionaryShape : public BaseDictionaryShape<DirectHandle<Name>> {
  public:
-  static inline bool IsMatch(Handle<Name> key, Object other);
-  static inline uint32_t Hash(Isolate* isolate, Handle<Name> key);
-  static inline uint32_t HashForObject(ReadOnlyRoots roots, Object object);
-  static inline Handle<Object> AsHandle(Isolate* isolate, Handle<Name> key);
-  static inline RootIndex GetMapRootIndex();
-  static const int kPrefixSize = 2;
-  static const int kEntrySize = 3;
+  static inline bool IsMatch(DirectHandle<Name> key, Tagged<Object> other);
+  static inline uint32_t Hash(ReadOnlyRoots roots, DirectHandle<Name> key);
+  static inline uint32_t HashForObject(ReadOnlyRoots roots,
+                                       Tagged<Object> object);
+  template <AllocationType allocation = AllocationType::kYoung>
+  static inline DirectHandle<Object> AsHandle(Isolate* isolate,
+                                              DirectHandle<Name> key);
+  template <AllocationType allocation = AllocationType::kOld>
+  static inline DirectHandle<Object> AsHandle(LocalIsolate* isolate,
+                                              DirectHandle<Name> key);
   static const int kEntryValueIndex = 1;
-  static const bool kNeedsHoleCheck = false;
+};
+
+class NameDictionaryShape : public BaseNameDictionaryShape {
+ public:
+  static const int kPrefixSize = 3;
+  static const int kEntrySize = 3;
+  static const bool kMatchNeedsHoleCheck = false;
 };
 
 template <typename Derived, typename Shape>
@@ -120,133 +191,198 @@ class EXPORT_TEMPLATE_DECLARE(V8_EXPORT_PRIVATE) BaseNameDictionary
   static const int kObjectHashIndex = kNextEnumerationIndexIndex + 1;
   static const int kEntryValueIndex = 1;
 
-  // Accessors for next enumeration index.
-  inline void SetNextEnumerationIndex(int index);
-  inline int NextEnumerationIndex();
-
   inline void SetHash(int hash);
   inline int Hash() const;
 
   // Creates a new dictionary.
+  template <typename IsolateT>
   V8_WARN_UNUSED_RESULT static Handle<Derived> New(
-      Isolate* isolate, int at_least_space_for,
+      IsolateT* isolate, int at_least_space_for,
       AllocationType allocation = AllocationType::kYoung,
       MinimumCapacity capacity_option = USE_DEFAULT_MINIMUM_CAPACITY);
 
-  // Collect the keys into the given KeyAccumulator, in ascending chronological
-  // order of property creation.
-  V8_WARN_UNUSED_RESULT static ExceptionStatus CollectKeysTo(
-      Handle<Derived> dictionary, KeyAccumulator* keys);
+  // Allocate the next enumeration index. Possibly updates all enumeration
+  // indices in the table.
+  static int NextEnumerationIndex(Isolate* isolate,
+                                  DirectHandle<Derived> dictionary);
+  // Accessors for next enumeration index.
+  inline int next_enumeration_index();
+  inline void set_next_enumeration_index(int index);
 
   // Return the key indices sorted by its enumeration index.
-  static Handle<FixedArray> IterationIndices(Isolate* isolate,
-                                             Handle<Derived> dictionary);
+  static DirectHandle<FixedArray> IterationIndices(
+      Isolate* isolate, DirectHandle<Derived> dictionary);
 
-  // Copies enumerable keys to preallocated fixed array.
-  // Does not throw for uninitialized exports in module namespace objects, so
-  // this has to be checked separately.
-  static void CopyEnumKeysTo(Isolate* isolate, Handle<Derived> dictionary,
-                             Handle<FixedArray> storage, KeyCollectionMode mode,
-                             KeyAccumulator* accumulator);
+  template <typename IsolateT, template <typename> typename HandleType>
+    requires(std::is_convertible_v<HandleType<Derived>, DirectHandle<Derived>>)
+  V8_WARN_UNUSED_RESULT static HandleType<Derived>
+  AddNoUpdateNextEnumerationIndex(IsolateT* isolate,
+                                  HandleType<Derived> dictionary, Key key,
+                                  DirectHandle<Object> value,
+                                  PropertyDetails details,
+                                  InternalIndex* entry_out = nullptr);
 
-  // Ensure enough space for n additional elements.
-  static Handle<Derived> EnsureCapacity(Isolate* isolate,
-                                        Handle<Derived> dictionary, int n);
+  template <template <typename> typename HandleType>
+    requires(std::is_convertible_v<HandleType<Derived>, DirectHandle<Derived>>)
+  V8_WARN_UNUSED_RESULT static HandleType<Derived>::MaybeType Add(
+      Isolate* isolate, HandleType<Derived> dictionary, Key key,
+      DirectHandle<Object> value, PropertyDetails details,
+      InternalIndex* entry_out = nullptr);
 
-  V8_WARN_UNUSED_RESULT static Handle<Derived> AddNoUpdateNextEnumerationIndex(
-      Isolate* isolate, Handle<Derived> dictionary, Key key,
-      Handle<Object> value, PropertyDetails details, int* entry_out = nullptr);
-
-  V8_WARN_UNUSED_RESULT static Handle<Derived> Add(
-      Isolate* isolate, Handle<Derived> dictionary, Key key,
-      Handle<Object> value, PropertyDetails details, int* entry_out = nullptr);
-
-  OBJECT_CONSTRUCTORS(BaseNameDictionary, Dictionary<Derived, Shape>);
+  // Exposed for NameDictionaryLookupForwardedString slow path for forwarded
+  // strings.
+  using Dictionary<Derived, Shape>::FindInsertionEntry;
 };
 
-class NameDictionary;
+class SimpleNameDictionaryShape : public BaseNameDictionaryShape {
+ public:
+  static const bool kHasDetails = false;
+  static const bool kMatchNeedsHoleCheck = false;
+  static const int kPrefixSize = 0;
+  static const int kEntrySize = 2;
 
-extern template class EXPORT_TEMPLATE_DECLARE(V8_EXPORT_PRIVATE)
-    BaseNameDictionary<NameDictionary, NameDictionaryShape>;
+  template <typename Dictionary>
+  static inline PropertyDetails DetailsAt(Tagged<Dictionary> dict,
+                                          InternalIndex entry) {
+    UNREACHABLE();
+  }
 
-class V8_EXPORT_PRIVATE NameDictionary
+  template <typename Dictionary>
+  static inline void DetailsAtPut(Tagged<Dictionary> dict, InternalIndex entry,
+                                  PropertyDetails value) {
+    UNREACHABLE();
+  }
+};
+
+EXTERN_DECLARE_DICTIONARY(SimpleNameDictionary, SimpleNameDictionaryShape)
+
+// A simple Name-to-Object dictionary.
+V8_OBJECT class SimpleNameDictionary
+    : public Dictionary<SimpleNameDictionary, SimpleNameDictionaryShape> {
+ public:
+  static inline DirectHandle<Map> GetMap(RootsTable& roots);
+
+  V8_EXPORT_PRIVATE V8_WARN_UNUSED_RESULT static Handle<SimpleNameDictionary>
+  Set(Isolate* isolate, Handle<SimpleNameDictionary> dictionary,
+      DirectHandle<Name> key, DirectHandle<Object> value);
+
+  // Exposed for NameDictionaryLookupForwardedString slow path for forwarded
+  // strings.
+  using HashTable<SimpleNameDictionary,
+                  SimpleNameDictionaryShape>::FindInsertionEntry;
+
+  static const int kEntryValueIndex = 1;
+} V8_OBJECT_END;
+
+#define EXTERN_DECLARE_BASE_NAME_DICTIONARY(DERIVED, SHAPE)        \
+  EXTERN_DECLARE_DICTIONARY(DERIVED, SHAPE)                        \
+  extern template class EXPORT_TEMPLATE_DECLARE(V8_EXPORT_PRIVATE) \
+      BaseNameDictionary<DERIVED, SHAPE>;
+
+EXTERN_DECLARE_BASE_NAME_DICTIONARY(NameDictionary, NameDictionaryShape)
+
+V8_OBJECT class V8_EXPORT_PRIVATE NameDictionary
     : public BaseNameDictionary<NameDictionary, NameDictionaryShape> {
  public:
-  DECL_CAST(NameDictionary)
+  static inline DirectHandle<Map> GetMap(RootsTable& roots);
 
+  DECL_PRINTER(NameDictionary)
+
+  static const int kFlagsIndex = kObjectHashIndex + 1;
+  static const int kEntryValueIndex = 1;
   static const int kEntryDetailsIndex = 2;
   static const int kInitialCapacity = 2;
 
-  inline Name NameAt(int entry);
-  inline Name NameAt(Isolate* isolate, int entry);
+  inline Tagged<Name> NameAt(InternalIndex entry);
 
   inline void set_hash(int hash);
   inline int hash() const;
 
-  OBJECT_CONSTRUCTORS(NameDictionary,
-                      BaseNameDictionary<NameDictionary, NameDictionaryShape>);
-};
+  // Note: Flags are stored as smi, so only 31 bits are usable.
+  using MayHaveInterestingPropertiesBit = base::BitField<bool, 0, 1, uint32_t>;
+  DECL_BOOLEAN_ACCESSORS(may_have_interesting_properties)
 
-class GlobalDictionaryShape : public NameDictionaryShape {
+  static constexpr int kFlagsDefault = 0;
+
+  inline uint32_t flags() const;
+  inline void set_flags(uint32_t flags);
+
+  // Creates a new NameDictionary.
+  template <typename IsolateT>
+  V8_WARN_UNUSED_RESULT static Handle<NameDictionary> New(
+      IsolateT* isolate, int at_least_space_for,
+      AllocationType allocation = AllocationType::kYoung,
+      MinimumCapacity capacity_option = USE_DEFAULT_MINIMUM_CAPACITY);
+} V8_OBJECT_END;
+
+class V8_EXPORT_PRIVATE GlobalDictionaryShape : public BaseNameDictionaryShape {
  public:
-  static inline bool IsMatch(Handle<Name> key, Object other);
-  static inline uint32_t HashForObject(ReadOnlyRoots roots, Object object);
+  static inline bool IsMatch(DirectHandle<Name> key, Tagged<Object> other);
+  static inline uint32_t HashForObject(ReadOnlyRoots roots,
+                                       Tagged<Object> object);
 
-  static const int kEntrySize = 1;  // Overrides NameDictionaryShape::kEntrySize
+  static const bool kMatchNeedsHoleCheck = true;
+  static const int kPrefixSize = 2;
+  static const int kEntrySize = 1;
 
   template <typename Dictionary>
-  static inline PropertyDetails DetailsAt(Dictionary dict, int entry);
+  static inline PropertyDetails DetailsAt(Tagged<Dictionary> dict,
+                                          InternalIndex entry);
 
   template <typename Dictionary>
-  static inline void DetailsAtPut(Isolate* isolate, Dictionary dict, int entry,
+  static inline void DetailsAtPut(Tagged<Dictionary> dict, InternalIndex entry,
                                   PropertyDetails value);
 
-  static inline Object Unwrap(Object key);
-  static inline bool IsKey(ReadOnlyRoots roots, Object k);
-  static inline bool IsLive(ReadOnlyRoots roots, Object key);
-  static inline RootIndex GetMapRootIndex();
+  static inline Tagged<Object> Unwrap(Tagged<Object> key);
 };
 
-class GlobalDictionary;
+EXTERN_DECLARE_BASE_NAME_DICTIONARY(GlobalDictionary, GlobalDictionaryShape)
 
-extern template class EXPORT_TEMPLATE_DECLARE(V8_EXPORT_PRIVATE)
-    BaseNameDictionary<GlobalDictionary, GlobalDictionaryShape>;
-
-class V8_EXPORT_PRIVATE GlobalDictionary
+V8_OBJECT class V8_EXPORT_PRIVATE GlobalDictionary
     : public BaseNameDictionary<GlobalDictionary, GlobalDictionaryShape> {
  public:
-  DECL_CAST(GlobalDictionary)
+  static inline DirectHandle<Map> GetMap(RootsTable& roots);
 
-  inline Object ValueAt(int entry);
-  inline Object ValueAt(Isolate* isolate, int entry);
-  inline PropertyCell CellAt(int entry);
-  inline PropertyCell CellAt(Isolate* isolate, int entry);
-  inline void SetEntry(Isolate* isolate, int entry, Object key, Object value,
-                       PropertyDetails details);
-  inline Name NameAt(int entry);
-  inline Name NameAt(Isolate* isolate, int entry);
-  inline void ValueAtPut(int entry, Object value);
+  DECL_PRINTER(GlobalDictionary)
 
-  OBJECT_CONSTRUCTORS(
-      GlobalDictionary,
-      BaseNameDictionary<GlobalDictionary, GlobalDictionaryShape>);
-};
+  inline Tagged<Object> ValueAt(InternalIndex entry);
+  inline Tagged<PropertyCell> CellAt(InternalIndex entry);
+  inline void SetEntry(InternalIndex entry, Tagged<Object> key,
+                       Tagged<Object> value, PropertyDetails details);
+  inline void SetEntry(InternalIndex entry, Tagged<Object> key,
+                       Tagged<Object> value, PropertyDetails details,
+                       WriteBarrierMode mode,
+                       const DisallowGarbageCollection& no_gc);
+  inline void ClearEntry(InternalIndex entry);
+  inline Tagged<Name> NameAt(InternalIndex entry);
+  inline void ValueAtPut(InternalIndex entry, Tagged<Object> value);
+
+  std::optional<Tagged<PropertyCell>>
+  TryFindPropertyCellForConcurrentLookupIterator(Isolate* isolate,
+                                                 DirectHandle<Name> name,
+                                                 RelaxedLoadTag tag);
+} V8_OBJECT_END;
 
 class NumberDictionaryBaseShape : public BaseDictionaryShape<uint32_t> {
  public:
-  static inline bool IsMatch(uint32_t key, Object other);
-  static inline Handle<Object> AsHandle(Isolate* isolate, uint32_t key);
+  static inline bool IsMatch(uint32_t key, Tagged<Object> other);
+  template <AllocationType allocation = AllocationType::kYoung>
+  static inline DirectHandle<Object> AsHandle(Isolate* isolate, uint32_t key);
+  template <AllocationType allocation = AllocationType::kOld>
+  static inline DirectHandle<Object> AsHandle(LocalIsolate* isolate,
+                                              uint32_t key);
 
-  static inline uint32_t Hash(Isolate* isolate, uint32_t key);
-  static inline uint32_t HashForObject(ReadOnlyRoots roots, Object object);
+  static inline uint32_t Hash(ReadOnlyRoots roots, uint32_t key);
+  static inline uint32_t HashForObject(ReadOnlyRoots roots,
+                                       Tagged<Object> object);
+
+  static const bool kMatchNeedsHoleCheck = true;
 };
 
 class NumberDictionaryShape : public NumberDictionaryBaseShape {
  public:
   static const int kPrefixSize = 1;
   static const int kEntrySize = 3;
-
-  static inline RootIndex GetMapRootIndex();
 };
 
 class SimpleNumberDictionaryShape : public NumberDictionaryBaseShape {
@@ -256,68 +392,69 @@ class SimpleNumberDictionaryShape : public NumberDictionaryBaseShape {
   static const int kEntrySize = 2;
 
   template <typename Dictionary>
-  static inline PropertyDetails DetailsAt(Dictionary dict, int entry) {
+  static inline PropertyDetails DetailsAt(Tagged<Dictionary> dict,
+                                          InternalIndex entry) {
     UNREACHABLE();
   }
 
   template <typename Dictionary>
-  static inline void DetailsAtPut(Isolate* isolate, Dictionary dict, int entry,
+  static inline void DetailsAtPut(Tagged<Dictionary> dict, InternalIndex entry,
                                   PropertyDetails value) {
     UNREACHABLE();
   }
-
-  static inline RootIndex GetMapRootIndex();
 };
 
-extern template class EXPORT_TEMPLATE_DECLARE(V8_EXPORT_PRIVATE)
-    HashTable<SimpleNumberDictionary, SimpleNumberDictionaryShape>;
-
-extern template class EXPORT_TEMPLATE_DECLARE(V8_EXPORT_PRIVATE)
-    Dictionary<SimpleNumberDictionary, SimpleNumberDictionaryShape>;
+EXTERN_DECLARE_DICTIONARY(SimpleNumberDictionary, SimpleNumberDictionaryShape)
 
 // SimpleNumberDictionary is used to map number to an entry.
-class SimpleNumberDictionary
+V8_OBJECT class SimpleNumberDictionary
     : public Dictionary<SimpleNumberDictionary, SimpleNumberDictionaryShape> {
  public:
-  DECL_CAST(SimpleNumberDictionary)
+  static inline DirectHandle<Map> GetMap(RootsTable& roots);
+
   // Type specific at put (default NONE attributes is used when adding).
-  V8_WARN_UNUSED_RESULT static Handle<SimpleNumberDictionary> Set(
-      Isolate* isolate, Handle<SimpleNumberDictionary> dictionary, uint32_t key,
-      Handle<Object> value);
+  V8_EXPORT_PRIVATE V8_WARN_UNUSED_RESULT static Handle<SimpleNumberDictionary>
+  Set(Isolate* isolate, Handle<SimpleNumberDictionary> dictionary, uint32_t key,
+      DirectHandle<Object> value);
 
   static const int kEntryValueIndex = 1;
+} V8_OBJECT_END;
 
-  OBJECT_CONSTRUCTORS(
-      SimpleNumberDictionary,
-      Dictionary<SimpleNumberDictionary, SimpleNumberDictionaryShape>);
-};
-
-extern template class EXPORT_TEMPLATE_DECLARE(
-    V8_EXPORT_PRIVATE) HashTable<NumberDictionary, NumberDictionaryShape>;
-
-extern template class EXPORT_TEMPLATE_DECLARE(V8_EXPORT_PRIVATE)
-    Dictionary<NumberDictionary, NumberDictionaryShape>;
+EXTERN_DECLARE_DICTIONARY(NumberDictionary, NumberDictionaryShape)
 
 // NumberDictionary is used as elements backing store and provides a bitfield
 // and stores property details for every entry.
-class NumberDictionary
+V8_OBJECT class NumberDictionary
     : public Dictionary<NumberDictionary, NumberDictionaryShape> {
  public:
-  DECL_CAST(NumberDictionary)
+  static inline DirectHandle<Map> GetMap(RootsTable& roots);
+
   DECL_PRINTER(NumberDictionary)
 
   // Type specific at put (default NONE attributes is used when adding).
-  V8_WARN_UNUSED_RESULT static Handle<NumberDictionary> Set(
-      Isolate* isolate, Handle<NumberDictionary> dictionary, uint32_t key,
-      Handle<Object> value,
-      Handle<JSObject> dictionary_holder = Handle<JSObject>::null(),
+  template <template <typename> typename HandleType>
+    requires(std::is_convertible_v<HandleType<NumberDictionary>,
+                                   DirectHandle<NumberDictionary>>)
+  V8_WARN_UNUSED_RESULT static HandleType<NumberDictionary> Set(
+      Isolate* isolate, HandleType<NumberDictionary> dictionary, uint32_t key,
+      DirectHandle<Object> value,
+      DirectHandle<JSObject> dictionary_holder = DirectHandle<JSObject>::null(),
       PropertyDetails details = PropertyDetails::Empty());
+  // This method is only safe to use when it is guaranteed that the dictionary
+  // doesn't need to grow.
+  // The number of elements stored and the maximum index is not updated. Use
+  // |SetInitialNumberOfElements| and |UpdateMaxNumberKey| to update the number
+  // in one go.
+  static void UncheckedSet(Isolate* isolate,
+                           DirectHandle<NumberDictionary> dictionary,
+                           uint32_t key, DirectHandle<Object> value);
 
   static const int kMaxNumberKeyIndex = kPrefixStartIndex;
-  void UpdateMaxNumberKey(uint32_t key, Handle<JSObject> dictionary_holder);
+  void UpdateMaxNumberKey(uint32_t key,
+                          DirectHandle<JSObject> dictionary_holder);
 
   // Sorting support
-  void CopyValuesTo(FixedArray elements);
+  void CopyValuesTo(Tagged<FixedArray> elements);
 
   // If slow elements are required we will never go back to fast-case
   // for the elements kept in this dictionary.  We require slow
@@ -343,13 +480,25 @@ class NumberDictionary
   // JSObjects prefer dictionary elements if the dictionary saves this much
   // memory compared to a fast elements backing store.
   static const uint32_t kPreferFastElementsSizeFactor = 3;
+} V8_OBJECT_END;
 
-  OBJECT_CONSTRUCTORS(NumberDictionary,
-                      Dictionary<NumberDictionary, NumberDictionaryShape>);
+// The comparator is passed two indices |a| and |b|, and it returns < 0 when the
+// property at index |a| comes before the property at index |b| in the
+// enumeration order.
+template <typename Dictionary>
+struct EnumIndexComparator {
+  explicit EnumIndexComparator(Tagged<Dictionary> dict) : dict(dict) {}
+  bool operator()(Tagged_t a, Tagged_t b) {
+    PropertyDetails details_a(dict->DetailsAt(
+        InternalIndex(Tagged<Smi>(static_cast<Address>(a)).value())));
+    PropertyDetails details_b(dict->DetailsAt(
+        InternalIndex(Tagged<Smi>(static_cast<Address>(b)).value())));
+    return details_a.dictionary_index() < details_b.dictionary_index();
+  }
+  Tagged<Dictionary> dict;
 };
 
-}  // namespace internal
-}  // namespace v8
+}  // namespace v8::internal
 
 #include "src/objects/object-macros-undef.h"
 

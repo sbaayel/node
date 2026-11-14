@@ -39,24 +39,25 @@ void CreateAsyncResource(const FunctionCallbackInfo<Value>& args) {
     r = new AsyncResource(isolate, args[0].As<Object>(), "foobär");
   }
 
-  args.GetReturnValue().Set(
-      External::New(isolate, static_cast<void*>(r)));
+  args.GetReturnValue().Set(External::New(
+      isolate, static_cast<void*>(r), v8::kExternalPointerTypeTagDefault));
 }
 
 void DestroyAsyncResource(const FunctionCallbackInfo<Value>& args) {
   assert(args[0]->IsExternal());
-  auto r = static_cast<AsyncResource*>(args[0].As<External>()->Value());
+  auto r = static_cast<AsyncResource*>(
+      args[0].As<External>()->Value(v8::kExternalPointerTypeTagDefault));
   delete r;
 }
 
 void CallViaFunction(const FunctionCallbackInfo<Value>& args) {
   Isolate* isolate = args.GetIsolate();
   assert(args[0]->IsExternal());
-  auto r = static_cast<AsyncResource*>(args[0].As<External>()->Value());
+  auto r = static_cast<AsyncResource*>(
+      args[0].As<External>()->Value(v8::kExternalPointerTypeTagDefault));
 
   Local<String> name =
-      String::NewFromUtf8(isolate, "methöd", v8::NewStringType::kNormal)
-      .ToLocalChecked();
+      String::NewFromUtf8(isolate, "methöd").ToLocalChecked();
   Local<Value> fn =
       r->get_resource()->Get(isolate->GetCurrentContext(), name)
       .ToLocalChecked();
@@ -70,11 +71,11 @@ void CallViaFunction(const FunctionCallbackInfo<Value>& args) {
 void CallViaString(const FunctionCallbackInfo<Value>& args) {
   Isolate* isolate = args.GetIsolate();
   assert(args[0]->IsExternal());
-  auto r = static_cast<AsyncResource*>(args[0].As<External>()->Value());
+  auto r = static_cast<AsyncResource*>(
+      args[0].As<External>()->Value(v8::kExternalPointerTypeTagDefault));
 
   Local<String> name =
-      String::NewFromUtf8(isolate, "methöd", v8::NewStringType::kNormal)
-      .ToLocalChecked();
+      String::NewFromUtf8(isolate, "methöd").ToLocalChecked();
 
   Local<Value> arg = Integer::New(isolate, 42);
   MaybeLocal<Value> ret = r->MakeCallback(name, 1, &arg);
@@ -84,7 +85,8 @@ void CallViaString(const FunctionCallbackInfo<Value>& args) {
 void CallViaUtf8Name(const FunctionCallbackInfo<Value>& args) {
   Isolate* isolate = args.GetIsolate();
   assert(args[0]->IsExternal());
-  auto r = static_cast<AsyncResource*>(args[0].As<External>()->Value());
+  auto r = static_cast<AsyncResource*>(
+      args[0].As<External>()->Value(v8::kExternalPointerTypeTagDefault));
 
   Local<Value> arg = Integer::New(isolate, 42);
   MaybeLocal<Value> ret = r->MakeCallback("methöd", 1, &arg);
@@ -93,19 +95,22 @@ void CallViaUtf8Name(const FunctionCallbackInfo<Value>& args) {
 
 void GetAsyncId(const FunctionCallbackInfo<Value>& args) {
   assert(args[0]->IsExternal());
-  auto r = static_cast<AsyncResource*>(args[0].As<External>()->Value());
+  auto r = static_cast<AsyncResource*>(
+      args[0].As<External>()->Value(v8::kExternalPointerTypeTagDefault));
   args.GetReturnValue().Set(r->get_async_id());
 }
 
 void GetTriggerAsyncId(const FunctionCallbackInfo<Value>& args) {
   assert(args[0]->IsExternal());
-  auto r = static_cast<AsyncResource*>(args[0].As<External>()->Value());
+  auto r = static_cast<AsyncResource*>(
+      args[0].As<External>()->Value(v8::kExternalPointerTypeTagDefault));
   args.GetReturnValue().Set(r->get_trigger_async_id());
 }
 
 void GetResource(const FunctionCallbackInfo<Value>& args) {
   assert(args[0]->IsExternal());
-  auto r = static_cast<AsyncResource*>(args[0].As<External>()->Value());
+  auto r = static_cast<AsyncResource*>(
+      args[0].As<External>()->Value(v8::kExternalPointerTypeTagDefault));
   args.GetReturnValue().Set(r->get_resource());
 }
 

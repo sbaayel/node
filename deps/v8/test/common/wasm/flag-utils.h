@@ -2,31 +2,49 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#ifndef V8_TEST_COMMON_FLAG_UTILS_H
-#define V8_TEST_COMMON_FLAG_UTILS_H
+#ifndef V8_TEST_COMMON_WASM_FLAG_UTILS_H
+#define V8_TEST_COMMON_WASM_FLAG_UTILS_H
 
-namespace v8 {
-namespace internal {
+#include "src/wasm/wasm-features.h"
+#include "test/common/flag-utils.h"
 
-template <typename T>
-class FlagScope {
+namespace v8::internal::wasm {
+
+#define EXPERIMENTAL_FLAG_SCOPE(flag) FLAG_SCOPE(wasm_##flag)
+
+class V8_NODISCARD WasmFeatureScope {
  public:
-  FlagScope(T* flag, T new_value) : flag_(flag), previous_value_(*flag) {
-    *flag = new_value;
+  explicit WasmFeatureScope(WasmEnabledFeatures* features,
+                            WasmEnabledFeature feature, bool val = true)
+      : prev_(features->contains(feature)),
+        feature_(feature),
+        features_(features) {
+    set(val);
   }
-  ~FlagScope() { *flag_ = previous_value_; }
+  ~WasmFeatureScope() { set(prev_); }
 
  private:
-  T* flag_;
-  T previous_value_;
+  void set(bool val) {
+    if (val) {
+      features_->Add(feature_);
+    } else {
+      features_->Remove(feature_);
+    }
+  }
+
+  bool const prev_;
+  WasmEnabledFeature const feature_;
+  WasmEnabledFeatures* const features_;
 };
 
-#define FLAG_SCOPE(flag) \
-  FlagScope<bool> __scope_##flag##__LINE__(&FLAG_##flag, true)
+#define WASM_FEATURE_SCOPE(feat)                          \
+  WasmFeatureScope feat##_scope(&this->enabled_features_, \
+                                WasmEnabledFeature::feat)
 
-#define EXPERIMENTAL_FLAG_SCOPE(flag) FLAG_SCOPE(experimental_wasm_##flag)
+#define WASM_FEATURE_SCOPE_VAL(feat, val)                 \
+  WasmFeatureScope feat##_scope(&this->enabled_features_, \
+                                WasmEnabledFeature::feat, val)
 
-}  // namespace internal
-}  // namespace v8
+}  // namespace v8::internal::wasm
 
-#endif  // V8_TEST_COMMON_FLAG_UTILS_H
+#endif  // V8_TEST_COMMON_WASM_FLAG_UTILS_H

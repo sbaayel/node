@@ -4,7 +4,12 @@
 
 #include <errno.h>
 #include <fcntl.h>
+
+#include "src/d8/d8.h"
+
+#ifndef V8_OS_ZOS
 #include <netinet/ip.h>
+#endif
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,7 +21,9 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#include "src/d8/d8.h"
+#include "include/v8-container.h"
+#include "include/v8-template.h"
+#include "src/api/api.h"
 
 namespace v8 {
 
@@ -156,36 +163,29 @@ class ExecArgs {
  public:
   ExecArgs() { exec_args_[0] = nullptr; }
   bool Init(Isolate* isolate, Local<Value> arg0, Local<Array> command_args) {
-    String::Utf8Value prog(isolate, arg0);
-    if (*prog == nullptr) {
-      const char* message =
-          "os.system(): String conversion of program name failed";
-      isolate->ThrowException(
-          String::NewFromUtf8(isolate, message, NewStringType::kNormal)
-              .ToLocalChecked());
-      return false;
+    SafeUtf8Value prog(isolate, arg0);
+    if (!prog) return false;
+    {
+      size_t len = prog.length() + 3;
+      char* c_arg = new char[len];
+      snprintf(c_arg, len, "%s", *prog);
+      exec_args_[0] = c_arg;
     }
-    int len = prog.length() + 3;
-    char* c_arg = new char[len];
-    snprintf(c_arg, len, "%s", *prog);
-    exec_args_[0] = c_arg;
     int i = 1;
     for (unsigned j = 0; j < command_args->Length(); i++, j++) {
-      Local<Value> arg(
-          command_args
-              ->Get(isolate->GetCurrentContext(), Integer::New(isolate, j))
-              .ToLocalChecked());
-      String::Utf8Value utf8_arg(isolate, arg);
-      if (*utf8_arg == nullptr) {
-        exec_args_[i] = nullptr;  // Consistent state for destructor.
-        const char* message =
-            "os.system(): String conversion of argument failed.";
-        isolate->ThrowException(
-            String::NewFromUtf8(isolate, message, NewStringType::kNormal)
-                .ToLocalChecked());
+      Local<Value> arg;
+      if (!command_args
+               ->Get(isolate->GetCurrentContext(), Integer::New(isolate, j))
+               .ToLocal(&arg)) {
+        exec_args_[i] = nullptr;
         return false;
       }
-      int len = utf8_arg.length() + 1;
+      SafeUtf8Value utf8_arg(isolate, arg);
+      if (!utf8_arg) {
+        exec_args_[i] = nullptr;  // Consistent state for destructor.
+        return false;
+      }
+      size_t len = utf8_arg.length() + 1;
       char* c_arg = new char[len];
       snprintf(c_arg, len, "%s", *utf8_arg);
       exec_args_[i] = c_arg;
@@ -211,38 +211,35 @@ class ExecArgs {
 };
 
 // Gets the optional timeouts from the arguments to the system() call.
-static bool GetTimeouts(const v8::FunctionCallbackInfo<v8::Value>& args,
+static bool GetTimeouts(const v8::FunctionCallbackInfo<v8::Value>& info,
                         int* read_timeout, int* total_timeout) {
-  if (args.Length() > 3) {
-    if (args[3]->IsNumber()) {
-      *total_timeout = args[3]
-                           ->Int32Value(args.GetIsolate()->GetCurrentContext())
-                           .FromJust();
+  Isolate* isolate = info.GetIsolate();
+  if (info.Length() > 3) {
+    if (info[3]->IsNumber()) {
+      *total_timeout =
+          info[3]->Int32Value(isolate->GetCurrentContext()).FromJust();
     } else {
-      args.GetIsolate()->ThrowException(
-          String::NewFromUtf8(args.GetIsolate(),
-                              "system: Argument 4 must be a number",
-                              NewStringType::kNormal)
-              .ToLocalChecked());
+      ThrowError(isolate, "system: Argument 4 must be a number");
       return false;
     }
   }
-  if (args.Length() > 2) {
-    if (args[2]->IsNumber()) {
-      *read_timeout = args[2]
-                          ->Int32Value(args.GetIsolate()->GetCurrentContext())
-                          .FromJust();
+  if (info.Length() > 2) {
+    if (info[2]->IsNumber()) {
+      *read_timeout =
+          info[2]->Int32Value(isolate->GetCurrentContext()).FromJust();
     } else {
-      args.GetIsolate()->ThrowException(
-          String::NewFromUtf8(args.GetIsolate(),
-                              "system: Argument 3 must be a number",
-                              NewStringType::kNormal)
-              .ToLocalChecked());
+      ThrowError(isolate, "system: Argument 3 must be a number");
       return false;
     }
   }
   return true;
 }
+
+namespace {
+v8::Local<v8::String> v8_strerror(v8::Isolate* isolate, int err) {
+  return v8::String::NewFromUtf8(isolate, strerror(err)).ToLocalChecked();
+}
+}  // namespace
 
 static const int kReadFD = 0;
 static const int kWriteFD = 1;
@@ -278,9 +275,7 @@ static bool ChildLaunchedOK(Isolate* isolate, int* exec_error_fds) {
     bytes_read = read(exec_error_fds[kReadFD], &err, sizeof(err));
   } while (bytes_read == -1 && errno == EINTR);
   if (bytes_read != 0) {
-    isolate->ThrowException(
-        String::NewFromUtf8(isolate, strerror(err), NewStringType::kNormal)
-            .ToLocalChecked());
+    ThrowError(isolate, v8_strerror(isolate, err));
     return false;
   }
   return true;
@@ -298,9 +293,7 @@ static Local<Value> GetStdout(Isolate* isolate, int child_fd,
   char buffer[kStdoutReadBufferSize];
 
   if (fcntl(child_fd, F_SETFL, O_NONBLOCK) != 0) {
-    return isolate->ThrowException(
-        String::NewFromUtf8(isolate, strerror(errno), NewStringType::kNormal)
-            .ToLocalChecked());
+    return ThrowError(isolate, v8_strerror(isolate, errno));
   }
 
   int bytes_read;
@@ -311,10 +304,7 @@ static Local<Value> GetStdout(Isolate* isolate, int child_fd,
       if (errno == EAGAIN) {
         if (!WaitOnFD(child_fd, read_timeout, total_timeout, start_time) ||
             (TimeIsOut(start_time, total_timeout))) {
-          return isolate->ThrowException(
-              String::NewFromUtf8(isolate, "Timed out waiting for output",
-                                  NewStringType::kNormal)
-                  .ToLocalChecked());
+          return ThrowError(isolate, "Timed out waiting for output");
         }
         continue;
       } else if (errno == EINTR) {
@@ -331,6 +321,9 @@ static Local<Value> GetStdout(Isolate* isolate, int child_fd,
           String::NewFromUtf8(isolate, buffer, NewStringType::kNormal, length)
               .ToLocalChecked();
       accumulator = String::Concat(isolate, accumulator, addition);
+      if (accumulator.IsEmpty()) {
+        return ThrowError(isolate, "String limit exceeded");
+      }
       fullness = bytes_read + fullness - length;
       memcpy(buffer, buffer + length, fullness);
     }
@@ -357,7 +350,7 @@ static Local<Value> GetStdout(Isolate* isolate, int child_fd,
 
 // Get exit status of child.
 static bool WaitForChild(Isolate* isolate, int pid,
-                         ZombieProtector& child_waiter,  // NOLINT
+                         ZombieProtector& child_waiter,
                          const struct timeval& start_time, int read_timeout,
                          int total_timeout) {
 #ifdef HAS_WAITID
@@ -372,11 +365,7 @@ static bool WaitForChild(Isolate* isolate, int pid,
     if (useconds < 1000000) useconds <<= 1;
     if ((read_timeout != -1 && useconds / 1000 > read_timeout) ||
         (TimeIsOut(start_time, total_timeout))) {
-      isolate->ThrowException(
-          String::NewFromUtf8(isolate,
-                              "Timed out waiting for process to terminate",
-                              NewStringType::kNormal)
-              .ToLocalChecked());
+      ThrowError(isolate, "Timed out waiting for process to terminate");
       kill(pid, SIGINT);
       return false;
     }
@@ -385,18 +374,14 @@ static bool WaitForChild(Isolate* isolate, int pid,
     char message[999];
     snprintf(message, sizeof(message), "Child killed by signal %d",
              child_info.si_status);
-    isolate->ThrowException(
-        String::NewFromUtf8(isolate, message, NewStringType::kNormal)
-            .ToLocalChecked());
+    ThrowError(isolate, message);
     return false;
   }
   if (child_info.si_code == CLD_EXITED && child_info.si_status != 0) {
     char message[999];
     snprintf(message, sizeof(message), "Child exited with status %d",
              child_info.si_status);
-    isolate->ThrowException(
-        String::NewFromUtf8(isolate, message, NewStringType::kNormal)
-            .ToLocalChecked());
+    ThrowError(isolate, message);
     return false;
   }
 
@@ -409,9 +394,7 @@ static bool WaitForChild(Isolate* isolate, int pid,
     char message[999];
     snprintf(message, sizeof(message), "Child killed by signal %d",
              WTERMSIG(child_status));
-    isolate->ThrowException(
-        String::NewFromUtf8(isolate, message, NewStringType::kNormal)
-            .ToLocalChecked());
+    ThrowError(isolate, message);
     return false;
   }
   if (WEXITSTATUS(child_status) != 0) {
@@ -419,9 +402,7 @@ static bool WaitForChild(Isolate* isolate, int pid,
     int exit_status = WEXITSTATUS(child_status);
     snprintf(message, sizeof(message), "Child exited with status %d",
              exit_status);
-    isolate->ThrowException(
-        String::NewFromUtf8(isolate, message, NewStringType::kNormal)
-            .ToLocalChecked());
+    ThrowError(isolate, message);
     return false;
   }
 
@@ -433,37 +414,29 @@ static bool WaitForChild(Isolate* isolate, int pid,
 #undef HAS_WAITID
 
 // Implementation of the system() function (see d8.h for details).
-void Shell::System(const v8::FunctionCallbackInfo<v8::Value>& args) {
-  HandleScope scope(args.GetIsolate());
+void Shell::System(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  DCHECK(i::ValidateCallbackInfo(info));
+  Isolate* isolate = info.GetIsolate();
+  HandleScope scope(isolate);
   int read_timeout = -1;
   int total_timeout = -1;
-  if (!GetTimeouts(args, &read_timeout, &total_timeout)) return;
+  if (!GetTimeouts(info, &read_timeout, &total_timeout)) return;
   Local<Array> command_args;
-  if (args.Length() > 1) {
-    if (!args[1]->IsArray()) {
-      args.GetIsolate()->ThrowException(
-          String::NewFromUtf8(args.GetIsolate(),
-                              "system: Argument 2 must be an array",
-                              NewStringType::kNormal)
-              .ToLocalChecked());
+  if (info.Length() > 1) {
+    if (!info[1]->IsArray()) {
+      ThrowError(isolate, "system: Argument 2 must be an array");
       return;
     }
-    command_args = Local<Array>::Cast(args[1]);
+    command_args = info[1].As<Array>();
   } else {
-    command_args = Array::New(args.GetIsolate(), 0);
+    command_args = Array::New(isolate, 0);
   }
   if (command_args->Length() > ExecArgs::kMaxArgs) {
-    args.GetIsolate()->ThrowException(
-        String::NewFromUtf8(args.GetIsolate(), "Too many arguments to system()",
-                            NewStringType::kNormal)
-            .ToLocalChecked());
+    ThrowError(isolate, "Too many arguments to system()");
     return;
   }
-  if (args.Length() < 1) {
-    args.GetIsolate()->ThrowException(
-        String::NewFromUtf8(args.GetIsolate(), "Too few arguments to system()",
-                            NewStringType::kNormal)
-            .ToLocalChecked());
+  if (info.Length() < 1) {
+    ThrowError(isolate, "Too few arguments to system()");
     return;
   }
 
@@ -471,24 +444,18 @@ void Shell::System(const v8::FunctionCallbackInfo<v8::Value>& args) {
   gettimeofday(&start_time, nullptr);
 
   ExecArgs exec_args;
-  if (!exec_args.Init(args.GetIsolate(), args[0], command_args)) {
+  if (!exec_args.Init(isolate, info[0], command_args)) {
     return;
   }
   int exec_error_fds[2];
   int stdout_fds[2];
 
   if (pipe(exec_error_fds) != 0) {
-    args.GetIsolate()->ThrowException(
-        String::NewFromUtf8(args.GetIsolate(), "pipe syscall failed.",
-                            NewStringType::kNormal)
-            .ToLocalChecked());
+    ThrowError(isolate, "pipe syscall failed.");
     return;
   }
   if (pipe(stdout_fds) != 0) {
-    args.GetIsolate()->ThrowException(
-        String::NewFromUtf8(args.GetIsolate(), "pipe syscall failed.",
-                            NewStringType::kNormal)
-            .ToLocalChecked());
+    ThrowError(isolate, "pipe syscall failed.");
     return;
   }
 
@@ -505,14 +472,13 @@ void Shell::System(const v8::FunctionCallbackInfo<v8::Value>& args) {
   OpenFDCloser error_read_closer(exec_error_fds[kReadFD]);
   OpenFDCloser stdout_read_closer(stdout_fds[kReadFD]);
 
-  Isolate* isolate = args.GetIsolate();
   if (!ChildLaunchedOK(isolate, exec_error_fds)) return;
 
   Local<Value> accumulator = GetStdout(isolate, stdout_fds[kReadFD], start_time,
                                        read_timeout, total_timeout);
   if (accumulator->IsUndefined()) {
     kill(pid, SIGINT);  // On timeout, kill the subprocess.
-    args.GetReturnValue().Set(accumulator);
+    info.GetReturnValue().Set(accumulator);
     return;
   }
 
@@ -521,52 +487,24 @@ void Shell::System(const v8::FunctionCallbackInfo<v8::Value>& args) {
     return;
   }
 
-  args.GetReturnValue().Set(accumulator);
+  info.GetReturnValue().Set(accumulator);
 }
 
-void Shell::ChangeDirectory(const v8::FunctionCallbackInfo<v8::Value>& args) {
-  if (args.Length() != 1) {
-    const char* message = "chdir() takes one argument";
-    args.GetIsolate()->ThrowException(
-        String::NewFromUtf8(args.GetIsolate(), message, NewStringType::kNormal)
-            .ToLocalChecked());
-    return;
-  }
-  String::Utf8Value directory(args.GetIsolate(), args[0]);
-  if (*directory == nullptr) {
-    const char* message = "os.chdir(): String conversion of argument failed.";
-    args.GetIsolate()->ThrowException(
-        String::NewFromUtf8(args.GetIsolate(), message, NewStringType::kNormal)
-            .ToLocalChecked());
-    return;
-  }
-  if (chdir(*directory) != 0) {
-    args.GetIsolate()->ThrowException(
-        String::NewFromUtf8(args.GetIsolate(), strerror(errno),
-                            NewStringType::kNormal)
-            .ToLocalChecked());
-    return;
-  }
-}
 
-void Shell::SetUMask(const v8::FunctionCallbackInfo<v8::Value>& args) {
-  if (args.Length() != 1) {
-    const char* message = "umask() takes one argument";
-    args.GetIsolate()->ThrowException(
-        String::NewFromUtf8(args.GetIsolate(), message, NewStringType::kNormal)
-            .ToLocalChecked());
+void Shell::SetUMask(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  DCHECK(i::ValidateCallbackInfo(info));
+  Isolate* isolate = info.GetIsolate();
+  if (info.Length() != 1) {
+    ThrowError(isolate, "umask() takes one argument");
     return;
   }
-  if (args[0]->IsNumber()) {
-    int previous = umask(
-        args[0]->Int32Value(args.GetIsolate()->GetCurrentContext()).FromJust());
-    args.GetReturnValue().Set(previous);
+  if (info[0]->IsNumber()) {
+    int previous =
+        umask(info[0]->Int32Value(isolate->GetCurrentContext()).FromJust());
+    info.GetReturnValue().Set(previous);
     return;
   } else {
-    const char* message = "umask() argument must be numeric";
-    args.GetIsolate()->ThrowException(
-        String::NewFromUtf8(args.GetIsolate(), message, NewStringType::kNormal)
-            .ToLocalChecked());
+    ThrowError(isolate, "umask() argument must be numeric");
     return;
   }
 }
@@ -575,15 +513,11 @@ static bool CheckItsADirectory(Isolate* isolate, char* directory) {
   struct stat stat_buf;
   int stat_result = stat(directory, &stat_buf);
   if (stat_result != 0) {
-    isolate->ThrowException(
-        String::NewFromUtf8(isolate, strerror(errno), NewStringType::kNormal)
-            .ToLocalChecked());
+    ThrowError(isolate, v8_strerror(isolate, errno));
     return false;
   }
   if ((stat_buf.st_mode & S_IFDIR) != 0) return true;
-  isolate->ThrowException(
-      String::NewFromUtf8(isolate, strerror(EEXIST), NewStringType::kNormal)
-          .ToLocalChecked());
+  ThrowError(isolate, v8_strerror(isolate, EEXIST));
   return false;
 }
 
@@ -597,9 +531,7 @@ static bool mkdirp(Isolate* isolate, char* directory, mode_t mask) {
   } else if (errno == ENOENT) {  // Intermediate path element is missing.
     char* last_slash = strrchr(directory, '/');
     if (last_slash == nullptr) {
-      isolate->ThrowException(
-          String::NewFromUtf8(isolate, strerror(errno), NewStringType::kNormal)
-              .ToLocalChecked());
+      ThrowError(isolate, v8_strerror(isolate, errno));
       return false;
     }
     *last_slash = 0;
@@ -610,126 +542,79 @@ static bool mkdirp(Isolate* isolate, char* directory, mode_t mask) {
     if (errno == EEXIST) {
       return CheckItsADirectory(isolate, directory);
     }
-    isolate->ThrowException(
-        String::NewFromUtf8(isolate, strerror(errno), NewStringType::kNormal)
-            .ToLocalChecked());
+    ThrowError(isolate, v8_strerror(isolate, errno));
     return false;
   } else {
-    isolate->ThrowException(
-        String::NewFromUtf8(isolate, strerror(errno), NewStringType::kNormal)
-            .ToLocalChecked());
+    ThrowError(isolate, v8_strerror(isolate, errno));
     return false;
   }
 }
 
-void Shell::MakeDirectory(const v8::FunctionCallbackInfo<v8::Value>& args) {
+void Shell::MakeDirectory(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  DCHECK(i::ValidateCallbackInfo(info));
+  Isolate* isolate = info.GetIsolate();
   mode_t mask = 0777;
-  if (args.Length() == 2) {
-    if (args[1]->IsNumber()) {
-      mask = args[1]
-                 ->Int32Value(args.GetIsolate()->GetCurrentContext())
-                 .FromJust();
+  if (info.Length() == 2) {
+    if (info[1]->IsNumber()) {
+      mask = info[1]->Int32Value(isolate->GetCurrentContext()).FromJust();
     } else {
-      const char* message = "mkdirp() second argument must be numeric";
-      args.GetIsolate()->ThrowException(
-          String::NewFromUtf8(args.GetIsolate(), message,
-                              NewStringType::kNormal)
-              .ToLocalChecked());
+      ThrowError(isolate, "mkdirp() second argument must be numeric");
       return;
     }
-  } else if (args.Length() != 1) {
-    const char* message = "mkdirp() takes one or two arguments";
-    args.GetIsolate()->ThrowException(
-        String::NewFromUtf8(args.GetIsolate(), message, NewStringType::kNormal)
-            .ToLocalChecked());
+  } else if (info.Length() != 1) {
+    ThrowError(isolate, "mkdirp() takes one or two arguments");
     return;
   }
-  String::Utf8Value directory(args.GetIsolate(), args[0]);
-  if (*directory == nullptr) {
-    const char* message = "os.mkdirp(): String conversion of argument failed.";
-    args.GetIsolate()->ThrowException(
-        String::NewFromUtf8(args.GetIsolate(), message, NewStringType::kNormal)
-            .ToLocalChecked());
-    return;
-  }
-  mkdirp(args.GetIsolate(), *directory, mask);
+  SafeUtf8Value directory(isolate, info[0]);
+  if (!directory) return;
+  mkdirp(isolate, *directory, mask);
 }
 
-void Shell::RemoveDirectory(const v8::FunctionCallbackInfo<v8::Value>& args) {
-  if (args.Length() != 1) {
-    const char* message = "rmdir() takes one or two arguments";
-    args.GetIsolate()->ThrowException(
-        String::NewFromUtf8(args.GetIsolate(), message, NewStringType::kNormal)
-            .ToLocalChecked());
+void Shell::RemoveDirectory(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  DCHECK(i::ValidateCallbackInfo(info));
+  Isolate* isolate = info.GetIsolate();
+  if (info.Length() != 1) {
+    ThrowError(isolate, "rmdir() takes one arguments");
     return;
   }
-  String::Utf8Value directory(args.GetIsolate(), args[0]);
-  if (*directory == nullptr) {
-    const char* message = "os.rmdir(): String conversion of argument failed.";
-    args.GetIsolate()->ThrowException(
-        String::NewFromUtf8(args.GetIsolate(), message, NewStringType::kNormal)
-            .ToLocalChecked());
-    return;
-  }
+  SafeUtf8Value directory(isolate, info[0]);
+  if (!directory) return;
   rmdir(*directory);
 }
 
-void Shell::SetEnvironment(const v8::FunctionCallbackInfo<v8::Value>& args) {
-  if (args.Length() != 2) {
-    const char* message = "setenv() takes two arguments";
-    args.GetIsolate()->ThrowException(
-        String::NewFromUtf8(args.GetIsolate(), message, NewStringType::kNormal)
-            .ToLocalChecked());
+void Shell::SetEnvironment(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  DCHECK(i::ValidateCallbackInfo(info));
+  Isolate* isolate = info.GetIsolate();
+  if (info.Length() != 2) {
+    ThrowError(isolate, "setenv() takes two arguments");
     return;
   }
-  String::Utf8Value var(args.GetIsolate(), args[0]);
-  String::Utf8Value value(args.GetIsolate(), args[1]);
-  if (*var == nullptr) {
-    const char* message =
-        "os.setenv(): String conversion of variable name failed.";
-    args.GetIsolate()->ThrowException(
-        String::NewFromUtf8(args.GetIsolate(), message, NewStringType::kNormal)
-            .ToLocalChecked());
-    return;
-  }
-  if (*value == nullptr) {
-    const char* message =
-        "os.setenv(): String conversion of variable contents failed.";
-    args.GetIsolate()->ThrowException(
-        String::NewFromUtf8(args.GetIsolate(), message, NewStringType::kNormal)
-            .ToLocalChecked());
-    return;
-  }
+  SafeUtf8Value var(isolate, info[0]);
+  if (!var) return;
+  SafeUtf8Value value(isolate, info[1]);
+  if (!value) return;
   setenv(*var, *value, 1);
 }
 
-void Shell::UnsetEnvironment(const v8::FunctionCallbackInfo<v8::Value>& args) {
-  if (args.Length() != 1) {
-    const char* message = "unsetenv() takes one argument";
-    args.GetIsolate()->ThrowException(
-        String::NewFromUtf8(args.GetIsolate(), message, NewStringType::kNormal)
-            .ToLocalChecked());
+void Shell::UnsetEnvironment(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  DCHECK(i::ValidateCallbackInfo(info));
+  Isolate* isolate = info.GetIsolate();
+  if (info.Length() != 1) {
+    ThrowError(isolate, "unsetenv() takes one argument");
     return;
   }
-  String::Utf8Value var(args.GetIsolate(), args[0]);
-  if (*var == nullptr) {
-    const char* message =
-        "os.setenv(): String conversion of variable name failed.";
-    args.GetIsolate()->ThrowException(
-        String::NewFromUtf8(args.GetIsolate(), message, NewStringType::kNormal)
-            .ToLocalChecked());
-    return;
-  }
+  SafeUtf8Value var(isolate, info[0]);
+  if (!var) return;
   unsetenv(*var);
 }
 
-char* Shell::ReadCharsFromTcpPort(const char* name, int* size_out) {
+base::OwnedVector<char> Shell::ReadCharsFromTcpPort(const char* name) {
   DCHECK_GE(Shell::options.read_from_tcp_port, 0);
 
   int sockfd = socket(PF_INET, SOCK_STREAM, 0);
   if (sockfd < 0) {
     fprintf(stderr, "Failed to create IPv4 socket\n");
-    return nullptr;
+    return {};
   }
 
   // Create an address for localhost:PORT where PORT is specified by the shell
@@ -743,9 +628,9 @@ char* Shell::ReadCharsFromTcpPort(const char* name, int* size_out) {
   if (connect(sockfd, reinterpret_cast<sockaddr*>(&serv_addr),
               sizeof(serv_addr)) < 0) {
     fprintf(stderr, "Failed to connect to localhost:%d\n",
-            Shell::options.read_from_tcp_port);
+            Shell::options.read_from_tcp_port.get());
     close(sockfd);
-    return nullptr;
+    return {};
   }
 
   // The file server follows the simple protocol for requesting and receiving
@@ -771,9 +656,9 @@ char* Shell::ReadCharsFromTcpPort(const char* name, int* size_out) {
     ssize_t sent_now = send(sockfd, name + sent_len, name_len - sent_len, 0);
     if (sent_now < 0) {
       fprintf(stderr, "Failed to send %s to localhost:%d\n", name,
-              Shell::options.read_from_tcp_port);
+              Shell::options.read_from_tcp_port.get());
       close(sockfd);
-      return nullptr;
+      return {};
     }
     sent_len += sent_now;
   }
@@ -788,18 +673,18 @@ char* Shell::ReadCharsFromTcpPort(const char* name, int* size_out) {
   // We need those 4 bytes to read off the file length.
   if (received < 4) {
     fprintf(stderr, "Failed to receive %s's length from localhost:%d\n", name,
-            Shell::options.read_from_tcp_port);
+            Shell::options.read_from_tcp_port.get());
     close(sockfd);
-    return nullptr;
+    return {};
   }
   // Reinterpretet the received file length as a signed big-endian integer.
-  int32_t file_length = bit_cast<int32_t>(htonl(big_endian_file_length));
+  int32_t file_length = base::bit_cast<int32_t>(htonl(big_endian_file_length));
 
   if (file_length < 0) {
     fprintf(stderr, "Received length %d for %s from localhost:%d\n",
-            file_length, name, Shell::options.read_from_tcp_port);
+            file_length, name, Shell::options.read_from_tcp_port.get());
     close(sockfd);
-    return nullptr;
+    return {};
   }
 
   // Allocate the output array.
@@ -812,43 +697,58 @@ char* Shell::ReadCharsFromTcpPort(const char* name, int* size_out) {
         recv(sockfd, chars + total_received, file_length - total_received, 0);
     if (received < 0) {
       fprintf(stderr, "Failed to receive %s from localhost:%d\n", name,
-              Shell::options.read_from_tcp_port);
+              Shell::options.read_from_tcp_port.get());
       close(sockfd);
       delete[] chars;
-      return nullptr;
+      return {};
     }
     total_received += received;
   }
 
   close(sockfd);
-  *size_out = file_length;
-  return chars;
+  return base::OwnedVector<char>(std::unique_ptr<char[]>(chars), file_length);
 }
 
 void Shell::AddOSMethods(Isolate* isolate, Local<ObjectTemplate> os_templ) {
   if (options.enable_os_system) {
-    os_templ->Set(String::NewFromUtf8(isolate, "system", NewStringType::kNormal)
-                      .ToLocalChecked(),
-                  FunctionTemplate::New(isolate, System));
+    os_templ->Set(isolate, "system", FunctionTemplate::New(isolate, System));
   }
-  os_templ->Set(String::NewFromUtf8(isolate, "chdir", NewStringType::kNormal)
-                    .ToLocalChecked(),
-                FunctionTemplate::New(isolate, ChangeDirectory));
-  os_templ->Set(String::NewFromUtf8(isolate, "setenv", NewStringType::kNormal)
-                    .ToLocalChecked(),
+
+  os_templ->Set(isolate, "setenv",
                 FunctionTemplate::New(isolate, SetEnvironment));
-  os_templ->Set(String::NewFromUtf8(isolate, "unsetenv", NewStringType::kNormal)
-                    .ToLocalChecked(),
+  os_templ->Set(isolate, "unsetenv",
                 FunctionTemplate::New(isolate, UnsetEnvironment));
-  os_templ->Set(String::NewFromUtf8(isolate, "umask", NewStringType::kNormal)
-                    .ToLocalChecked(),
-                FunctionTemplate::New(isolate, SetUMask));
-  os_templ->Set(String::NewFromUtf8(isolate, "mkdirp", NewStringType::kNormal)
-                    .ToLocalChecked(),
+  os_templ->Set(isolate, "umask", FunctionTemplate::New(isolate, SetUMask));
+  os_templ->Set(isolate, "mkdirp",
                 FunctionTemplate::New(isolate, MakeDirectory));
-  os_templ->Set(String::NewFromUtf8(isolate, "rmdir", NewStringType::kNormal)
-                    .ToLocalChecked(),
+  os_templ->Set(isolate, "rmdir",
                 FunctionTemplate::New(isolate, RemoveDirectory));
+}
+
+void Shell::FileExists(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  DCHECK(i::ValidateCallbackInfo(info));
+  Isolate* isolate = info.GetIsolate();
+  if (info.Length() < 1) {
+    ThrowError(isolate, "exists() takes one argument");
+    return;
+  }
+  SafeUtf8Value file_name(isolate, info[0]);
+  if (!file_name) return;
+
+  struct stat stat_buf;
+  bool exists = (stat(*file_name, &stat_buf) == 0);
+
+  info.GetReturnValue().Set(v8::Boolean::New(isolate, exists));
+}
+
+bool Shell::ChangeWorkingDirectory(const std::string& path, bool print_error) {
+  bool success = chdir(path.c_str()) == 0;
+
+  if (!success && print_error) {
+    fprintf(stderr, "Failed to change directory to %s: %s\n", path.c_str(),
+            strerror(errno));
+  }
+  return success;
 }
 
 }  // namespace v8

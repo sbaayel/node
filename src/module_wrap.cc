@@ -1,11 +1,14 @@
 #include "module_wrap.h"
 
+#include "debug_utils-inl.h"
 #include "env.h"
 #include "memory_tracker-inl.h"
 #include "node_contextify.h"
 #include "node_errors.h"
+#include "node_external_reference.h"
 #include "node_internals.h"
-#include "node_process.h"
+#include "node_process-inl.h"
+#include "node_sea.h"
 #include "node_url.h"
 #include "node_watchdog.h"
 #include "util-inl.h"
@@ -20,65 +23,165 @@ namespace loader {
 using errors::TryCatchScope;
 
 using node::contextify::ContextifyContext;
-using node::url::URL;
-using node::url::URL_FLAGS_FAILED;
 using v8::Array;
 using v8::ArrayBufferView;
+using v8::Boolean;
 using v8::Context;
+using v8::Data;
+using v8::EscapableHandleScope;
+using v8::Exception;
+using v8::FixedArray;
 using v8::Function;
 using v8::FunctionCallbackInfo;
 using v8::FunctionTemplate;
 using v8::Global;
 using v8::HandleScope;
+using v8::Int32;
 using v8::Integer;
-using v8::IntegrityLevel;
 using v8::Isolate;
 using v8::Just;
+using v8::JustVoid;
 using v8::Local;
+using v8::LocalVector;
 using v8::Maybe;
 using v8::MaybeLocal;
+using v8::MemorySpan;
+using v8::Message;
+using v8::MicrotaskQueue;
 using v8::Module;
+using v8::ModuleImportPhase;
+using v8::ModuleRequest;
+using v8::Name;
 using v8::Nothing;
-using v8::Number;
+using v8::Null;
 using v8::Object;
+using v8::ObjectTemplate;
 using v8::PrimitiveArray;
 using v8::Promise;
+using v8::PromiseRejectEvent;
+using v8::PropertyAttribute;
+using v8::PropertyCallbackInfo;
 using v8::ScriptCompiler;
 using v8::ScriptOrigin;
 using v8::String;
+using v8::Symbol;
 using v8::UnboundModuleScript;
 using v8::Undefined;
 using v8::Value;
 
-static const char* const EXTENSIONS[] = {
-  ".js",
-  ".json",
-  ".node",
-  ".mjs"
-};
+inline bool DataIsString(Local<Data> data) {
+  return data->IsValue() && data.As<Value>()->IsString();
+}
 
-ModuleWrap::ModuleWrap(Environment* env,
+void ModuleCacheKey::MemoryInfo(MemoryTracker* tracker) const {
+  tracker->TrackField("specifier", specifier);
+  tracker->TrackField("import_attributes", import_attributes);
+}
+
+std::string ModuleCacheKey::ToString() const {
+  std::string result = "ModuleCacheKey(\"" + specifier + "\"";
+  if (!import_attributes.empty()) {
+    result += ", {";
+    bool first = true;
+    for (const auto& attr : import_attributes) {
+      if (first) {
+        first = false;
+      } else {
+        result += ", ";
+      }
+      result += attr.first + ": " + attr.second;
+    }
+    result += "}";
+  }
+  result += ")";
+  return result;
+}
+
+template <int elements_per_attribute>
+ModuleCacheKey ModuleCacheKey::From(Local<String> specifier,
+                                    Local<FixedArray> import_attributes) {
+  CHECK_EQ(import_attributes->Length() % elements_per_attribute, 0);
+  Isolate* isolate = Isolate::GetCurrent();
+  std::size_t h1 = specifier->GetIdentityHash();
+  size_t num_attributes = import_attributes->Length() / elements_per_attribute;
+  ImportAttributeVector attributes;
+  attributes.reserve(num_attributes);
+
+  std::size_t h2 = 0;
+
+  for (int i = 0; i < import_attributes->Length();
+       i += elements_per_attribute) {
+    DCHECK(DataIsString(import_attributes->Get(i)));
+    DCHECK(DataIsString(import_attributes->Get(i + 1)));
+
+    Local<String> v8_key = import_attributes->Get(i).As<String>();
+    Local<String> v8_value = import_attributes->Get(i + 1).As<String>();
+    Utf8Value key_utf8(isolate, v8_key);
+    Utf8Value value_utf8(isolate, v8_value);
+
+    attributes.emplace_back(key_utf8.ToString(), value_utf8.ToString());
+    h2 ^= v8_key->GetIdentityHash();
+    h2 ^= v8_value->GetIdentityHash();
+  }
+
+  // Combine the hashes using a simple XOR and bit shift to reduce
+  // collisions. Note that the hash does not guarantee uniqueness.
+  std::size_t hash = h1 ^ (h2 << 1);
+
+  Utf8Value utf8_specifier(isolate, specifier);
+  return ModuleCacheKey{utf8_specifier.ToString(), attributes, hash};
+}
+
+ModuleCacheKey ModuleCacheKey::From(Local<ModuleRequest> v8_request) {
+  return From(v8_request->GetSpecifier(), v8_request->GetImportAttributes());
+}
+
+ModuleWrap::ModuleWrap(Realm* realm,
                        Local<Object> object,
                        Local<Module> module,
-                       Local<String> url) :
-  BaseObject(env, object),
-  id_(env->get_next_module_id()) {
-  module_.Reset(env->isolate(), module);
-  url_.Reset(env->isolate(), url);
-  env->id_to_module_map.emplace(id_, this);
+                       Local<String> url,
+                       Local<Object> context_object,
+                       Local<Value> synthetic_evaluation_step)
+    : BaseObject(realm, object),
+      url_(Utf8Value(realm->isolate(), url).ToString()),
+      module_(realm->isolate(), module),
+      module_hash_(module->GetIdentityHash()) {
+  realm->env()->hash_to_module_map.emplace(module_hash_, this);
+
+  object->SetInternalField(kModuleSlot, module);
+  object->SetInternalField(kModuleSourceObjectSlot,
+                           v8::Undefined(realm->isolate()));
+  object->SetInternalField(kSyntheticEvaluationStepsSlot,
+                           synthetic_evaluation_step);
+  object->SetInternalField(kContextObjectSlot, context_object);
+  object->SetInternalField(kLinkedRequestsSlot,
+                           v8::Undefined(realm->isolate()));
+
+  if (!synthetic_evaluation_step->IsUndefined()) {
+    synthetic_ = true;
+    // Synthetic modules have no dependencies.
+    linked_ = true;
+  }
+  MakeWeak();
+  module_.SetWeak();
 }
 
 ModuleWrap::~ModuleWrap() {
-  HandleScope scope(env()->isolate());
-  Local<Module> module = module_.Get(env()->isolate());
-  env()->id_to_module_map.erase(id_);
-  auto range = env()->hash_to_module_map.equal_range(module->GetIdentityHash());
+  auto range = env()->hash_to_module_map.equal_range(module_hash_);
   for (auto it = range.first; it != range.second; ++it) {
     if (it->second == this) {
       env()->hash_to_module_map.erase(it);
       break;
     }
   }
+}
+
+Local<Context> ModuleWrap::context() const {
+  Local<Value> obj = object()->GetInternalField(kContextObjectSlot).As<Value>();
+  // If this fails, there is likely a bug e.g. ModuleWrap::context() is accessed
+  // before the ModuleWrap constructor completes.
+  CHECK(obj->IsObject());
+  return obj.As<Object>()->GetCreationContextChecked();
 }
 
 ModuleWrap* ModuleWrap::GetFromModule(Environment* env,
@@ -92,22 +195,72 @@ ModuleWrap* ModuleWrap::GetFromModule(Environment* env,
   return nullptr;
 }
 
-ModuleWrap* ModuleWrap::GetFromID(Environment* env, uint32_t id) {
-  auto module_wrap_it = env->id_to_module_map.find(id);
-  if (module_wrap_it == env->id_to_module_map.end()) {
-    return nullptr;
+Maybe<bool> ModuleWrap::CheckUnsettledTopLevelAwait() {
+  Isolate* isolate = env()->isolate();
+  Local<Context> context = env()->context();
+
+  // This must be invoked when the environment is shutting down, and the module
+  // is kept alive by the module wrap via an internal field.
+  CHECK(env()->exiting());
+  CHECK(!module_.IsEmpty());
+
+  Local<Module> module = module_.Get(isolate);
+  // It's a synthetic module, likely a facade wrapping CJS.
+  if (!module->IsSourceTextModule()) {
+    return Just(true);
   }
-  return module_wrap_it->second;
+
+  if (!HasAsyncGraph()) {  // There is no TLA, no need to check.
+    return Just(true);
+  }
+
+  auto stalled_messages =
+      std::get<1>(module->GetStalledTopLevelAwaitMessages(isolate));
+  if (stalled_messages.empty()) {
+    return Just(true);
+  }
+
+  if (env()->options()->warnings) {
+    for (auto& message : stalled_messages) {
+      std::string reason = "Warning: Detected unsettled top-level await at ";
+      std::string info =
+          FormatErrorMessage(isolate, context, "", message, true);
+      reason += info;
+      FPrintF(stderr, "%s\n", reason);
+    }
+  }
+
+  return Just(false);
 }
 
-// new ModuleWrap(url, context, source, lineOffset, columnOffset)
-// new ModuleWrap(url, context, exportNames, syntheticExecutionFunction)
+bool ModuleWrap::HasAsyncGraph() {
+  if (!has_async_graph_.has_value()) {
+    Isolate* isolate = env()->isolate();
+    HandleScope scope(isolate);
+
+    has_async_graph_ = module_.Get(isolate)->IsGraphAsync();
+  }
+  return has_async_graph_.value();
+}
+
+Local<PrimitiveArray> ModuleWrap::GetHostDefinedOptions(
+    Isolate* isolate, Local<Symbol> id_symbol) {
+  Local<PrimitiveArray> host_defined_options =
+      PrimitiveArray::New(isolate, HostDefinedOptions::kLength);
+  host_defined_options->Set(isolate, HostDefinedOptions::kID, id_symbol);
+  return host_defined_options;
+}
+
+// new ModuleWrap(url, context, source, lineOffset, columnOffset[, cachedData]);
+// new ModuleWrap(url, context, source, lineOffset, columnOffset,
+//                idSymbol);
+// new ModuleWrap(url, context, exportNames, evaluationCallback[, cjsModule])
 void ModuleWrap::New(const FunctionCallbackInfo<Value>& args) {
   CHECK(args.IsConstructCall());
   CHECK_GE(args.Length(), 3);
 
-  Environment* env = Environment::GetCurrent(args);
-  Isolate* isolate = env->isolate();
+  Realm* realm = Realm::GetCurrent(args);
+  Isolate* isolate = realm->isolate();
 
   Local<Object> that = args.This();
 
@@ -115,40 +268,59 @@ void ModuleWrap::New(const FunctionCallbackInfo<Value>& args) {
   Local<String> url = args[0].As<String>();
 
   Local<Context> context;
+  ContextifyContext* contextify_context = nullptr;
   if (args[1]->IsUndefined()) {
-    context = that->CreationContext();
+    context = that->GetCreationContextChecked();
   } else {
     CHECK(args[1]->IsObject());
-    ContextifyContext* sandbox =
-        ContextifyContext::ContextFromContextifiedSandbox(
-            env, args[1].As<Object>());
-    CHECK_NOT_NULL(sandbox);
-    context = sandbox->context();
+    contextify_context = ContextifyContext::ContextFromContextifiedSandbox(
+        realm->env(), args[1].As<Object>());
+    CHECK_NOT_NULL(contextify_context);
+    context = contextify_context->context();
   }
 
-  Local<Integer> line_offset;
-  Local<Integer> column_offset;
+  int line_offset = 0;
+  int column_offset = 0;
 
   bool synthetic = args[2]->IsArray();
-  if (synthetic) {
-    // new ModuleWrap(url, context, exportNames, syntheticExecutionFunction)
-    CHECK(args[3]->IsFunction());
-  } else {
-    // new ModuleWrap(url, context, source, lineOffset, columOffset, cachedData)
-    CHECK(args[2]->IsString());
-    CHECK(args[3]->IsNumber());
-    line_offset = args[3].As<Integer>();
-    CHECK(args[4]->IsNumber());
-    column_offset = args[4].As<Integer>();
-  }
-
+  bool can_use_builtin_cache = false;
   Local<PrimitiveArray> host_defined_options =
       PrimitiveArray::New(isolate, HostDefinedOptions::kLength);
-  host_defined_options->Set(isolate, HostDefinedOptions::kType,
-                            Number::New(isolate, ScriptType::kModule));
+  Local<Symbol> id_symbol;
+  if (synthetic) {
+    // new ModuleWrap(url, context, exportNames, evaluationCallback[,
+    // cjsModule])
+    CHECK(args[3]->IsFunction());
+  } else {
+    // new ModuleWrap(url, context, source, lineOffset, columnOffset[,
+    //                cachedData]);
+    // new ModuleWrap(url, context, source, lineOffset, columnOffset,
+    //                idSymbol);
+    CHECK(args[2]->IsString());
+    CHECK(args[3]->IsNumber());
+    line_offset = args[3].As<Int32>()->Value();
+    CHECK(args[4]->IsNumber());
+    column_offset = args[4].As<Int32>()->Value();
+    if (args[5]->IsSymbol()) {
+      id_symbol = args[5].As<Symbol>();
+      can_use_builtin_cache =
+          (id_symbol ==
+           realm->isolate_data()->source_text_module_default_hdo());
+    } else {
+      id_symbol = Symbol::New(isolate, url);
+    }
+    host_defined_options = GetHostDefinedOptions(isolate, id_symbol);
 
-  ShouldNotAbortOnUncaughtScope no_abort_scope(env);
-  TryCatchScope try_catch(env);
+    if (that->SetPrivate(context,
+                         realm->isolate_data()->host_defined_option_symbol(),
+                         id_symbol)
+            .IsNothing()) {
+      return;
+    }
+  }
+
+  ShouldNotAbortOnUncaughtScope no_abort_scope(realm->env());
+  TryCatchScope try_catch(realm->env());
 
   Local<Module> module;
 
@@ -159,201 +331,518 @@ void ModuleWrap::New(const FunctionCallbackInfo<Value>& args) {
       Local<Array> export_names_arr = args[2].As<Array>();
 
       uint32_t len = export_names_arr->Length();
-      std::vector<Local<String>> export_names(len);
+      LocalVector<String> export_names(realm->isolate(), len);
       for (uint32_t i = 0; i < len; i++) {
-        Local<Value> export_name_val =
-            export_names_arr->Get(context, i).ToLocalChecked();
+        Local<Value> export_name_val;
+        if (!export_names_arr->Get(context, i).ToLocal(&export_name_val)) {
+          return;
+        }
         CHECK(export_name_val->IsString());
         export_names[i] = export_name_val.As<String>();
       }
 
-      module = Module::CreateSyntheticModule(isolate, url, export_names,
-        SyntheticModuleEvaluationStepsCallback);
+      const MemorySpan<const Local<String>> span(export_names.begin(),
+                                                 export_names.size());
+      module = Module::CreateSyntheticModule(
+          isolate, url, span, SyntheticModuleEvaluationStepsCallback);
     } else {
-      ScriptCompiler::CachedData* cached_data = nullptr;
-      if (!args[5]->IsUndefined()) {
-        CHECK(args[5]->IsArrayBufferView());
+      // When we are compiling for the default loader, this will be
+      // std::nullopt, and CompileSourceTextModule() should use
+      // on-disk cache.
+      std::optional<ScriptCompiler::CachedData*> user_cached_data;
+      if (id_symbol !=
+          realm->isolate_data()->source_text_module_default_hdo()) {
+        user_cached_data = nullptr;
+      }
+      if (args[5]->IsArrayBufferView()) {
+        CHECK(!can_use_builtin_cache);  // We don't use this option internally.
         Local<ArrayBufferView> cached_data_buf = args[5].As<ArrayBufferView>();
-        uint8_t* data = static_cast<uint8_t*>(
-            cached_data_buf->Buffer()->GetBackingStore()->Data());
-        cached_data =
+        uint8_t* data =
+            static_cast<uint8_t*>(cached_data_buf->Buffer()->Data());
+        user_cached_data =
             new ScriptCompiler::CachedData(data + cached_data_buf->ByteOffset(),
                                            cached_data_buf->ByteLength());
       }
-
-      Local<String> source_text = args[2].As<String>();
-      ScriptOrigin origin(url,
-                          line_offset,                      // line offset
-                          column_offset,                    // column offset
-                          True(isolate),                    // is cross origin
-                          Local<Integer>(),                 // script id
-                          Local<Value>(),                   // source map URL
-                          False(isolate),                   // is opaque (?)
-                          False(isolate),                   // is WASM
-                          True(isolate),                    // is ES Module
-                          host_defined_options);
-      ScriptCompiler::Source source(source_text, origin, cached_data);
-      ScriptCompiler::CompileOptions options;
-      if (source.GetCachedData() == nullptr) {
-        options = ScriptCompiler::kNoCompileOptions;
-      } else {
-        options = ScriptCompiler::kConsumeCodeCache;
+#ifndef DISABLE_SINGLE_EXECUTABLE_APPLICATION
+      // For embedder ESM in a SEA, use the bundled code cache if available.
+      if (id_symbol == realm->isolate_data()->embedder_module_hdo() &&
+          sea::IsSingleExecutable()) {
+        const sea::SeaResource& sea = sea::FindSingleExecutableResource();
+        if (sea.use_code_cache()) {
+          std::string_view data = sea.code_cache.value();
+          user_cached_data = new ScriptCompiler::CachedData(
+              reinterpret_cast<const uint8_t*>(data.data()),
+              static_cast<int>(data.size()),
+              ScriptCompiler::CachedData::BufferNotOwned);
+        }
       }
-      if (!ScriptCompiler::CompileModule(isolate, &source, options)
+#endif  // !DISABLE_SINGLE_EXECUTABLE_APPLICATION
+      Local<String> source_text = args[2].As<String>();
+
+      bool cache_rejected = false;
+      if (!CompileSourceTextModule(realm,
+                                   source_text,
+                                   url,
+                                   line_offset,
+                                   column_offset,
+                                   host_defined_options,
+                                   user_cached_data,
+                                   &cache_rejected)
                .ToLocal(&module)) {
         if (try_catch.HasCaught() && !try_catch.HasTerminated()) {
           CHECK(!try_catch.Message().IsEmpty());
           CHECK(!try_catch.Exception().IsEmpty());
-          AppendExceptionLine(env, try_catch.Exception(), try_catch.Message(),
+          AppendExceptionLine(realm->env(),
+                              try_catch.Exception(),
+                              try_catch.Message(),
                               ErrorHandlingMode::MODULE_ERROR);
           try_catch.ReThrow();
         }
         return;
       }
-      if (options == ScriptCompiler::kConsumeCodeCache &&
-          source.GetCachedData()->rejected) {
-        THROW_ERR_VM_MODULE_CACHED_DATA_REJECTED(
-            env, "cachedData buffer was rejected");
-        try_catch.ReThrow();
+
+      if (user_cached_data.has_value() && user_cached_data.value() != nullptr) {
+#ifndef DISABLE_SINGLE_EXECUTABLE_APPLICATION
+        if (id_symbol == realm->isolate_data()->embedder_module_hdo() &&
+            sea::IsSingleExecutable()) {
+          if (cache_rejected) {
+            per_process::Debug(DebugCategory::SEA,
+                               "SEA module code cache rejected\n");
+            ProcessEmitWarningSync(realm->env(), "Code cache data rejected.");
+          } else {
+            per_process::Debug(DebugCategory::SEA,
+                               "SEA module code cache accepted\n");
+          }
+        } else  // NOLINT(readability/braces)
+#endif          // !DISABLE_SINGLE_EXECUTABLE_APPLICATION
+          if (cache_rejected) {
+            THROW_ERR_VM_MODULE_CACHED_DATA_REJECTED(
+                realm, "cachedData buffer was rejected");
+            try_catch.ReThrow();
+            return;
+          }
+      }
+
+      if (that->Set(context,
+                    realm->env()->has_top_level_await_string(),
+                    Boolean::New(isolate, module->HasTopLevelAwait()))
+              .IsNothing()) {
+        return;
+      }
+
+      if (that->Set(context,
+                    realm->env()->source_url_string(),
+                    module->GetUnboundModuleScript()->GetSourceURL())
+              .IsNothing()) {
+        return;
+      }
+
+      if (that->Set(context,
+                    realm->env()->source_map_url_string(),
+                    module->GetUnboundModuleScript()->GetSourceMappingURL())
+              .IsNothing()) {
         return;
       }
     }
   }
 
-  if (!that->Set(context, env->url_string(), url).FromMaybe(false)) {
+  if (that->Set(context,
+                realm->isolate_data()->synthetic_string(),
+                Boolean::New(isolate, synthetic))
+          .IsNothing()) {
     return;
   }
 
-  ModuleWrap* obj = new ModuleWrap(env, that, module, url);
-
-  if (synthetic) {
-    obj->synthetic_ = true;
-    obj->synthetic_evaluation_steps_.Reset(
-        env->isolate(), args[3].As<Function>());
+  if (!that->Set(context, realm->isolate_data()->url_string(), url)
+           .FromMaybe(false)) {
+    return;
   }
 
-  obj->context_.Reset(isolate, context);
+  if (synthetic && args[4]->IsObject() &&
+      that->Set(context, realm->isolate_data()->imported_cjs_symbol(), args[4])
+          .IsNothing()) {
+    return;
+  }
 
-  env->hash_to_module_map.emplace(module->GetIdentityHash(), obj);
+  // Initialize an empty slot for source map cache before the object is frozen.
+  if (that->SetPrivate(context,
+                       realm->isolate_data()->source_map_data_private_symbol(),
+                       Undefined(isolate))
+          .IsNothing()) {
+    return;
+  }
 
-  host_defined_options->Set(isolate, HostDefinedOptions::kID,
-                            Number::New(isolate, obj->id()));
+  // Use the extras object as an object whose GetCreationContext() will be the
+  // original `context`, since the `Context` itself strictly speaking cannot
+  // be stored in an internal field.
+  Local<Object> context_object = context->GetExtrasBindingObject();
+  Local<Value> synthetic_evaluation_step =
+      synthetic ? args[3] : Undefined(realm->isolate()).As<Value>();
 
-  that->SetIntegrityLevel(context, IntegrityLevel::kFrozen);
+  ModuleWrap* obj = new ModuleWrap(
+      realm, that, module, url, context_object, synthetic_evaluation_step);
+
+  obj->contextify_context_ = contextify_context;
+
   args.GetReturnValue().Set(that);
 }
 
-void ModuleWrap::Link(const FunctionCallbackInfo<Value>& args) {
-  Environment* env = Environment::GetCurrent(args);
+MaybeLocal<Module> ModuleWrap::CompileSourceTextModule(
+    Realm* realm,
+    Local<String> source_text,
+    Local<String> url,
+    int line_offset,
+    int column_offset,
+    Local<PrimitiveArray> host_defined_options,
+    std::optional<ScriptCompiler::CachedData*> user_cached_data,
+    bool* cache_rejected) {
+  Isolate* isolate = realm->isolate();
+  EscapableHandleScope scope(isolate);
+  ScriptOrigin origin(url,
+                      line_offset,
+                      column_offset,
+                      true,            // is cross origin
+                      -1,              // script id
+                      Local<Value>(),  // source map URL
+                      false,           // is opaque (?)
+                      false,           // is WASM
+                      true,            // is ES Module
+                      host_defined_options);
+  ScriptCompiler::CachedData* cached_data = nullptr;
+  CompileCacheEntry* cache_entry = nullptr;
+  // When compiling for the default loader, user_cached_data is std::nullptr.
+  // When compiling for vm.Module, it's either nullptr or a pointer to the
+  // cached data.
+  if (user_cached_data.has_value()) {
+    cached_data = user_cached_data.value();
+  } else if (realm->env()->use_compile_cache()) {
+    cache_entry = realm->env()->compile_cache_handler()->GetOrInsert(
+        source_text, url, CachedCodeType::kESM);
+  }
+
+  if (cache_entry != nullptr && cache_entry->cache != nullptr) {
+    // source will take ownership of cached_data.
+    cached_data = cache_entry->CopyCache();
+  }
+
+  ScriptCompiler::Source source(source_text, origin, cached_data);
+  ScriptCompiler::CompileOptions options;
+  if (cached_data == nullptr) {
+    options = ScriptCompiler::kNoCompileOptions;
+  } else {
+    options = ScriptCompiler::kConsumeCodeCache;
+  }
+
+  Local<Module> module;
+  if (!ScriptCompiler::CompileModule(isolate, &source, options)
+           .ToLocal(&module)) {
+    return scope.EscapeMaybe(MaybeLocal<Module>());
+  }
+
+  if (options == ScriptCompiler::kConsumeCodeCache) {
+    *cache_rejected = source.GetCachedData()->rejected;
+  }
+
+  if (cache_entry != nullptr) {
+    realm->env()->compile_cache_handler()->MaybeSave(
+        cache_entry, module, *cache_rejected);
+  }
+
+  return scope.Escape(module);
+}
+
+ModulePhase to_phase_constant(ModuleImportPhase phase) {
+  switch (phase) {
+    case ModuleImportPhase::kEvaluation:
+      return kEvaluationPhase;
+    case ModuleImportPhase::kDefer:
+      return kDeferPhase;
+    case ModuleImportPhase::kSource:
+      return kSourcePhase;
+    default:
+      UNREACHABLE();
+  }
+}
+
+static Local<Object> createImportAttributesContainer(
+    Realm* realm,
+    Isolate* isolate,
+    Local<FixedArray> raw_attributes,
+    const int elements_per_attribute) {
+  CHECK_EQ(raw_attributes->Length() % elements_per_attribute, 0);
+  size_t num_attributes = raw_attributes->Length() / elements_per_attribute;
+  LocalVector<Name> names(isolate, num_attributes);
+  LocalVector<Value> values(isolate, num_attributes);
+
+  for (int i = 0; i < raw_attributes->Length(); i += elements_per_attribute) {
+    Local<Data> key = raw_attributes->Get(i);
+    Local<Data> value = raw_attributes->Get(i + 1);
+    DCHECK(DataIsString(key));
+    DCHECK(DataIsString(value));
+
+    int idx = i / elements_per_attribute;
+    names[idx] = key.As<String>();
+    values[idx] = value.As<String>();
+  }
+
+  Local<Object> attributes = Object::New(
+      isolate, Null(isolate), names.data(), values.data(), num_attributes);
+  attributes->SetIntegrityLevel(realm->context(), v8::IntegrityLevel::kFrozen)
+      .Check();
+  return attributes;
+}
+
+static Local<Array> createModuleRequestsContainer(
+    Realm* realm, Isolate* isolate, Local<FixedArray> raw_requests) {
+  EscapableHandleScope scope(isolate);
+  Local<Context> context = realm->context();
+  LocalVector<Value> requests(isolate, raw_requests->Length());
+
+  for (int i = 0; i < raw_requests->Length(); i++) {
+    DCHECK(raw_requests->Get(i)->IsModuleRequest());
+    Local<ModuleRequest> module_request =
+        raw_requests->Get(i).As<ModuleRequest>();
+
+    Local<String> specifier = module_request->GetSpecifier();
+
+    // Contains the import attributes for this request in the form:
+    // [key1, value1, source_offset1, key2, value2, source_offset2, ...].
+    Local<FixedArray> raw_attributes = module_request->GetImportAttributes();
+    Local<Object> attributes =
+        createImportAttributesContainer(realm, isolate, raw_attributes, 3);
+    ModuleImportPhase phase = module_request->GetPhase();
+
+    Local<Name> names[] = {
+        realm->isolate_data()->specifier_string(),
+        realm->isolate_data()->attributes_string(),
+        realm->isolate_data()->phase_string(),
+    };
+    Local<Value> values[] = {
+        specifier,
+        attributes,
+        Integer::New(isolate, to_phase_constant(phase)),
+    };
+    DCHECK_EQ(arraysize(names), arraysize(values));
+
+    Local<Object> request =
+        Object::New(isolate, Null(isolate), names, values, arraysize(names));
+    request->SetIntegrityLevel(context, v8::IntegrityLevel::kFrozen).Check();
+
+    requests[i] = request;
+  }
+
+  return scope.Escape(Array::New(isolate, requests.data(), requests.size()));
+}
+
+void ModuleWrap::GetModuleRequests(const FunctionCallbackInfo<Value>& args) {
+  Realm* realm = Realm::GetCurrent(args);
   Isolate* isolate = args.GetIsolate();
-
-  CHECK_EQ(args.Length(), 1);
-  CHECK(args[0]->IsFunction());
-
   Local<Object> that = args.This();
 
   ModuleWrap* obj;
   ASSIGN_OR_RETURN_UNWRAP(&obj, that);
 
-  if (obj->linked_)
-    return;
-  obj->linked_ = true;
-
-  Local<Function> resolver_arg = args[0].As<Function>();
-
-  Local<Context> mod_context = obj->context_.Get(isolate);
   Local<Module> module = obj->module_.Get(isolate);
+  args.GetReturnValue().Set(createModuleRequestsContainer(
+      realm, isolate, module->GetModuleRequests()));
+}
 
-  Local<Array> promises = Array::New(isolate,
-                                     module->GetModuleRequestsLength());
+// moduleWrap.link(moduleWraps)
+void ModuleWrap::Link(const FunctionCallbackInfo<Value>& args) {
+  Isolate* isolate = args.GetIsolate();
+  HandleScope handle_scope(isolate);
+  Realm* realm = Realm::GetCurrent(args);
+  Local<Context> context = realm->context();
 
-  // call the dependency resolve callbacks
-  for (int i = 0; i < module->GetModuleRequestsLength(); i++) {
-    Local<String> specifier = module->GetModuleRequest(i);
-    Utf8Value specifier_utf8(env->isolate(), specifier);
-    std::string specifier_std(*specifier_utf8, specifier_utf8.length());
+  ModuleWrap* dependent;
+  ASSIGN_OR_RETURN_UNWRAP(&dependent, args.This());
 
-    Local<Value> argv[] = {
-      specifier
-    };
+  CHECK_EQ(args.Length(), 1);
 
-    MaybeLocal<Value> maybe_resolve_return_value =
-        resolver_arg->Call(mod_context, that, 1, argv);
-    if (maybe_resolve_return_value.IsEmpty()) {
-      return;
+  Local<FixedArray> requests =
+      dependent->module_.Get(isolate)->GetModuleRequests();
+  Local<Array> modules = args[0].As<Array>();
+  std::vector<Global<Value>> modules_vector;
+  if (FromV8Array(context, modules, &modules_vector).IsEmpty()) {
+    return;
+  }
+  size_t request_count = static_cast<size_t>(requests->Length());
+  CHECK_EQ(modules_vector.size(), request_count);
+  std::vector<ModuleWrap*> linked_module_wraps(request_count);
+
+  // Track the duplicated module requests. For example if a modulelooks like
+  // this:
+  //
+  // import { foo } from 'mod' with { type: 'json' };
+  // import source ModSource from 'mod' with { type: 'json' };
+  // import { baz } from 'mod2';
+  //
+  // The first two module requests are identical. The map would look like
+  // { mod_key: 0, mod2_key: 2 } in this case, so that module request 0 and
+  // module request 1 would be mapped to mod_key and both should resolve to the
+  // module identified by module request 0 (the first one with this identity),
+  // and module request 2 should resolve the module identified by index 2.
+  std::unordered_map<ModuleCacheKey, size_t, ModuleCacheKey::Hash>
+      module_request_map;
+
+  for (size_t i = 0; i < request_count; i++) {
+    // TODO(joyeecheung): merge this with the serializeKey() in module_map.js.
+    // This currently doesn't sort the import attributes.
+    Local<Value> module_value = modules_vector[i].Get(isolate);
+    ModuleCacheKey module_cache_key =
+        ModuleCacheKey::From(requests->Get(i).As<ModuleRequest>());
+    auto it = module_request_map.find(module_cache_key);
+    if (it == module_request_map.end()) {
+      // This is the first request with this identity, record it - any mismatch
+      // for this would only be found in subsequent requests, so no need to
+      // check here.
+      module_request_map[module_cache_key] = i;
+    } else {  // This identity has been seen before, check for mismatch.
+      size_t first_seen_index = it->second;
+      // Check that the module is the same as the one resolved by the first
+      // request with this identity.
+      Local<Value> first_seen_value =
+          modules_vector[first_seen_index].Get(isolate);
+      if (!module_value->StrictEquals(first_seen_value)) {
+        // If the module is different from the one of the same request, throw an
+        // error.
+        THROW_ERR_MODULE_LINK_MISMATCH(
+            realm->env(),
+            "Module request '%s' at index %d must be linked "
+            "to the same module requested at index %d",
+            module_cache_key.ToString(),
+            i,
+            first_seen_index);
+        return;
+      }
     }
-    Local<Value> resolve_return_value =
-        maybe_resolve_return_value.ToLocalChecked();
-    if (!resolve_return_value->IsPromise()) {
-      env->ThrowError("linking error, expected resolver to return a promise");
-    }
-    Local<Promise> resolve_promise = resolve_return_value.As<Promise>();
-    obj->resolve_cache_[specifier_std].Reset(env->isolate(), resolve_promise);
 
-    promises->Set(mod_context, i, resolve_promise).Check();
+    CHECK(module_value->IsObject());  // Guaranteed by link methods in JS land.
+    ModuleWrap* resolved =
+        BaseObject::Unwrap<ModuleWrap>(module_value.As<Object>());
+    CHECK_NOT_NULL(resolved);  // Guaranteed by link methods in JS land.
+    linked_module_wraps[i] = resolved;
   }
 
-  args.GetReturnValue().Set(promises);
+  args.This()->SetInternalField(kLinkedRequestsSlot, modules);
+  std::swap(dependent->linked_module_wraps_, linked_module_wraps);
+  dependent->linked_ = true;
 }
 
 void ModuleWrap::Instantiate(const FunctionCallbackInfo<Value>& args) {
-  Environment* env = Environment::GetCurrent(args);
+  Realm* realm = Realm::GetCurrent(args);
   Isolate* isolate = args.GetIsolate();
   ModuleWrap* obj;
   ASSIGN_OR_RETURN_UNWRAP(&obj, args.This());
-  Local<Context> context = obj->context_.Get(isolate);
+  Local<Context> context = obj->context();
   Local<Module> module = obj->module_.Get(isolate);
-  TryCatchScope try_catch(env);
-  USE(module->InstantiateModule(context, ResolveCallback));
+  Environment* env = realm->env();
 
-  // clear resolve cache on instantiate
-  obj->resolve_cache_.clear();
-
-  if (try_catch.HasCaught() && !try_catch.HasTerminated()) {
-    CHECK(!try_catch.Message().IsEmpty());
-    CHECK(!try_catch.Exception().IsEmpty());
-    AppendExceptionLine(env, try_catch.Exception(), try_catch.Message(),
-                        ErrorHandlingMode::MODULE_ERROR);
-    try_catch.ReThrow();
+  if (!obj->IsLinked()) {
+    THROW_ERR_VM_MODULE_LINK_FAILURE(env, "module is not linked");
     return;
+  }
+
+  {
+    TryCatchScope try_catch(env);
+    USE(module->InstantiateModule(
+        context, ResolveModuleCallback, ResolveSourceCallback));
+
+    if (try_catch.HasCaught() && !try_catch.HasTerminated()) {
+      CHECK(!try_catch.Message().IsEmpty());
+      CHECK(!try_catch.Exception().IsEmpty());
+      AppendExceptionLine(env,
+                          try_catch.Exception(),
+                          try_catch.Message(),
+                          ErrorHandlingMode::MODULE_ERROR);
+      try_catch.ReThrow();
+      return;
+    }
   }
 }
 
 void ModuleWrap::Evaluate(const FunctionCallbackInfo<Value>& args) {
-  Environment* env = Environment::GetCurrent(args);
-  Isolate* isolate = env->isolate();
+  Realm* realm = Realm::GetCurrent(args);
+  Isolate* isolate = realm->isolate();
   ModuleWrap* obj;
   ASSIGN_OR_RETURN_UNWRAP(&obj, args.This());
-  Local<Context> context = obj->context_.Get(isolate);
+  Local<Context> context = obj->context();
   Local<Module> module = obj->module_.Get(isolate);
+
+  ContextifyContext* contextify_context = obj->contextify_context_;
+  MicrotaskQueue* microtask_queue = nullptr;
+  if (contextify_context != nullptr)
+      microtask_queue = contextify_context->microtask_queue();
 
   // module.evaluate(timeout, breakOnSigint)
   CHECK_EQ(args.Length(), 2);
 
   CHECK(args[0]->IsNumber());
-  int64_t timeout = args[0]->IntegerValue(env->context()).FromJust();
+  int64_t timeout;
+  if (!args[0]->IntegerValue(realm->context()).To(&timeout)) {
+    return;
+  }
 
   CHECK(args[1]->IsBoolean());
   bool break_on_sigint = args[1]->IsTrue();
 
-  ShouldNotAbortOnUncaughtScope no_abort_scope(env);
-  TryCatchScope try_catch(env);
+  ShouldNotAbortOnUncaughtScope no_abort_scope(realm->env());
+  TryCatchScope try_catch(realm->env());
 
   bool timed_out = false;
   bool received_signal = false;
   MaybeLocal<Value> result;
-  if (break_on_sigint && timeout != -1) {
-    Watchdog wd(isolate, timeout, &timed_out);
-    SigintWatchdog swd(isolate, &received_signal);
+  {
+    auto wd = timeout != -1
+                  ? std::make_optional<Watchdog>(isolate, timeout, &timed_out)
+                  : std::nullopt;
+    auto swd = break_on_sigint ? std::make_optional<SigintWatchdog>(
+                                     isolate, &received_signal)
+                               : std::nullopt;
+
     result = module->Evaluate(context);
-  } else if (break_on_sigint) {
-    SigintWatchdog swd(isolate, &received_signal);
-    result = module->Evaluate(context);
-  } else if (timeout != -1) {
-    Watchdog wd(isolate, timeout, &timed_out);
-    result = module->Evaluate(context);
-  } else {
-    result = module->Evaluate(context);
+
+    Local<Value> res;
+    if (result.ToLocal(&res) && microtask_queue) {
+      DCHECK(res->IsPromise());
+
+      // To address https://github.com/nodejs/node/issues/59541 when the
+      // module has its own separate microtask queue in microtaskMode
+      // "afterEvaluate", we avoid returning a promise built inside the
+      // module's own context.
+      //
+      // Instead, we build a promise in the outer context, which we resolve
+      // with {result}, then we checkpoint the module's own queue, and finally
+      // we return the outer-context promise.
+      //
+      // If we simply returned the inner promise {result} directly, per
+      // https://tc39.es/ecma262/#sec-newpromiseresolvethenablejob, the outer
+      // context, when resolving a promise coming from a different context,
+      // would need to enqueue a task (known as a thenable job task) onto the
+      // queue of that different context (the module's context). But this queue
+      // will normally not be checkpointed after evaluate() returns.
+      //
+      // This means that the execution flow in the outer context would
+      // silently fall through at the statement (in lib/internal/vm/module.js):
+      //   await this[kWrap].evaluate(timeout, breakOnSigint)
+      //
+      // This is true for any promises created inside the module's context
+      // and made available to the outer context, as the node:vm doc explains.
+      //
+      // We must handle this particular return value differently to make it
+      // possible to await on the result of evaluate().
+      Local<Context> outer_context = isolate->GetCurrentContext();
+      Local<Promise::Resolver> resolver;
+      if (!Promise::Resolver::New(outer_context).ToLocal(&resolver)) {
+        result = {};
+      }
+      if (resolver->Resolve(outer_context, res).IsNothing()) {
+        result = {};
+      }
+      result = resolver->GetPromise();
+
+      microtask_queue->PerformCheckpoint(isolate);
+    }
   }
 
   if (result.IsEmpty()) {
@@ -362,16 +851,15 @@ void ModuleWrap::Evaluate(const FunctionCallbackInfo<Value>& args) {
 
   // Convert the termination exception into a regular exception.
   if (timed_out || received_signal) {
-    if (!env->is_main_thread() && env->is_stopping())
-      return;
-    env->isolate()->CancelTerminateExecution();
+    if (!realm->env()->is_main_thread() && realm->env()->is_stopping()) return;
+    isolate->CancelTerminateExecution();
     // It is possible that execution was terminated by another timeout in
     // which this timeout is nested, so check whether one of the watchdogs
     // from this invocation is responsible for termination.
     if (timed_out) {
-      THROW_ERR_SCRIPT_EXECUTION_TIMEOUT(env, timeout);
+      THROW_ERR_SCRIPT_EXECUTION_TIMEOUT(realm->env(), timeout);
     } else if (received_signal) {
-      THROW_ERR_SCRIPT_EXECUTION_INTERRUPTED(env);
+      THROW_ERR_SCRIPT_EXECUTION_INTERRUPTED(realm->env());
     }
   }
 
@@ -381,29 +869,131 @@ void ModuleWrap::Evaluate(const FunctionCallbackInfo<Value>& args) {
     return;
   }
 
-  args.GetReturnValue().Set(result.ToLocalChecked());
+  Local<Value> res;
+  if (result.ToLocal(&res)) {
+    args.GetReturnValue().Set(res);
+  }
+}
+
+Maybe<void> ThrowIfPromiseRejected(Realm* realm, Local<Promise> promise) {
+  Isolate* isolate = realm->isolate();
+  Local<Context> context = realm->context();
+  if (promise->State() != Promise::PromiseState::kRejected) {
+    return JustVoid();
+  }
+  // The rejected promise is created by V8, so we don't get a chance to mark
+  // it as resolved before the rejection happens from evaluation. But we can
+  // tell the promise rejection callback to treat it as a promise rejected
+  // before handler was added which would remove it from the unhandled
+  // rejection handling, since we are converting it into an error and throw
+  // from here directly.
+  Local<Value> type =
+      Integer::New(isolate,
+                   static_cast<int32_t>(
+                       PromiseRejectEvent::kPromiseHandlerAddedAfterReject));
+  Local<Value> args[] = {type, promise, Undefined(isolate)};
+  if (realm->promise_reject_callback()
+          ->Call(context, Undefined(isolate), arraysize(args), args)
+          .IsEmpty()) {
+    return Nothing<void>();
+  }
+  Local<Value> exception = promise->Result();
+  Local<Message> message = Exception::CreateMessage(isolate, exception);
+  AppendExceptionLine(
+      realm->env(), exception, message, ErrorHandlingMode::MODULE_ERROR);
+  isolate->ThrowException(exception);
+  return Nothing<void>();
+}
+
+void ThrowIfPromiseRejected(const FunctionCallbackInfo<Value>& args) {
+  if (!args[0]->IsPromise()) {
+    return;
+  }
+  ThrowIfPromiseRejected(Realm::GetCurrent(args), args[0].As<Promise>());
+}
+
+void ModuleWrap::EvaluateSync(const FunctionCallbackInfo<Value>& args) {
+  Realm* realm = Realm::GetCurrent(args);
+  Isolate* isolate = args.GetIsolate();
+  ModuleWrap* obj;
+  ASSIGN_OR_RETURN_UNWRAP(&obj, args.This());
+  Local<Context> context = obj->context();
+  Local<Module> module = obj->module_.Get(isolate);
+  Environment* env = realm->env();
+
+  Local<Value> result;
+  {
+    TryCatchScope try_catch(env);
+    if (!module->Evaluate(context).ToLocal(&result)) {
+      if (try_catch.HasCaught()) {
+        if (!try_catch.HasTerminated()) {
+          try_catch.ReThrow();
+        }
+        return;
+      }
+    }
+  }
+
+  CHECK(result->IsPromise());
+  Local<Promise> promise = result.As<Promise>();
+  if (ThrowIfPromiseRejected(realm, promise).IsNothing()) {
+    return;
+  }
+
+  // Graphs with top-level await are rejected by the caller before evaluation
+  // starts, so the promise must have been settled synchronously.
+  CHECK(!obj->HasAsyncGraph());
+  CHECK_EQ(promise->State(), Promise::PromiseState::kFulfilled);
+
+  args.GetReturnValue().Set(module->GetModuleNamespace());
 }
 
 void ModuleWrap::GetNamespace(const FunctionCallbackInfo<Value>& args) {
-  Environment* env = Environment::GetCurrent(args);
+  Realm* realm = Realm::GetCurrent(args);
   Isolate* isolate = args.GetIsolate();
   ModuleWrap* obj;
   ASSIGN_OR_RETURN_UNWRAP(&obj, args.This());
 
   Local<Module> module = obj->module_.Get(isolate);
-
-  switch (module->GetStatus()) {
-    default:
-      return env->ThrowError(
-          "cannot get namespace, Module has not been instantiated");
-    case v8::Module::Status::kInstantiated:
-    case v8::Module::Status::kEvaluating:
-    case v8::Module::Status::kEvaluated:
-      break;
+  if (module->GetStatus() < Module::kInstantiated) {
+    return THROW_ERR_MODULE_NOT_INSTANTIATED(realm->env());
   }
 
   Local<Value> result = module->GetModuleNamespace();
   args.GetReturnValue().Set(result);
+}
+
+void ModuleWrap::SetModuleSourceObject(
+    const FunctionCallbackInfo<Value>& args) {
+  ModuleWrap* obj;
+  ASSIGN_OR_RETURN_UNWRAP(&obj, args.This());
+
+  CHECK_EQ(args.Length(), 1);
+  CHECK(args[0]->IsObject());
+  CHECK(obj->object()
+            ->GetInternalField(kModuleSourceObjectSlot)
+            .As<Value>()
+            ->IsUndefined());
+
+  obj->object()->SetInternalField(kModuleSourceObjectSlot, args[0]);
+}
+
+void ModuleWrap::GetModuleSourceObject(
+    const FunctionCallbackInfo<Value>& args) {
+  Isolate* isolate = args.GetIsolate();
+  ModuleWrap* obj;
+  ASSIGN_OR_RETURN_UNWRAP(&obj, args.This());
+
+  CHECK_EQ(args.Length(), 0);
+  Local<Value> module_source_object =
+      obj->object()->GetInternalField(kModuleSourceObjectSlot).As<Value>();
+
+  if (module_source_object->IsUndefined()) {
+    THROW_ERR_SOURCE_PHASE_NOT_DEFINED(isolate, obj->url_);
+    return;
+  }
+
+  args.GetReturnValue().Set(module_source_object);
 }
 
 void ModuleWrap::GetStatus(const FunctionCallbackInfo<Value>& args) {
@@ -416,24 +1006,6 @@ void ModuleWrap::GetStatus(const FunctionCallbackInfo<Value>& args) {
   args.GetReturnValue().Set(module->GetStatus());
 }
 
-void ModuleWrap::GetStaticDependencySpecifiers(
-    const FunctionCallbackInfo<Value>& args) {
-  Environment* env = Environment::GetCurrent(args);
-  ModuleWrap* obj;
-  ASSIGN_OR_RETURN_UNWRAP(&obj, args.This());
-
-  Local<Module> module = obj->module_.Get(env->isolate());
-
-  int count = module->GetModuleRequestsLength();
-
-  Local<Array> specifiers = Array::New(env->isolate(), count);
-
-  for (int i = 0; i < count; i++)
-    specifiers->Set(env->context(), i, module->GetModuleRequest(i)).Check();
-
-  args.GetReturnValue().Set(specifiers);
-}
-
 void ModuleWrap::GetError(const FunctionCallbackInfo<Value>& args) {
   Isolate* isolate = args.GetIsolate();
   ModuleWrap* obj;
@@ -443,1053 +1015,414 @@ void ModuleWrap::GetError(const FunctionCallbackInfo<Value>& args) {
   args.GetReturnValue().Set(module->GetException());
 }
 
-MaybeLocal<Module> ModuleWrap::ResolveCallback(Local<Context> context,
-                                               Local<String> specifier,
-                                               Local<Module> referrer) {
+void ModuleWrap::HasAsyncGraph(Local<Name> property,
+                               const PropertyCallbackInfo<Value>& args) {
+  Isolate* isolate = args.GetIsolate();
+  Environment* env = Environment::GetCurrent(isolate);
+  ModuleWrap* obj;
+  ASSIGN_OR_RETURN_UNWRAP(&obj, args.Holder());
+
+  Local<Module> module = obj->module_.Get(isolate);
+  if (module->GetStatus() < Module::kInstantiated) {
+    return THROW_ERR_MODULE_NOT_INSTANTIATED(env);
+  }
+
+  args.GetReturnValue().Set(obj->HasAsyncGraph());
+}
+
+// static
+MaybeLocal<Module> ModuleWrap::ResolveModuleCallback(
+    Local<Context> context,
+    size_t module_request_index,
+    Local<Module> referrer) {
+  ModuleWrap* resolved_module;
+  if (!ResolveModule(context, module_request_index, referrer)
+           .To(&resolved_module)) {
+    return {};
+  }
+  DCHECK_NOT_NULL(resolved_module);
+  return resolved_module->module_.Get(Isolate::GetCurrent());
+}
+
+// static
+MaybeLocal<Object> ModuleWrap::ResolveSourceCallback(
+    Local<Context> context,
+    size_t module_request_index,
+    Local<Module> referrer) {
+  ModuleWrap* resolved_module;
+  if (!ResolveModule(context, module_request_index, referrer)
+           .To(&resolved_module)) {
+    return {};
+  }
+  DCHECK_NOT_NULL(resolved_module);
+
+  Local<Value> module_source_object =
+      resolved_module->object()
+          ->GetInternalField(ModuleWrap::kModuleSourceObjectSlot)
+          .As<Value>();
+  if (module_source_object->IsUndefined()) {
+    THROW_ERR_SOURCE_PHASE_NOT_DEFINED(Isolate::GetCurrent(),
+                                       resolved_module->url_);
+    return {};
+  }
+  CHECK(module_source_object->IsObject());
+  return module_source_object.As<Object>();
+}
+
+static std::string GetSpecifierFromModuleRequest(Local<Module> referrer,
+                                                 size_t module_request_index) {
+  Local<ModuleRequest> raw_request =
+      referrer->GetModuleRequests()
+          ->Get(static_cast<int>(module_request_index))
+          .As<ModuleRequest>();
+  Local<String> specifier = raw_request->GetSpecifier();
+  Utf8Value specifier_utf8(Isolate::GetCurrent(), specifier);
+  return specifier_utf8.ToString();
+}
+
+// static
+Maybe<ModuleWrap*> ModuleWrap::ResolveModule(Local<Context> context,
+                                             size_t module_request_index,
+                                             Local<Module> referrer) {
+  Isolate* isolate = Isolate::GetCurrent();
   Environment* env = Environment::GetCurrent(context);
-  CHECK_NOT_NULL(env);  // TODO(addaleax): Handle nullptr here.
-  Isolate* isolate = env->isolate();
+  if (env == nullptr) {
+    THROW_ERR_EXECUTION_ENVIRONMENT_NOT_AVAILABLE(isolate);
+    return Nothing<ModuleWrap*>();
+  }
+  // Check that the referrer is not yet been instantiated.
+  DCHECK(referrer->GetStatus() <= Module::kInstantiated);
 
-  ModuleWrap* dependent = GetFromModule(env, referrer);
+  ModuleWrap* dependent = ModuleWrap::GetFromModule(env, referrer);
   if (dependent == nullptr) {
-    env->ThrowError("linking error, null dep");
-    return MaybeLocal<Module>();
+    std::string specifier =
+        GetSpecifierFromModuleRequest(referrer, module_request_index);
+    THROW_ERR_VM_MODULE_LINK_FAILURE(
+        env, "request for '%s' is from invalid module", specifier);
+    return Nothing<ModuleWrap*>();
+  }
+  if (!dependent->IsLinked()) {
+    std::string specifier =
+        GetSpecifierFromModuleRequest(referrer, module_request_index);
+    THROW_ERR_VM_MODULE_LINK_FAILURE(env,
+                                     "request for '%s' can not be resolved on "
+                                     "module '%s' that is not linked",
+                                     specifier,
+                                     dependent->url_);
+    return Nothing<ModuleWrap*>();
   }
 
-  Utf8Value specifier_utf8(isolate, specifier);
-  std::string specifier_std(*specifier_utf8, specifier_utf8.length());
-
-  if (dependent->resolve_cache_.count(specifier_std) != 1) {
-    env->ThrowError("linking error, not in local cache");
-    return MaybeLocal<Module>();
-  }
-
-  Local<Promise> resolve_promise =
-      dependent->resolve_cache_[specifier_std].Get(isolate);
-
-  if (resolve_promise->State() != Promise::kFulfilled) {
-    env->ThrowError("linking error, dependency promises must be resolved on "
-                    "instantiate");
-    return MaybeLocal<Module>();
-  }
-
-  Local<Object> module_object = resolve_promise->Result().As<Object>();
-  if (module_object.IsEmpty() || !module_object->IsObject()) {
-    env->ThrowError("linking error, expected a valid module object from "
-                    "resolver");
-    return MaybeLocal<Module>();
-  }
-
-  ModuleWrap* module;
-  ASSIGN_OR_RETURN_UNWRAP(&module, module_object, MaybeLocal<Module>());
-  return module->module_.Get(isolate);
-}
-
-namespace {
-
-// Tests whether a path starts with /, ./ or ../
-// In WhatWG terminology, the alternative case is called a "bare" specifier
-// (e.g. in `import "jquery"`).
-inline bool ShouldBeTreatedAsRelativeOrAbsolutePath(
-    const std::string& specifier) {
-  size_t len = specifier.length();
-  if (len == 0)
-    return false;
-  if (specifier[0] == '/') {
-    return true;
-  } else if (specifier[0] == '.') {
-    if (len == 1 || specifier[1] == '/')
-      return true;
-    if (specifier[1] == '.') {
-      if (len == 2 || specifier[2] == '/')
-        return true;
-    }
-  }
-  return false;
-}
-
-std::string ReadFile(uv_file file) {
-  std::string contents;
-  uv_fs_t req;
-  char buffer_memory[4096];
-  uv_buf_t buf = uv_buf_init(buffer_memory, sizeof(buffer_memory));
-
-  do {
-    const int r = uv_fs_read(nullptr,
-                             &req,
-                             file,
-                             &buf,
-                             1,
-                             contents.length(),  // offset
-                             nullptr);
-    uv_fs_req_cleanup(&req);
-
-    if (r <= 0)
-      break;
-    contents.append(buf.base, r);
-  } while (true);
-  return contents;
-}
-
-enum DescriptorType {
-  FILE,
-  DIRECTORY,
-  NONE
-};
-
-// When DescriptorType cache is added, this can also return
-// Nothing for the "null" cache entries.
-inline Maybe<uv_file> OpenDescriptor(const std::string& path) {
-  uv_fs_t fs_req;
-#ifdef _WIN32
-  std::string pth = "\\\\.\\" + path;
-  uv_file fd = uv_fs_open(nullptr, &fs_req, pth.c_str(), O_RDONLY, 0, nullptr);
-#else
-  uv_file fd = uv_fs_open(nullptr, &fs_req, path.c_str(), O_RDONLY, 0, nullptr);
-#endif
-  uv_fs_req_cleanup(&fs_req);
-  if (fd < 0) return Nothing<uv_file>();
-  return Just(fd);
-}
-
-inline void CloseDescriptor(uv_file fd) {
-  uv_fs_t fs_req;
-  CHECK_EQ(0, uv_fs_close(nullptr, &fs_req, fd, nullptr));
-  uv_fs_req_cleanup(&fs_req);
-}
-
-inline DescriptorType CheckDescriptorAtFile(uv_file fd) {
-  uv_fs_t fs_req;
-  int rc = uv_fs_fstat(nullptr, &fs_req, fd, nullptr);
-  if (rc == 0) {
-    uint64_t is_directory = fs_req.statbuf.st_mode & S_IFDIR;
-    uv_fs_req_cleanup(&fs_req);
-    return is_directory ? DIRECTORY : FILE;
-  }
-  uv_fs_req_cleanup(&fs_req);
-  return NONE;
-}
-
-// TODO(@guybedford): Add a DescriptorType cache layer here.
-// Should be directory based -> if path/to/dir doesn't exist
-// then the cache should early-fail any path/to/dir/file check.
-DescriptorType CheckDescriptorAtPath(const std::string& path) {
-  Maybe<uv_file> fd = OpenDescriptor(path);
-  if (fd.IsNothing()) return NONE;
-  DescriptorType type = CheckDescriptorAtFile(fd.FromJust());
-  CloseDescriptor(fd.FromJust());
-  return type;
-}
-
-Maybe<std::string> ReadIfFile(const std::string& path) {
-  Maybe<uv_file> fd = OpenDescriptor(path);
-  if (fd.IsNothing()) return Nothing<std::string>();
-  DescriptorType type = CheckDescriptorAtFile(fd.FromJust());
-  if (type != FILE) return Nothing<std::string>();
-  std::string source = ReadFile(fd.FromJust());
-  CloseDescriptor(fd.FromJust());
-  return Just(source);
-}
-
-using Exists = PackageConfig::Exists;
-using IsValid = PackageConfig::IsValid;
-using HasMain = PackageConfig::HasMain;
-using HasName = PackageConfig::HasName;
-using PackageType = PackageConfig::PackageType;
-
-Maybe<const PackageConfig*> GetPackageConfig(Environment* env,
-                                             const std::string& path,
-                                             const URL& base) {
-  auto existing = env->package_json_cache.find(path);
-  if (existing != env->package_json_cache.end()) {
-    const PackageConfig* pcfg = &existing->second;
-    if (pcfg->is_valid == IsValid::No) {
-      std::string msg = "Invalid JSON in " + path +
-        " imported from " + base.ToFilePath();
-      node::THROW_ERR_INVALID_PACKAGE_CONFIG(env, msg.c_str());
-      return Nothing<const PackageConfig*>();
-    }
-    return Just(pcfg);
-  }
-
-  Maybe<std::string> source = ReadIfFile(path);
-
-  if (source.IsNothing()) {
-    auto entry = env->package_json_cache.emplace(path,
-        PackageConfig { Exists::No, IsValid::Yes, HasMain::No, "",
-                        HasName::No, "",
-                        PackageType::None, Global<Value>() });
-    return Just(&entry.first->second);
-  }
-
-  std::string pkg_src = source.FromJust();
-
-  Isolate* isolate = env->isolate();
-  v8::HandleScope handle_scope(isolate);
-
-  Local<Object> pkg_json;
-  {
-    Local<Value> src;
-    Local<Value> pkg_json_v;
-    Local<Context> context = env->context();
-
-    if (!ToV8Value(context, pkg_src).ToLocal(&src) ||
-        !v8::JSON::Parse(context, src.As<String>()).ToLocal(&pkg_json_v) ||
-        !pkg_json_v->ToObject(context).ToLocal(&pkg_json)) {
-      env->package_json_cache.emplace(path,
-          PackageConfig { Exists::Yes, IsValid::No, HasMain::No, "",
-                          HasName::No, "",
-                          PackageType::None, Global<Value>() });
-      std::string msg = "Invalid JSON in " + path +
-          " imported from " + base.ToFilePath();
-      node::THROW_ERR_INVALID_PACKAGE_CONFIG(env, msg.c_str());
-      return Nothing<const PackageConfig*>();
-    }
-  }
-
-  Local<Value> pkg_main;
-  HasMain has_main = HasMain::No;
-  std::string main_std;
-  if (pkg_json->Get(env->context(), env->main_string()).ToLocal(&pkg_main)) {
-    if (pkg_main->IsString()) {
-      has_main = HasMain::Yes;
-    }
-    Utf8Value main_utf8(isolate, pkg_main);
-    main_std.assign(std::string(*main_utf8, main_utf8.length()));
-  }
-
-  Local<Value> pkg_name;
-  HasName has_name = HasName::No;
-  std::string name_std;
-  if (pkg_json->Get(env->context(), env->name_string()).ToLocal(&pkg_name)) {
-    if (pkg_name->IsString()) {
-      has_name = HasName::Yes;
-
-      Utf8Value name_utf8(isolate, pkg_name);
-      name_std.assign(std::string(*name_utf8, name_utf8.length()));
-    }
-  }
-
-  PackageType pkg_type = PackageType::None;
-  Local<Value> type_v;
-  if (pkg_json->Get(env->context(), env->type_string()).ToLocal(&type_v)) {
-    if (type_v->StrictEquals(env->module_string())) {
-      pkg_type = PackageType::Module;
-    } else if (type_v->StrictEquals(env->commonjs_string())) {
-      pkg_type = PackageType::CommonJS;
-    }
-    // ignore unknown types for forwards compatibility
-  }
-
-  Local<Value> exports_v;
-  if (pkg_json->Get(env->context(),
-      env->exports_string()).ToLocal(&exports_v) &&
-      !exports_v->IsNullOrUndefined()) {
-    Global<Value> exports;
-    exports.Reset(env->isolate(), exports_v);
-
-    auto entry = env->package_json_cache.emplace(path,
-        PackageConfig { Exists::Yes, IsValid::Yes, has_main, main_std,
-                        has_name, name_std,
-                        pkg_type, std::move(exports) });
-    return Just(&entry.first->second);
-  }
-
-  auto entry = env->package_json_cache.emplace(path,
-      PackageConfig { Exists::Yes, IsValid::Yes, has_main, main_std,
-                      has_name, name_std,
-                      pkg_type, Global<Value>() });
-  return Just(&entry.first->second);
-}
-
-Maybe<const PackageConfig*> GetPackageScopeConfig(Environment* env,
-                                                  const URL& resolved,
-                                                  const URL& base) {
-  URL pjson_url("./package.json", &resolved);
-  while (true) {
-    std::string pjson_url_path = pjson_url.path();
-    if (pjson_url_path.length() > 25 &&
-        pjson_url_path.substr(pjson_url_path.length() - 25, 25) ==
-        "node_modules/package.json") {
-      break;
-    }
-    Maybe<const PackageConfig*> pkg_cfg =
-        GetPackageConfig(env, pjson_url.ToFilePath(), base);
-    if (pkg_cfg.IsNothing()) return pkg_cfg;
-    if (pkg_cfg.FromJust()->exists == Exists::Yes) return pkg_cfg;
-
-    URL last_pjson_url = pjson_url;
-    pjson_url = URL("../package.json", pjson_url);
-
-    // Terminates at root where ../package.json equals ../../package.json
-    // (can't just check "/package.json" for Windows support).
-    if (pjson_url.path() == last_pjson_url.path()) break;
-  }
-  auto entry = env->package_json_cache.emplace(pjson_url.ToFilePath(),
-  PackageConfig { Exists::No, IsValid::Yes, HasMain::No, "",
-                  HasName::No, "",
-                  PackageType::None, Global<Value>() });
-  const PackageConfig* pcfg = &entry.first->second;
-  return Just(pcfg);
-}
-
-/*
- * Legacy CommonJS main resolution:
- * 1. let M = pkg_url + (json main field)
- * 2. TRY(M, M.js, M.json, M.node)
- * 3. TRY(M/index.js, M/index.json, M/index.node)
- * 4. TRY(pkg_url/index.js, pkg_url/index.json, pkg_url/index.node)
- * 5. NOT_FOUND
- */
-inline bool FileExists(const URL& url) {
-  return CheckDescriptorAtPath(url.ToFilePath()) == FILE;
-}
-Maybe<URL> LegacyMainResolve(const URL& pjson_url,
-                             const PackageConfig& pcfg) {
-  URL guess;
-  if (pcfg.has_main == HasMain::Yes) {
-    // Note: fs check redundances will be handled by Descriptor cache here.
-    if (FileExists(guess = URL("./" + pcfg.main, pjson_url))) {
-      return Just(guess);
-    }
-    if (FileExists(guess = URL("./" + pcfg.main + ".js", pjson_url))) {
-      return Just(guess);
-    }
-    if (FileExists(guess = URL("./" + pcfg.main + ".json", pjson_url))) {
-      return Just(guess);
-    }
-    if (FileExists(guess = URL("./" + pcfg.main + ".node", pjson_url))) {
-      return Just(guess);
-    }
-    if (FileExists(guess = URL("./" + pcfg.main + "/index.js", pjson_url))) {
-      return Just(guess);
-    }
-    // Such stat.
-    if (FileExists(guess = URL("./" + pcfg.main + "/index.json", pjson_url))) {
-      return Just(guess);
-    }
-    if (FileExists(guess = URL("./" + pcfg.main + "/index.node", pjson_url))) {
-      return Just(guess);
-    }
-    // Fallthrough.
-  }
-  if (FileExists(guess = URL("./index.js", pjson_url))) {
-    return Just(guess);
-  }
-  // So fs.
-  if (FileExists(guess = URL("./index.json", pjson_url))) {
-    return Just(guess);
-  }
-  if (FileExists(guess = URL("./index.node", pjson_url))) {
-    return Just(guess);
-  }
-  // Not found.
-  return Nothing<URL>();
-}
-
-enum ResolveExtensionsOptions {
-  TRY_EXACT_NAME,
-  ONLY_VIA_EXTENSIONS
-};
-
-template <ResolveExtensionsOptions options>
-Maybe<URL> ResolveExtensions(const URL& search) {
-  if (options == TRY_EXACT_NAME) {
-    if (FileExists(search)) {
-      return Just(search);
-    }
-  }
-
-  for (const char* extension : EXTENSIONS) {
-    URL guess(search.path() + extension, &search);
-    if (FileExists(guess)) {
-      return Just(guess);
-    }
-  }
-
-  return Nothing<URL>();
-}
-
-inline Maybe<URL> ResolveIndex(const URL& search) {
-  return ResolveExtensions<ONLY_VIA_EXTENSIONS>(URL("index", search));
-}
-
-Maybe<URL> FinalizeResolution(Environment* env,
-                              const URL& resolved,
-                              const URL& base) {
-  if (env->options()->experimental_specifier_resolution == "node") {
-    Maybe<URL> file = ResolveExtensions<TRY_EXACT_NAME>(resolved);
-    if (!file.IsNothing()) {
-      return file;
-    }
-    if (resolved.path().back() != '/') {
-      file = ResolveIndex(URL(resolved.path() + "/", &base));
-    } else {
-      file = ResolveIndex(resolved);
-    }
-    if (!file.IsNothing()) {
-      return file;
-    }
-    std::string msg = "Cannot find module " + resolved.path() +
-        " imported from " + base.ToFilePath();
-    node::THROW_ERR_MODULE_NOT_FOUND(env, msg.c_str());
-    return Nothing<URL>();
-  }
-
-  const std::string& path = resolved.ToFilePath();
-  if (CheckDescriptorAtPath(path) != FILE) {
-    std::string msg = "Cannot find module " +
-        (path.length() != 0 ? path : resolved.path()) +
-        " imported from " + base.ToFilePath();
-    node::THROW_ERR_MODULE_NOT_FOUND(env, msg.c_str());
-    return Nothing<URL>();
-  }
-
-  return Just(resolved);
-}
-
-void ThrowExportsNotFound(Environment* env,
-                          const std::string& subpath,
-                          const URL& pjson_url,
-                          const URL& base) {
-  const std::string msg = "Package exports for " +
-      pjson_url.ToFilePath() + " do not define a '" + subpath +
-      "' subpath, imported from " + base.ToFilePath();
-  node::THROW_ERR_MODULE_NOT_FOUND(env, msg.c_str());
-}
-
-void ThrowExportsInvalid(Environment* env,
-                         const std::string& subpath,
-                         const std::string& target,
-                         const URL& pjson_url,
-                         const URL& base) {
-  if (subpath.length()) {
-    const std::string msg = "Cannot resolve package exports target '" + target +
-        "' matched for '" + subpath + "' in " + pjson_url.ToFilePath() +
-        ", imported from " + base.ToFilePath();
-    node::THROW_ERR_MODULE_NOT_FOUND(env, msg.c_str());
+  size_t linked_module_count = dependent->linked_module_wraps_.size();
+  if (linked_module_count > 0) {
+    CHECK_LT(module_request_index, linked_module_count);
   } else {
-    const std::string msg = "Cannot resolve package main '" + target + "' in" +
-        pjson_url.ToFilePath() + ", imported from " + base.ToFilePath();
-    node::THROW_ERR_MODULE_NOT_FOUND(env, msg.c_str());
+    UNREACHABLE("Module resolution callback invoked for a module"
+                " without linked requests");
   }
+
+  return Just(dependent->linked_module_wraps_[module_request_index]);
 }
 
-void ThrowExportsInvalid(Environment* env,
-                         const std::string& subpath,
-                         Local<Value> target,
-                         const URL& pjson_url,
-                         const URL& base) {
-  Local<String> target_string;
-  if (target->ToString(env->context()).ToLocal(&target_string)) {
-    Utf8Value target_utf8(env->isolate(), target_string);
-    std::string target_str(*target_utf8, target_utf8.length());
-    if (target->IsArray()) {
-      target_str = '[' + target_str + ']';
-    }
-    ThrowExportsInvalid(env, subpath, target_str, pjson_url, base);
+static MaybeLocal<Promise> ImportModuleDynamicallyWithPhase(
+    Local<Context> context,
+    Local<Data> host_defined_options,
+    Local<Value> resource_name,
+    Local<String> specifier,
+    ModuleImportPhase phase,
+    Local<FixedArray> import_attributes) {
+  Isolate* isolate = Isolate::GetCurrent();
+  Environment* env = Environment::GetCurrent(context);
+  if (env == nullptr) {
+    THROW_ERR_EXECUTION_ENVIRONMENT_NOT_AVAILABLE(isolate);
+    return MaybeLocal<Promise>();
   }
-}
-
-Maybe<URL> ResolveExportsTargetString(Environment* env,
-                                      const std::string& target,
-                                      const std::string& subpath,
-                                      const std::string& match,
-                                      const URL& pjson_url,
-                                      const URL& base,
-                                      bool throw_invalid = true) {
-  if (target.substr(0, 2) != "./") {
-    if (throw_invalid) {
-      ThrowExportsInvalid(env, match, target, pjson_url, base);
-    }
-    return Nothing<URL>();
-  }
-  if (subpath.length() > 0 && target.back() != '/') {
-    if (throw_invalid) {
-      ThrowExportsInvalid(env, match, target, pjson_url, base);
-    }
-    return Nothing<URL>();
-  }
-  URL resolved(target, pjson_url);
-  std::string resolved_path = resolved.path();
-  std::string pkg_path = URL(".", pjson_url).path();
-  if (resolved_path.find(pkg_path) != 0 ||
-      resolved_path.find("/node_modules/", pkg_path.length() - 1) !=
-      std::string::npos) {
-    if (throw_invalid) {
-      ThrowExportsInvalid(env, match, target, pjson_url, base);
-    }
-    return Nothing<URL>();
-  }
-  if (subpath.length() == 0) return Just(resolved);
-  URL subpath_resolved(subpath, resolved);
-  std::string subpath_resolved_path = subpath_resolved.path();
-  if (subpath_resolved_path.find(resolved_path) != 0 ||
-      subpath_resolved_path.find("/node_modules/", pkg_path.length() - 1)
-      != std::string::npos) {
-    if (throw_invalid) {
-      ThrowExportsInvalid(env, match, target + subpath, pjson_url, base);
-    }
-    return Nothing<URL>();
-  }
-  return Just(subpath_resolved);
-}
-
-bool IsArrayIndex(Environment* env, Local<Value> p) {
-  Local<Context> context = env->context();
-  Local<String> p_str = p->ToString(context).ToLocalChecked();
-  double n_dbl = static_cast<double>(p_str->NumberValue(context).FromJust());
-  Local<Number> n = Number::New(env->isolate(), n_dbl);
-  Local<String> cmp_str = n->ToString(context).ToLocalChecked();
-  if (!p_str->Equals(context, cmp_str).FromJust()) {
-    return false;
-  }
-  if (n_dbl == 0 && std::signbit(n_dbl) == false) {
-    return true;
-  }
-  Local<Integer> cmp_integer;
-  if (!n->ToInteger(context).ToLocal(&cmp_integer)) {
-    return false;
-  }
-  return n_dbl > 0 && n_dbl < (2 ^ 32) - 1;
-}
-
-Maybe<URL> ResolveExportsTarget(Environment* env,
-                                const URL& pjson_url,
-                                Local<Value> target,
-                                const std::string& subpath,
-                                const std::string& pkg_subpath,
-                                const URL& base,
-                                bool throw_invalid = true) {
-  Isolate* isolate = env->isolate();
-  Local<Context> context = env->context();
-  if (target->IsString()) {
-    Utf8Value target_utf8(isolate, target.As<v8::String>());
-    std::string target_str(*target_utf8, target_utf8.length());
-    Maybe<URL> resolved = ResolveExportsTargetString(env, target_str, subpath,
-        pkg_subpath, pjson_url, base, throw_invalid);
-    if (resolved.IsNothing()) {
-      return Nothing<URL>();
-    }
-    return FinalizeResolution(env, resolved.FromJust(), base);
-  } else if (target->IsArray()) {
-      Local<Array> target_arr = target.As<Array>();
-      const uint32_t length = target_arr->Length();
-      if (length == 0) {
-        if (throw_invalid) {
-          ThrowExportsInvalid(env, pkg_subpath, target, pjson_url, base);
-        }
-        return Nothing<URL>();
-      }
-      for (uint32_t i = 0; i < length; i++) {
-        auto target_item = target_arr->Get(context, i).ToLocalChecked();
-        if (!target_item->IsArray()) {
-          Maybe<URL> resolved = ResolveExportsTarget(env, pjson_url,
-              target_item, subpath, pkg_subpath, base, false);
-          if (resolved.IsNothing()) continue;
-          return FinalizeResolution(env, resolved.FromJust(), base);
-        }
-      }
-      if (throw_invalid) {
-        auto invalid = target_arr->Get(context, length - 1).ToLocalChecked();
-        Maybe<URL> resolved = ResolveExportsTarget(env, pjson_url, invalid,
-            subpath, pkg_subpath, base, true);
-        CHECK(resolved.IsNothing());
-      }
-      return Nothing<URL>();
-  } else if (target->IsObject()) {
-    Local<Object> target_obj = target.As<Object>();
-    Local<Array> target_obj_keys =
-        target_obj->GetOwnPropertyNames(context).ToLocalChecked();
-    Local<Value> conditionalTarget;
-    bool matched = false;
-    for (uint32_t i = 0; i < target_obj_keys->Length(); ++i) {
-      Local<Value> key =
-          target_obj_keys->Get(context, i).ToLocalChecked();
-      if (IsArrayIndex(env, key)) {
-        const std::string msg = "Invalid package config for " +
-            pjson_url.ToFilePath() + ", \"exports\" cannot contain numeric " +
-            "property keys.";
-        node::THROW_ERR_INVALID_PACKAGE_CONFIG(env, msg.c_str());
-        return Nothing<URL>();
-      }
-    }
-    for (uint32_t i = 0; i < target_obj_keys->Length(); ++i) {
-      Local<Value> key = target_obj_keys->Get(context, i).ToLocalChecked();
-      Utf8Value key_utf8(env->isolate(),
-                         key->ToString(context).ToLocalChecked());
-      std::string key_str(*key_utf8, key_utf8.length());
-      if (key_str == "node" || key_str == "import") {
-        matched = true;
-        conditionalTarget = target_obj->Get(context, key).ToLocalChecked();
-        Maybe<URL> resolved = ResolveExportsTarget(env, pjson_url,
-            conditionalTarget, subpath, pkg_subpath, base, false);
-        if (!resolved.IsNothing()) {
-          ProcessEmitExperimentalWarning(env, "Conditional exports");
-          return resolved;
-        }
-      } else if (key_str == "default") {
-        matched = true;
-        conditionalTarget = target_obj->Get(context, key).ToLocalChecked();
-        Maybe<URL> resolved = ResolveExportsTarget(env, pjson_url,
-            conditionalTarget, subpath, pkg_subpath, base, false);
-        if (!resolved.IsNothing()) {
-          ProcessEmitExperimentalWarning(env, "Conditional exports");
-          return resolved;
-        }
-      }
-    }
-    if (matched && throw_invalid) {
-      Maybe<URL> resolved = ResolveExportsTarget(env, pjson_url,
-          conditionalTarget, subpath, pkg_subpath, base, true);
-      CHECK(resolved.IsNothing());
-      return Nothing<URL>();
-    }
-  }
-  if (throw_invalid) {
-    ThrowExportsInvalid(env, pkg_subpath, target, pjson_url, base);
-  }
-  return Nothing<URL>();
-}
-
-Maybe<bool> IsConditionalExportsMainSugar(Environment* env,
-                                          Local<Value> exports,
-                                          const URL& pjson_url,
-                                          const URL& base) {
-  if (exports->IsString() || exports->IsArray()) return Just(true);
-  if (!exports->IsObject()) return Just(false);
-  Local<Context> context = env->context();
-  Local<Object> exports_obj = exports.As<Object>();
-  Local<Array> keys =
-      exports_obj->GetOwnPropertyNames(context).ToLocalChecked();
-  bool isConditionalSugar = false;
-  for (uint32_t i = 0; i < keys->Length(); ++i) {
-    Local<Value> key = keys->Get(context, i).ToLocalChecked();
-    Utf8Value key_utf8(env->isolate(), key->ToString(context).ToLocalChecked());
-    bool curIsConditionalSugar = key_utf8.length() == 0 || key_utf8[0] != '.';
-    if (i == 0) {
-      isConditionalSugar = curIsConditionalSugar;
-    } else if (isConditionalSugar != curIsConditionalSugar) {
-      const std::string msg = "Cannot resolve package exports in " +
-        pjson_url.ToFilePath() + ", imported from " + base.ToFilePath() + ". " +
-        "\"exports\" cannot contain some keys starting with '.' and some not." +
-        " The exports object must either be an object of package subpath keys" +
-        " or an object of main entry condition name keys only.";
-      node::THROW_ERR_INVALID_PACKAGE_CONFIG(env, msg.c_str());
-      return Nothing<bool>();
-    }
-  }
-  return Just(isConditionalSugar);
-}
-
-Maybe<URL> PackageMainResolve(Environment* env,
-                              const URL& pjson_url,
-                              const PackageConfig& pcfg,
-                              const URL& base) {
-  if (pcfg.exists == Exists::Yes) {
-    Isolate* isolate = env->isolate();
-
-    if (!pcfg.exports.IsEmpty()) {
-      Local<Value> exports = pcfg.exports.Get(isolate);
-      Maybe<bool> isConditionalExportsMainSugar =
-          IsConditionalExportsMainSugar(env, exports, pjson_url, base);
-      if (isConditionalExportsMainSugar.IsNothing())
-        return Nothing<URL>();
-      if (isConditionalExportsMainSugar.FromJust()) {
-        return ResolveExportsTarget(env, pjson_url, exports, "", "", base,
-                                    true);
-      } else if (exports->IsObject()) {
-        Local<Object> exports_obj = exports.As<Object>();
-        if (exports_obj->HasOwnProperty(env->context(), env->dot_string())
-            .FromJust()) {
-          Local<Value> target =
-              exports_obj->Get(env->context(), env->dot_string())
-              .ToLocalChecked();
-          return ResolveExportsTarget(env, pjson_url, target, "", "", base,
-                                      true);
-        }
-      }
-    }
-    if (pcfg.has_main == HasMain::Yes) {
-      URL resolved(pcfg.main, pjson_url);
-      const std::string& path = resolved.ToFilePath();
-      if (CheckDescriptorAtPath(path) == FILE) {
-        return Just(resolved);
-      }
-    }
-    if (env->options()->experimental_specifier_resolution == "node") {
-      if (pcfg.has_main == HasMain::Yes) {
-        return FinalizeResolution(env, URL(pcfg.main, pjson_url), base);
-      } else {
-        return FinalizeResolution(env, URL("index", pjson_url), base);
-      }
-    }
-    if (pcfg.type != PackageType::Module) {
-      Maybe<URL> resolved = LegacyMainResolve(pjson_url, pcfg);
-      if (!resolved.IsNothing()) {
-        return resolved;
-      }
-    }
-  }
-  std::string msg = "Cannot find main entry point for " +
-      URL(".", pjson_url).ToFilePath() + " imported from " +
-      base.ToFilePath();
-  node::THROW_ERR_MODULE_NOT_FOUND(env, msg.c_str());
-  return Nothing<URL>();
-}
-
-Maybe<URL> PackageExportsResolve(Environment* env,
-                                 const URL& pjson_url,
-                                 const std::string& pkg_subpath,
-                                 const PackageConfig& pcfg,
-                                 const URL& base) {
-  Isolate* isolate = env->isolate();
-  Local<Context> context = env->context();
-  Local<Value> exports = pcfg.exports.Get(isolate);
-  Maybe<bool> isConditionalExportsMainSugar =
-      IsConditionalExportsMainSugar(env, exports, pjson_url, base);
-  if (isConditionalExportsMainSugar.IsNothing())
-    return Nothing<URL>();
-  if (!exports->IsObject() || isConditionalExportsMainSugar.FromJust()) {
-    ThrowExportsNotFound(env, pkg_subpath, pjson_url, base);
-    return Nothing<URL>();
-  }
-  Local<Object> exports_obj = exports.As<Object>();
-  Local<String> subpath = String::NewFromUtf8(isolate,
-      pkg_subpath.c_str(), v8::NewStringType::kNormal).ToLocalChecked();
-
-  if (exports_obj->HasOwnProperty(context, subpath).FromJust()) {
-    Local<Value> target = exports_obj->Get(context, subpath).ToLocalChecked();
-    Maybe<URL> resolved = ResolveExportsTarget(env, pjson_url, target, "",
-                                               pkg_subpath, base);
-    if (resolved.IsNothing()) {
-      return Nothing<URL>();
-    }
-    return FinalizeResolution(env, resolved.FromJust(), base);
+  Realm* realm = Realm::GetCurrent(context);
+  if (realm == nullptr) {
+    // Fallback to the principal realm if it's in a vm context.
+    realm = env->principal_realm();
   }
 
-  Local<String> best_match;
-  std::string best_match_str = "";
-  Local<Array> keys =
-      exports_obj->GetOwnPropertyNames(context).ToLocalChecked();
-  for (uint32_t i = 0; i < keys->Length(); ++i) {
-    Local<Value> key = keys->Get(context, i).ToLocalChecked();
-    Utf8Value key_utf8(isolate, key->ToString(context).ToLocalChecked());
-    std::string key_str(*key_utf8, key_utf8.length());
-    if (key_str.back() != '/') continue;
-    if (pkg_subpath.substr(0, key_str.length()) == key_str &&
-        key_str.length() > best_match_str.length()) {
-      best_match = key->ToString(context).ToLocalChecked();
-      best_match_str = key_str;
-    }
+  EscapableHandleScope handle_scope(isolate);
+
+  Local<Function> import_callback =
+      realm->host_import_module_dynamically_callback();
+  Local<Value> id;
+
+  Local<FixedArray> options = host_defined_options.As<FixedArray>();
+  // Get referrer id symbol from the host-defined options.
+  // If the host-defined options are empty, get the referrer id symbol
+  // from the realm global object.
+  if (options->Length() == HostDefinedOptions::kLength) {
+    id = options->Get(HostDefinedOptions::kID).As<Symbol>();
+  } else if (!context->Global()
+                  ->GetPrivate(context, env->host_defined_option_symbol())
+                  .ToLocal(&id)) {
+    return MaybeLocal<Promise>();
   }
 
-  if (best_match_str.length() > 0) {
-    auto target = exports_obj->Get(context, best_match).ToLocalChecked();
-    std::string subpath = pkg_subpath.substr(best_match_str.length());
+  Local<Object> attributes =
+      createImportAttributesContainer(realm, isolate, import_attributes, 2);
 
-    Maybe<URL> resolved = ResolveExportsTarget(env, pjson_url, target, subpath,
-                                               pkg_subpath, base);
-    if (resolved.IsNothing()) {
-      return Nothing<URL>();
-    }
-    return FinalizeResolution(env, resolved.FromJust(), base);
+  Local<Value> import_args[] = {
+      id,
+      Local<Value>(specifier),
+      Integer::New(isolate, to_phase_constant(phase)),
+      attributes,
+      resource_name,
+  };
+
+  Local<Value> result;
+  if (!import_callback
+           ->Call(
+               context, Undefined(isolate), arraysize(import_args), import_args)
+           .ToLocal(&result)) {
+    return {};
   }
 
-  ThrowExportsNotFound(env, pkg_subpath, pjson_url, base);
-  return Nothing<URL>();
-}
-
-Maybe<URL> ResolveSelf(Environment* env,
-                       const std::string& pkg_name,
-                       const std::string& pkg_subpath,
-                       const URL& base) {
-  const PackageConfig* pcfg;
-  if (GetPackageScopeConfig(env, base, base).To(&pcfg) &&
-      pcfg->exists == Exists::Yes) {
-    // TODO(jkrems): Find a way to forward the pair/iterator already generated
-    // while executing GetPackageScopeConfig
-    URL pjson_url("");
-    bool found_pjson = false;
-    for (auto it = env->package_json_cache.begin();
-          it != env->package_json_cache.end();
-          ++it) {
-      if (&it->second == pcfg) {
-        pjson_url = URL::FromFilePath(it->first);
-        found_pjson = true;
-      }
-    }
-    if (!found_pjson || pcfg->name != pkg_name) return Nothing<URL>();
-    if (pcfg->exports.IsEmpty()) return Nothing<URL>();
-    if (!pkg_subpath.length()) {
-      return PackageMainResolve(env, pjson_url, *pcfg, base);
-    } else {
-      return PackageExportsResolve(env, pjson_url, pkg_subpath, *pcfg, base);
-    }
+  // Wrap the returned value in a promise created in the referrer context to
+  // avoid dynamic scopes.
+  Local<Promise::Resolver> resolver;
+  if (!Promise::Resolver::New(context).ToLocal(&resolver)) {
+    return {};
   }
-
-  return Nothing<URL>();
-}
-
-Maybe<URL> PackageResolve(Environment* env,
-                          const std::string& specifier,
-                          const URL& base) {
-  size_t sep_index = specifier.find('/');
-  bool valid_package_name = true;
-  bool scope = false;
-  if (specifier[0] == '@') {
-    scope = true;
-    if (sep_index == std::string::npos || specifier.length() == 0) {
-      valid_package_name = false;
-    } else {
-      sep_index = specifier.find('/', sep_index + 1);
-    }
-  } else if (specifier[0] == '.') {
-    valid_package_name = false;
+  if (resolver->Resolve(context, result).IsNothing()) {
+    return {};
   }
-  std::string pkg_name = specifier.substr(0,
-      sep_index == std::string::npos ? std::string::npos : sep_index);
-  // Package name cannot have leading . and cannot have percent-encoding or
-  // separators.
-  for (size_t i = 0; i < pkg_name.length(); i++) {
-    char c = pkg_name[i];
-    if (c == '%' || c == '\\') {
-      valid_package_name = false;
-      break;
-    }
-  }
-  if (!valid_package_name) {
-    std::string msg = "Invalid package name '" + specifier +
-      "' imported from " + base.ToFilePath();
-    node::THROW_ERR_INVALID_MODULE_SPECIFIER(env, msg.c_str());
-    return Nothing<URL>();
-  }
-  std::string pkg_subpath;
-  if ((sep_index == std::string::npos ||
-      sep_index == specifier.length() - 1)) {
-    pkg_subpath = "";
-  } else {
-    pkg_subpath = "." + specifier.substr(sep_index);
-  }
-
-  Maybe<URL> self_url = ResolveSelf(env, pkg_name, pkg_subpath, base);
-  if (self_url.IsJust()) {
-    ProcessEmitExperimentalWarning(env, "Package name self resolution");
-    return self_url;
-  }
-
-  URL pjson_url("./node_modules/" + pkg_name + "/package.json", &base);
-  std::string pjson_path = pjson_url.ToFilePath();
-  std::string last_path;
-  do {
-    DescriptorType check =
-        CheckDescriptorAtPath(pjson_path.substr(0, pjson_path.length() - 13));
-    if (check != DIRECTORY) {
-      last_path = pjson_path;
-      pjson_url = URL((scope ?
-          "../../../../node_modules/" : "../../../node_modules/") +
-          pkg_name + "/package.json", &pjson_url);
-      pjson_path = pjson_url.ToFilePath();
-      continue;
-    }
-
-    // Package match.
-    Maybe<const PackageConfig*> pcfg = GetPackageConfig(env, pjson_path, base);
-    // Invalid package configuration error.
-    if (pcfg.IsNothing()) return Nothing<URL>();
-    if (!pkg_subpath.length()) {
-      return PackageMainResolve(env, pjson_url, *pcfg.FromJust(), base);
-    } else {
-      if (!pcfg.FromJust()->exports.IsEmpty()) {
-        return PackageExportsResolve(env, pjson_url, pkg_subpath,
-                                     *pcfg.FromJust(), base);
-      } else {
-        return FinalizeResolution(env, URL(pkg_subpath, pjson_url), base);
-      }
-    }
-    CHECK(false);
-    // Cross-platform root check.
-  } while (pjson_path.length() != last_path.length());
-
-  std::string msg = "Cannot find package '" + pkg_name +
-      "' imported from " + base.ToFilePath();
-  node::THROW_ERR_MODULE_NOT_FOUND(env, msg.c_str());
-  return Nothing<URL>();
-}
-
-}  // anonymous namespace
-
-Maybe<URL> Resolve(Environment* env,
-                   const std::string& specifier,
-                   const URL& base) {
-  // Order swapped from spec for minor perf gain.
-  // Ok since relative URLs cannot parse as URLs.
-  URL resolved;
-  if (ShouldBeTreatedAsRelativeOrAbsolutePath(specifier)) {
-    resolved = URL(specifier, base);
-  } else {
-    URL pure_url(specifier);
-    if (!(pure_url.flags() & URL_FLAGS_FAILED)) {
-      resolved = pure_url;
-    } else {
-      return PackageResolve(env, specifier, base);
-    }
-  }
-  return FinalizeResolution(env, resolved, base);
-}
-
-void ModuleWrap::Resolve(const FunctionCallbackInfo<Value>& args) {
-  Environment* env = Environment::GetCurrent(args);
-
-  // module.resolve(specifier, url)
-  CHECK_EQ(args.Length(), 2);
-
-  CHECK(args[0]->IsString());
-  Utf8Value specifier_utf8(env->isolate(), args[0]);
-  std::string specifier_std(*specifier_utf8, specifier_utf8.length());
-
-  CHECK(args[1]->IsString());
-  Utf8Value url_utf8(env->isolate(), args[1]);
-  URL url(*url_utf8, url_utf8.length());
-
-  if (url.flags() & URL_FLAGS_FAILED) {
-    return node::THROW_ERR_INVALID_ARG_TYPE(
-        env, "second argument is not a URL string");
-  }
-
-  Maybe<URL> result =
-      node::loader::Resolve(env,
-                            specifier_std,
-                            url);
-  if (result.IsNothing()) {
-    return;
-  }
-
-  URL resolution = result.FromJust();
-  CHECK(!(resolution.flags() & URL_FLAGS_FAILED));
-
-  Local<Value> resolution_obj;
-  if (resolution.ToObject(env).ToLocal(&resolution_obj))
-    args.GetReturnValue().Set(resolution_obj);
-}
-
-void ModuleWrap::GetPackageType(const FunctionCallbackInfo<Value>& args) {
-  Environment* env = Environment::GetCurrent(args);
-
-  // module.getPackageType(url)
-  CHECK_EQ(args.Length(), 1);
-
-  CHECK(args[0]->IsString());
-  Utf8Value url_utf8(env->isolate(), args[0]);
-  URL url(*url_utf8, url_utf8.length());
-
-  PackageType pkg_type = PackageType::None;
-  Maybe<const PackageConfig*> pcfg =
-      GetPackageScopeConfig(env, url, url);
-  if (!pcfg.IsNothing()) {
-    pkg_type = pcfg.FromJust()->type;
-  }
-
-  args.GetReturnValue().Set(Integer::New(env->isolate(), pkg_type));
+  return handle_scope.Escape(resolver->GetPromise());
 }
 
 static MaybeLocal<Promise> ImportModuleDynamically(
     Local<Context> context,
-    Local<v8::ScriptOrModule> referrer,
-    Local<String> specifier) {
-  Isolate* iso = context->GetIsolate();
-  Environment* env = Environment::GetCurrent(context);
-  CHECK_NOT_NULL(env);  // TODO(addaleax): Handle nullptr here.
-  v8::EscapableHandleScope handle_scope(iso);
-
-  Local<Function> import_callback =
-    env->host_import_module_dynamically_callback();
-
-  Local<PrimitiveArray> options = referrer->GetHostDefinedOptions();
-  if (options->Length() != HostDefinedOptions::kLength) {
-    Local<Promise::Resolver> resolver =
-        Promise::Resolver::New(context).ToLocalChecked();
-    resolver
-        ->Reject(context,
-                 v8::Exception::TypeError(FIXED_ONE_BYTE_STRING(
-                     context->GetIsolate(), "Invalid host defined options")))
-        .ToChecked();
-    return handle_scope.Escape(resolver->GetPromise());
-  }
-
-  Local<Value> object;
-
-  int type = options->Get(iso, HostDefinedOptions::kType)
-                 .As<Number>()
-                 ->Int32Value(context)
-                 .ToChecked();
-  uint32_t id = options->Get(iso, HostDefinedOptions::kID)
-                    .As<Number>()
-                    ->Uint32Value(context)
-                    .ToChecked();
-  if (type == ScriptType::kScript) {
-    contextify::ContextifyScript* wrap = env->id_to_script_map.find(id)->second;
-    object = wrap->object();
-  } else if (type == ScriptType::kModule) {
-    ModuleWrap* wrap = ModuleWrap::GetFromID(env, id);
-    object = wrap->object();
-  } else if (type == ScriptType::kFunction) {
-    auto it = env->id_to_function_map.find(id);
-    CHECK_NE(it, env->id_to_function_map.end());
-    object = it->second->object();
-  } else {
-    UNREACHABLE();
-  }
-
-  Local<Value> import_args[] = {
-    object,
-    Local<Value>(specifier),
-  };
-
-  Local<Value> result;
-  if (import_callback->Call(
-        context,
-        Undefined(iso),
-        arraysize(import_args),
-        import_args).ToLocal(&result)) {
-    CHECK(result->IsPromise());
-    return handle_scope.Escape(result.As<Promise>());
-  }
-
-  return MaybeLocal<Promise>();
+    Local<Data> host_defined_options,
+    Local<Value> resource_name,
+    Local<String> specifier,
+    Local<FixedArray> import_attributes) {
+  return ImportModuleDynamicallyWithPhase(context,
+                                          host_defined_options,
+                                          resource_name,
+                                          specifier,
+                                          ModuleImportPhase::kEvaluation,
+                                          import_attributes);
 }
 
 void ModuleWrap::SetImportModuleDynamicallyCallback(
     const FunctionCallbackInfo<Value>& args) {
-  Isolate* iso = args.GetIsolate();
-  Environment* env = Environment::GetCurrent(args);
-  HandleScope handle_scope(iso);
+  Isolate* isolate = args.GetIsolate();
+  Realm* realm = Realm::GetCurrent(args);
+  HandleScope handle_scope(isolate);
 
   CHECK_EQ(args.Length(), 1);
   CHECK(args[0]->IsFunction());
   Local<Function> import_callback = args[0].As<Function>();
-  env->set_host_import_module_dynamically_callback(import_callback);
+  realm->set_host_import_module_dynamically_callback(import_callback);
 
-  iso->SetHostImportModuleDynamicallyCallback(ImportModuleDynamically);
+  isolate->SetHostImportModuleDynamicallyCallback(ImportModuleDynamically);
+  isolate->SetHostImportModuleWithPhaseDynamicallyCallback(
+      ImportModuleDynamicallyWithPhase);
+}
+
+void ModuleWrap::SetImportMetaResolveInitializer(
+    const v8::FunctionCallbackInfo<v8::Value>& args) {
+  Isolate* isolate = args.GetIsolate();
+  Realm* realm = Realm::GetCurrent(args);
+  HandleScope handle_scope(isolate);
+
+  CHECK_EQ(args.Length(), 1);
+  CHECK(args[0]->IsFunction());
+  Local<Function> initializer = args[0].As<Function>();
+  realm->set_host_import_meta_resolve_initializer(initializer);
+}
+
+static void ImportMetaResolveLazyGetter(
+    Local<v8::Name> name, const PropertyCallbackInfo<Value>& info) {
+  Isolate* isolate = info.GetIsolate();
+  Local<Value> receiver_val = info.Holder();
+  if (!receiver_val->IsObject()) {
+    THROW_ERR_INVALID_INVOCATION(isolate);
+    return;
+  }
+  Local<Object> receiver = receiver_val.As<Object>();
+  Local<Context> context;
+  if (!receiver->GetCreationContext().ToLocal(&context)) {
+    THROW_ERR_INVALID_INVOCATION(isolate);
+    return;
+  }
+  Realm* realm = Realm::GetCurrent(context);
+  if (realm == nullptr) {
+    THROW_ERR_INVALID_INVOCATION(isolate);
+  }
+  Local<Function> initializer = realm->host_import_meta_resolve_initializer();
+  if (initializer.IsEmpty()) {
+    THROW_ERR_INVALID_INVOCATION(isolate);
+    return;
+  }
+
+  // This should be createImportMetaResolve(). The loader argument is already
+  // bound at initialization time.
+  Local<Value> args[] = {info.Data()};
+  Local<Value> ret;
+  if (!initializer
+           ->Call(context, Undefined(realm->isolate()), arraysize(args), args)
+           .ToLocal(&ret)) {
+    return;
+  }
+  info.GetReturnValue().Set(ret);
+}
+
+static void PathHelpersLazyGetter(Local<v8::Name> name,
+                                  const PropertyCallbackInfo<Value>& info) {
+  Isolate* isolate = info.GetIsolate();
+  // This getter has no JavaScript function representation and is not
+  // invoked in the creation context.
+  // When this getter is invoked in a vm context, the `Realm::GetCurrent(info)`
+  // returns a nullptr and retrieve the creation context via `this` object and
+  // get the creation Realm.
+  Local<Value> receiver_val = info.Holder();
+  if (!receiver_val->IsObject()) {
+    THROW_ERR_INVALID_INVOCATION(isolate);
+    return;
+  }
+  Local<Object> receiver = receiver_val.As<Object>();
+  Local<Context> context;
+  if (!receiver->GetCreationContext().ToLocal(&context)) {
+    THROW_ERR_INVALID_INVOCATION(isolate);
+    return;
+  }
+  Environment* env = Environment::GetCurrent(context);
+
+  node::Utf8Value url(isolate, info.Data());
+  auto file_url = ada::parse(url.ToStringView());
+  CHECK(file_url);
+  auto file_path = url::FileURLToPath(env, *file_url);
+  CHECK(file_path.has_value());
+  std::string_view ret_view = file_path.value();
+
+  node::Utf8Value utf8name(isolate, name);
+  auto plain_name = utf8name.ToStringView();
+  if (plain_name == "dirname") {
+#ifdef _WIN32
+#define PATH_SEPARATOR '\\'
+#else
+#define PATH_SEPARATOR '/'
+#endif
+    auto index = ret_view.rfind(PATH_SEPARATOR);
+    CHECK(index != std::string_view::npos);
+    ret_view.remove_suffix(ret_view.size() - index);
+#undef PATH_SEPARATOR
+  }
+  Local<Value> ret;
+  if (!ToV8Value(context, ret_view, isolate).ToLocal(&ret)) {
+    return;
+  }
+  info.GetReturnValue().Set(ret);
+}
+
+static Maybe<void> DefaultImportMetaObjectInitializer(Realm* realm,
+                                                      Local<Object> wrap,
+                                                      Local<Object> meta) {
+  Local<Context> context = realm->context();
+  Isolate* isolate = realm->isolate();
+  Environment* env = realm->env();
+
+  Local<Value> url;
+  if (!wrap->Get(context, env->url_string()).ToLocal(&url)) {
+    return Nothing<void>();
+  }
+
+  // N.B.: Order is important to keep keys in alphabetical order.
+
+  Utf8Value url_utf8(isolate, url);
+  if (url_utf8.ToStringView().starts_with("file:")) {
+    // Set a lazy getter of import.meta.dirname
+    if (meta->SetLazyDataProperty(
+                context, env->dirname_string(), PathHelpersLazyGetter, url)
+            .IsNothing()) {
+      return Nothing<void>();
+    }
+
+    // Set a lazy getter of import.meta.filename
+    if (meta->SetLazyDataProperty(
+                context, env->filename_string(), PathHelpersLazyGetter, url)
+            .IsNothing()) {
+      return Nothing<void>();
+    }
+  }
+
+  // Set import.meta.main = moduleWrap.isMain
+  Local<Value> is_main;
+  if (!wrap->Get(context, FIXED_ONE_BYTE_STRING(isolate, "isMain"))
+           .ToLocal(&is_main)) {
+    return Nothing<void>();
+  }
+  if (meta->Set(context,
+                FIXED_ONE_BYTE_STRING(isolate, "main"),
+                Boolean::New(isolate, is_main->IsTrue()))
+          .IsEmpty()) {
+    return Nothing<void>();
+  }
+
+  // Set a lazy getter of import.meta.resolve - only if the initializer is set,
+  // which is only the case when run on a non-loader-hook thread.
+  Local<Function> import_meta_resolve_initializer =
+      realm->host_import_meta_resolve_initializer();
+  if (!import_meta_resolve_initializer.IsEmpty() &&
+      meta->SetLazyDataProperty(context,
+                                FIXED_ONE_BYTE_STRING(isolate, "resolve"),
+                                ImportMetaResolveLazyGetter,
+                                url)
+          .IsNothing()) {
+    return Nothing<void>();
+  }
+
+  // Set import.meta.url = moduleWrap.url
+  if (meta->Set(context, env->url_string(), url).IsEmpty()) {
+    return Nothing<void>();
+  }
+
+  return JustVoid();
 }
 
 void ModuleWrap::HostInitializeImportMetaObjectCallback(
     Local<Context> context, Local<Module> module, Local<Object> meta) {
   Environment* env = Environment::GetCurrent(context);
-  CHECK_NOT_NULL(env);  // TODO(addaleax): Handle nullptr here.
+  if (env == nullptr)
+    return;
   ModuleWrap* module_wrap = GetFromModule(env, module);
 
   if (module_wrap == nullptr) {
     return;
   }
+  Realm* realm = Realm::GetCurrent(context);
+  if (realm == nullptr) {
+    // Fallback to the principal realm if it's in a vm context.
+    realm = env->principal_realm();
+  }
 
   Local<Object> wrap = module_wrap->object();
   Local<Function> callback =
-      env->host_initialize_import_meta_object_callback();
-  Local<Value> args[] = { wrap, meta };
+      realm->host_initialize_import_meta_object_callback();
+  Local<Value> id;
+  if (!wrap->GetPrivate(context, env->host_defined_option_symbol())
+           .ToLocal(&id)) {
+    return;
+  }
+  DCHECK(id->IsSymbol());
+
+  // Use the default initializer for source text modules without custom
+  // callbacks.
+  if (id == env->source_text_module_default_hdo() ||
+      id == env->embedder_module_hdo()) {
+    USE(DefaultImportMetaObjectInitializer(realm, wrap, meta));
+    return;
+  }
+
+  // For modules that have custom callbacks, call into JS land
+  // to look up the callback from the registry.
+  Local<Value> args[] = {id, meta, wrap};
   TryCatchScope try_catch(env);
+
   USE(callback->Call(
-        context, Undefined(env->isolate()), arraysize(args), args));
+      context, Undefined(realm->isolate()), arraysize(args), args));
   if (try_catch.HasCaught() && !try_catch.HasTerminated()) {
     try_catch.ReThrow();
   }
@@ -1497,13 +1430,13 @@ void ModuleWrap::HostInitializeImportMetaObjectCallback(
 
 void ModuleWrap::SetInitializeImportMetaObjectCallback(
     const FunctionCallbackInfo<Value>& args) {
-  Environment* env = Environment::GetCurrent(args);
-  Isolate* isolate = env->isolate();
+  Realm* realm = Realm::GetCurrent(args);
+  Isolate* isolate = realm->isolate();
 
   CHECK_EQ(args.Length(), 1);
   CHECK(args[0]->IsFunction());
   Local<Function> import_meta_callback = args[0].As<Function>();
-  env->set_host_initialize_import_meta_object_callback(import_meta_callback);
+  realm->set_host_initialize_import_meta_object_callback(import_meta_callback);
 
   isolate->SetHostInitializeImportMetaObjectCallback(
       HostInitializeImportMetaObjectCallback);
@@ -1518,20 +1451,33 @@ MaybeLocal<Value> ModuleWrap::SyntheticModuleEvaluationStepsCallback(
 
   TryCatchScope try_catch(env);
   Local<Function> synthetic_evaluation_steps =
-      obj->synthetic_evaluation_steps_.Get(isolate);
+      obj->object()
+          ->GetInternalField(kSyntheticEvaluationStepsSlot)
+          .As<Value>()
+          .As<Function>();
+  obj->object()->SetInternalField(
+      kSyntheticEvaluationStepsSlot, Undefined(isolate));
   MaybeLocal<Value> ret = synthetic_evaluation_steps->Call(context,
       obj->object(), 0, nullptr);
   if (ret.IsEmpty()) {
     CHECK(try_catch.HasCaught());
   }
-  obj->synthetic_evaluation_steps_.Reset();
   if (try_catch.HasCaught() && !try_catch.HasTerminated()) {
     CHECK(!try_catch.Message().IsEmpty());
     CHECK(!try_catch.Exception().IsEmpty());
     try_catch.ReThrow();
     return MaybeLocal<Value>();
   }
-  return ret;
+
+  Local<Promise::Resolver> resolver;
+  if (!Promise::Resolver::New(context).ToLocal(&resolver)) {
+    return MaybeLocal<Value>();
+  }
+
+  if (resolver->Resolve(context, Undefined(isolate)).IsNothing()) {
+    return MaybeLocal<Value>();
+  }
+  return resolver->GetPromise();
 }
 
 void ModuleWrap::SetSyntheticExport(const FunctionCallbackInfo<Value>& args) {
@@ -1565,73 +1511,201 @@ void ModuleWrap::CreateCachedData(const FunctionCallbackInfo<Value>& args) {
 
   Local<Module> module = obj->module_.Get(isolate);
 
-  CHECK_LT(module->GetStatus(), v8::Module::Status::kEvaluating);
+  CHECK_LT(module->GetStatus(), Module::Status::kEvaluating);
 
   Local<UnboundModuleScript> unbound_module_script =
       module->GetUnboundModuleScript();
   std::unique_ptr<ScriptCompiler::CachedData> cached_data(
       ScriptCompiler::CreateCodeCache(unbound_module_script));
   Environment* env = Environment::GetCurrent(args);
+  Local<Object> result;
   if (!cached_data) {
-    args.GetReturnValue().Set(Buffer::New(env, 0).ToLocalChecked());
-  } else {
-    MaybeLocal<Object> buf =
-        Buffer::Copy(env,
-                     reinterpret_cast<const char*>(cached_data->data),
-                     cached_data->length);
-    args.GetReturnValue().Set(buf.ToLocalChecked());
+    if (!Buffer::New(env, 0).ToLocal(&result)) {
+      return;
+    }
+  } else if (!Buffer::Copy(env,
+                           reinterpret_cast<const char*>(cached_data->data),
+                           cached_data->length)
+                  .ToLocal(&result)) {
+    return;
   }
+  args.GetReturnValue().Set(result);
 }
 
-void ModuleWrap::Initialize(Local<Object> target,
-                            Local<Value> unused,
-                            Local<Context> context,
-                            void* priv) {
+// This v8::Module::ResolveModuleCallback simply links `import 'original'`
+// to the env->temporary_required_module_facade_original() which is stashed
+// right before this callback is called and will be restored as soon as
+// v8::Module::Instantiate() returns.
+MaybeLocal<Module> LinkRequireFacadeWithOriginal(
+    Local<Context> context,
+    Local<String> specifier,
+    Local<FixedArray> import_attributes,
+    Local<Module> referrer) {
   Environment* env = Environment::GetCurrent(context);
-  Isolate* isolate = env->isolate();
+  Isolate* isolate = Isolate::GetCurrent();
+  CHECK(specifier->Equals(context, env->original_string()).ToChecked());
+  CHECK(!env->temporary_required_module_facade_original.IsEmpty());
+  return env->temporary_required_module_facade_original.Get(isolate);
+}
 
-  Local<FunctionTemplate> tpl = env->NewFunctionTemplate(New);
-  tpl->SetClassName(FIXED_ONE_BYTE_STRING(isolate, "ModuleWrap"));
-  tpl->InstanceTemplate()->SetInternalFieldCount(1);
+// Wraps an existing source text module with a facade that adds
+// .__esModule = true to the exports.
+// See env->required_module_facade_source_string() for the source.
+void ModuleWrap::CreateRequiredModuleFacade(
+    const FunctionCallbackInfo<Value>& args) {
+  Isolate* isolate = args.GetIsolate();
+  Local<Context> context = isolate->GetCurrentContext();
+  Environment* env = Environment::GetCurrent(context);
+  CHECK(args[0]->IsObject());  // original module
+  Local<Object> wrap = args[0].As<Object>();
+  ModuleWrap* original;
+  ASSIGN_OR_RETURN_UNWRAP(&original, wrap);
 
-  env->SetProtoMethod(tpl, "link", Link);
-  env->SetProtoMethod(tpl, "instantiate", Instantiate);
-  env->SetProtoMethod(tpl, "evaluate", Evaluate);
-  env->SetProtoMethod(tpl, "setExport", SetSyntheticExport);
-  env->SetProtoMethodNoSideEffect(tpl, "createCachedData", CreateCachedData);
-  env->SetProtoMethodNoSideEffect(tpl, "getNamespace", GetNamespace);
-  env->SetProtoMethodNoSideEffect(tpl, "getStatus", GetStatus);
-  env->SetProtoMethodNoSideEffect(tpl, "getError", GetError);
-  env->SetProtoMethodNoSideEffect(tpl, "getStaticDependencySpecifiers",
-                                  GetStaticDependencySpecifiers);
+  // Use the same facade source and URL to hit the compilation cache.
+  ScriptOrigin origin(env->required_module_facade_url_string(),
+                      0,               // line offset
+                      0,               // column offset
+                      true,            // is cross origin
+                      -1,              // script id
+                      Local<Value>(),  // source map URL
+                      false,           // is opaque (?)
+                      false,           // is WASM
+                      true);           // is ES Module
+  ScriptCompiler::Source source(env->required_module_facade_source_string(),
+                                origin);
 
-  target->Set(env->context(), FIXED_ONE_BYTE_STRING(isolate, "ModuleWrap"),
-              tpl->GetFunction(context).ToLocalChecked()).Check();
-  env->SetMethod(target, "resolve", Resolve);
-  env->SetMethod(target, "getPackageType", GetPackageType);
-  env->SetMethod(target,
-                 "setImportModuleDynamicallyCallback",
-                 SetImportModuleDynamicallyCallback);
-  env->SetMethod(target,
-                 "setInitializeImportMetaObjectCallback",
-                 SetInitializeImportMetaObjectCallback);
+  // The module facade instantiation simply links `import 'original'` in the
+  // facade with the original module and should never fail.
+  Local<Module> facade;
+  if (!ScriptCompiler::CompileModule(isolate, &source).ToLocal(&facade)) {
+    return;
+  }
+  // Stash the original module in temporary_required_module_facade_original
+  // for the LinkRequireFacadeWithOriginal() callback to pick it up.
+  CHECK(env->temporary_required_module_facade_original.IsEmpty());
+  env->temporary_required_module_facade_original.Reset(
+      isolate, original->module_.Get(isolate));
+  CHECK(facade->InstantiateModule(context, LinkRequireFacadeWithOriginal)
+            .IsJust());
+  env->temporary_required_module_facade_original.Reset();
 
-#define V(name)                                                                \
-    target->Set(context,                                                       \
-      FIXED_ONE_BYTE_STRING(env->isolate(), #name),                            \
-      Integer::New(env->isolate(), Module::Status::name))                      \
-        .FromJust()
-    V(kUninstantiated);
-    V(kInstantiating);
-    V(kInstantiated);
-    V(kEvaluating);
-    V(kEvaluated);
-    V(kErrored);
+  // The evaluation of the facade is synchronous.
+  Local<Value> evaluated;
+  if (!facade->Evaluate(context).ToLocal(&evaluated)) {
+    return;
+  }
+  CHECK(evaluated->IsPromise());
+  CHECK_EQ(evaluated.As<Promise>()->State(), Promise::PromiseState::kFulfilled);
+
+  args.GetReturnValue().Set(facade->GetModuleNamespace());
+}
+
+void ModuleWrap::CreatePerIsolateProperties(IsolateData* isolate_data,
+                                            Local<ObjectTemplate> target) {
+  Isolate* isolate = isolate_data->isolate();
+
+  Local<FunctionTemplate> tpl = NewFunctionTemplate(isolate, New);
+  tpl->InstanceTemplate()->SetInternalFieldCount(
+      ModuleWrap::kInternalFieldCount);
+
+  SetProtoMethod(isolate, tpl, "link", Link);
+  SetProtoMethod(isolate, tpl, "getModuleRequests", GetModuleRequests);
+  SetProtoMethod(isolate, tpl, "instantiate", Instantiate);
+  SetProtoMethod(isolate, tpl, "evaluateSync", EvaluateSync);
+  SetProtoMethod(isolate, tpl, "evaluate", Evaluate);
+  SetProtoMethod(isolate, tpl, "setExport", SetSyntheticExport);
+  SetProtoMethod(isolate, tpl, "setModuleSourceObject", SetModuleSourceObject);
+  SetProtoMethod(isolate, tpl, "getModuleSourceObject", GetModuleSourceObject);
+  SetProtoMethodNoSideEffect(
+      isolate, tpl, "createCachedData", CreateCachedData);
+  SetProtoMethodNoSideEffect(isolate, tpl, "getNamespace", GetNamespace);
+  SetProtoMethodNoSideEffect(isolate, tpl, "getStatus", GetStatus);
+  SetProtoMethodNoSideEffect(isolate, tpl, "getError", GetError);
+  SetConstructorFunction(isolate, target, "ModuleWrap", tpl);
+
+  tpl->InstanceTemplate()->SetLazyDataProperty(
+      FIXED_ONE_BYTE_STRING(isolate, "hasAsyncGraph"),
+      HasAsyncGraph,
+      Local<Value>(),
+      PropertyAttribute::DontEnum);
+
+  isolate_data->set_module_wrap_constructor_template(tpl);
+
+  SetMethod(isolate,
+            target,
+            "setImportModuleDynamicallyCallback",
+            SetImportModuleDynamicallyCallback);
+  SetMethod(isolate,
+            target,
+            "setInitializeImportMetaObjectCallback",
+            SetInitializeImportMetaObjectCallback);
+  SetMethod(isolate,
+            target,
+            "setImportMetaResolveInitializer",
+            SetImportMetaResolveInitializer);
+  SetMethod(isolate,
+            target,
+            "createRequiredModuleFacade",
+            CreateRequiredModuleFacade);
+  SetMethod(isolate, target, "throwIfPromiseRejected", ThrowIfPromiseRejected);
+}
+
+void ModuleWrap::CreatePerContextProperties(Local<Object> target,
+                                            Local<Value> unused,
+                                            Local<Context> context,
+                                            void* priv) {
+  Realm* realm = Realm::GetCurrent(context);
+  Isolate* isolate = realm->isolate();
+#define V(enum_type, name)                                                     \
+  target                                                                       \
+      ->Set(context,                                                           \
+            FIXED_ONE_BYTE_STRING(isolate, #name),                             \
+            Integer::New(isolate, enum_type::name))                            \
+      .FromJust()
+  V(Module::Status, kUninstantiated);
+  V(Module::Status, kInstantiating);
+  V(Module::Status, kInstantiated);
+  V(Module::Status, kEvaluating);
+  V(Module::Status, kEvaluated);
+  V(Module::Status, kErrored);
+
+  V(ModulePhase, kEvaluationPhase);
+  V(ModulePhase, kDeferPhase);
+  V(ModulePhase, kSourcePhase);
 #undef V
 }
 
+void ModuleWrap::RegisterExternalReferences(
+    ExternalReferenceRegistry* registry) {
+  registry->Register(New);
+
+  registry->Register(Link);
+  registry->Register(GetModuleRequests);
+  registry->Register(EvaluateSync);
+  registry->Register(Instantiate);
+  registry->Register(Evaluate);
+  registry->Register(SetSyntheticExport);
+  registry->Register(SetModuleSourceObject);
+  registry->Register(GetModuleSourceObject);
+  registry->Register(CreateCachedData);
+  registry->Register(GetNamespace);
+  registry->Register(GetStatus);
+  registry->Register(GetError);
+  registry->Register(HasAsyncGraph);
+
+  registry->Register(CreateRequiredModuleFacade);
+
+  registry->Register(SetImportModuleDynamicallyCallback);
+  registry->Register(SetInitializeImportMetaObjectCallback);
+  registry->Register(SetImportMetaResolveInitializer);
+  registry->Register(ThrowIfPromiseRejected);
+}
 }  // namespace loader
 }  // namespace node
 
-NODE_MODULE_CONTEXT_AWARE_INTERNAL(module_wrap,
-                                   node::loader::ModuleWrap::Initialize)
+NODE_BINDING_CONTEXT_AWARE_INTERNAL(
+    module_wrap, node::loader::ModuleWrap::CreatePerContextProperties)
+NODE_BINDING_PER_ISOLATE_INIT(
+    module_wrap, node::loader::ModuleWrap::CreatePerIsolateProperties)
+NODE_BINDING_EXTERNAL_REFERENCE(
+    module_wrap, node::loader::ModuleWrap::RegisterExternalReferences)

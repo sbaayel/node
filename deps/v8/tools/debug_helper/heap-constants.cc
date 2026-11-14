@@ -3,16 +3,20 @@
 // found in the LICENSE file.
 
 #include "heap-constants.h"
+
 #include "src/common/globals.h"
+#include "src/heap/memory-chunk.h"
 
 namespace d = v8::debug_helper;
 
-namespace v8_debug_helper_internal {
+namespace v8 {
+namespace internal {
+namespace debug_helper_internal {
 
 std::string FindKnownObject(uintptr_t address,
                             const d::HeapAddresses& heap_addresses) {
-  uintptr_t containing_page = address & ~i::kPageAlignmentMask;
-  uintptr_t offset_in_page = address & i::kPageAlignmentMask;
+  uintptr_t containing_page = MemoryChunk::FromAddress(address)->address();
+  uintptr_t offset_in_page = MemoryChunk::AddressToOffset(address);
 
   // If there's a match with a known page, then search only that page.
   if (containing_page == heap_addresses.map_space_first_page) {
@@ -49,15 +53,19 @@ std::string FindKnownObject(uintptr_t address,
   return result;
 }
 
-KnownInstanceType FindKnownMapInstanceType(
+KnownInstanceType FindKnownMapInstanceTypes(
     uintptr_t address, const d::HeapAddresses& heap_addresses) {
-  uintptr_t containing_page = address & ~i::kPageAlignmentMask;
-  uintptr_t offset_in_page = address & i::kPageAlignmentMask;
+  uintptr_t containing_page = MemoryChunk::FromAddress(address)->address();
+  uintptr_t offset_in_page = MemoryChunk::AddressToOffset(address);
 
   // If there's a match with a known page, then search only that page.
   if (containing_page == heap_addresses.map_space_first_page) {
     return KnownInstanceType(
         FindKnownMapInstanceTypeInMapSpace(offset_in_page));
+  }
+  if (containing_page == heap_addresses.old_space_first_page) {
+    return KnownInstanceType(
+        FindKnownMapInstanceTypeInOldSpace(offset_in_page));
   }
   if (containing_page == heap_addresses.read_only_space_first_page) {
     return KnownInstanceType(
@@ -72,6 +80,12 @@ KnownInstanceType FindKnownMapInstanceType(
       result.types.push_back(static_cast<i::InstanceType>(sub_result));
     }
   }
+  if (heap_addresses.old_space_first_page == 0) {
+    int sub_result = FindKnownMapInstanceTypeInOldSpace(offset_in_page);
+    if (sub_result >= 0) {
+      result.types.push_back(static_cast<i::InstanceType>(sub_result));
+    }
+  }
   if (heap_addresses.read_only_space_first_page == 0) {
     int sub_result = FindKnownMapInstanceTypeInReadOnlySpace(offset_in_page);
     if (sub_result >= 0) {
@@ -82,4 +96,6 @@ KnownInstanceType FindKnownMapInstanceType(
   return result;
 }
 
-}  // namespace v8_debug_helper_internal
+}  // namespace debug_helper_internal
+}  // namespace internal
+}  // namespace v8

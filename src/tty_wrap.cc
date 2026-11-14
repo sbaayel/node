@@ -24,6 +24,8 @@
 #include "env-inl.h"
 #include "handle_wrap.h"
 #include "node_buffer.h"
+#include "node_external_reference.h"
+#include "node_internals.h"
 #include "stream_base-inl.h"
 #include "stream_wrap.h"
 #include "util-inl.h"
@@ -32,38 +34,52 @@ namespace node {
 
 using v8::Array;
 using v8::Context;
-using v8::Function;
 using v8::FunctionCallbackInfo;
 using v8::FunctionTemplate;
 using v8::Integer;
+using v8::Isolate;
 using v8::Local;
 using v8::Object;
 using v8::String;
 using v8::Value;
+
+void TTYWrap::RegisterExternalReferences(ExternalReferenceRegistry* registry) {
+  registry->Register(New);
+  registry->Register(GetWindowSize);
+  registry->Register(SetRawMode);
+  registry->Register(IsTTY);
+}
 
 void TTYWrap::Initialize(Local<Object> target,
                          Local<Value> unused,
                          Local<Context> context,
                          void* priv) {
   Environment* env = Environment::GetCurrent(context);
+  Isolate* isolate = env->isolate();
 
   Local<String> ttyString = FIXED_ONE_BYTE_STRING(env->isolate(), "TTY");
 
-  Local<FunctionTemplate> t = env->NewFunctionTemplate(New);
-  t->SetClassName(ttyString);
-  t->InstanceTemplate()
-    ->SetInternalFieldCount(StreamBase::kStreamBaseFieldCount);
-  t->Inherit(LibuvStreamWrap::GetConstructorTemplate(env));
+  Local<FunctionTemplate> t = env->tty_constructor_template();
+  if (t.IsEmpty()) {
+    t = NewFunctionTemplate(isolate, New);
+    t->SetClassName(ttyString);
+    t->InstanceTemplate()->SetInternalFieldCount(TTYWrap::kInternalFieldCount);
+    t->Inherit(LibuvStreamWrap::GetConstructorTemplate(env));
 
-  env->SetProtoMethodNoSideEffect(t, "getWindowSize", TTYWrap::GetWindowSize);
-  env->SetProtoMethod(t, "setRawMode", SetRawMode);
+    SetProtoMethodNoSideEffect(
+        isolate, t, "getWindowSize", TTYWrap::GetWindowSize);
+    SetProtoMethod(isolate, t, "setRawMode", SetRawMode);
+    env->set_tty_constructor_template(t);
+  }
 
-  env->SetMethodNoSideEffect(target, "isTTY", IsTTY);
+  SetMethodNoSideEffect(context, target, "isTTY", IsTTY);
+  NODE_DEFINE_CONSTANT(target, UV_TTY_MODE_NORMAL);
+  NODE_DEFINE_CONSTANT(target, UV_TTY_MODE_IO);
+  NODE_DEFINE_CONSTANT(target, UV_TTY_MODE_RAW_VT);
 
   Local<Value> func;
-  if (t->GetFunction(env->context()).ToLocal(&func) &&
-      target->Set(env->context(), ttyString, func).IsJust()) {
-    env->set_tty_constructor_template(t);
+  if (t->GetFunction(context).ToLocal(&func)) {
+    target->Set(context, ttyString, func).Check();
   }
 }
 
@@ -82,9 +98,8 @@ void TTYWrap::GetWindowSize(const FunctionCallbackInfo<Value>& args) {
   Environment* env = Environment::GetCurrent(args);
 
   TTYWrap* wrap;
-  ASSIGN_OR_RETURN_UNWRAP(&wrap,
-                          args.Holder(),
-                          args.GetReturnValue().Set(UV_EBADF));
+  ASSIGN_OR_RETURN_UNWRAP(
+      &wrap, args.This(), args.GetReturnValue().Set(UV_EBADF));
   CHECK(args[0]->IsArray());
 
   int width, height;
@@ -92,8 +107,12 @@ void TTYWrap::GetWindowSize(const FunctionCallbackInfo<Value>& args) {
 
   if (err == 0) {
     Local<Array> a = args[0].As<Array>();
-    a->Set(env->context(), 0, Integer::New(env->isolate(), width)).Check();
-    a->Set(env->context(), 1, Integer::New(env->isolate(), height)).Check();
+    if (a->Set(env->context(), 0, Integer::New(env->isolate(), width))
+            .IsNothing() ||
+        a->Set(env->context(), 1, Integer::New(env->isolate(), height))
+            .IsNothing()) {
+      return;
+    }
   }
 
   args.GetReturnValue().Set(err);
@@ -102,10 +121,21 @@ void TTYWrap::GetWindowSize(const FunctionCallbackInfo<Value>& args) {
 
 void TTYWrap::SetRawMode(const FunctionCallbackInfo<Value>& args) {
   TTYWrap* wrap;
-  ASSIGN_OR_RETURN_UNWRAP(&wrap,
-                          args.Holder(),
-                          args.GetReturnValue().Set(UV_EBADF));
-  int err = uv_tty_set_mode(&wrap->handle_, args[0]->IsTrue());
+  ASSIGN_OR_RETURN_UNWRAP(
+      &wrap, args.This(), args.GetReturnValue().Set(UV_EBADF));
+  // UV_TTY_MODE_RAW_VT is a variant of UV_TTY_MODE_RAW that
+  // enables control sequence processing on the TTY implementer side,
+  // rather than having libuv translate keypress events into
+  // control sequences, aligning behavior more closely with
+  // POSIX platforms. This is also required to support some control
+  // sequences at all on Windows, such as bracketed paste mode.
+  // The Node.js readline implementation handles differences between
+  // these modes.
+  Environment* env = Environment::GetCurrent(args);
+  int mode;
+  if (!args[0]->Int32Value(env->context()).To(&mode)) return;
+  int err = uv_tty_set_mode(&wrap->handle_, static_cast<uv_tty_mode_t>(mode));
+  if (err == 0 && mode != UV_TTY_MODE_NORMAL) SetTerminalModeChanged();
   args.GetReturnValue().Set(err);
 }
 
@@ -123,10 +153,9 @@ void TTYWrap::New(const FunctionCallbackInfo<Value>& args) {
   CHECK_GE(fd, 0);
 
   int err = 0;
-  new TTYWrap(env, args.This(), fd, args[1]->IsTrue(), &err);
+  new TTYWrap(env, args.This(), fd, &err);
   if (err != 0) {
-    env->CollectUVExceptionInfo(args[2], err, "uv_tty_init");
-    args.GetReturnValue().SetUndefined();
+    USE(env->CollectUVExceptionInfo(args[1], err, "uv_tty_init"));
   }
 }
 
@@ -134,13 +163,12 @@ void TTYWrap::New(const FunctionCallbackInfo<Value>& args) {
 TTYWrap::TTYWrap(Environment* env,
                  Local<Object> object,
                  int fd,
-                 bool readable,
                  int* init_err)
     : LibuvStreamWrap(env,
                       object,
                       reinterpret_cast<uv_stream_t*>(&handle_),
                       AsyncWrap::PROVIDER_TTYWRAP) {
-  *init_err = uv_tty_init(env->event_loop(), &handle_, fd, readable);
+  *init_err = uv_tty_init(env->event_loop(), &handle_, fd, 0);
   set_fd(fd);
   if (*init_err != 0)
     MarkAsUninitialized();
@@ -148,4 +176,6 @@ TTYWrap::TTYWrap(Environment* env,
 
 }  // namespace node
 
-NODE_MODULE_CONTEXT_AWARE_INTERNAL(tty_wrap, node::TTYWrap::Initialize)
+NODE_BINDING_CONTEXT_AWARE_INTERNAL(tty_wrap, node::TTYWrap::Initialize)
+NODE_BINDING_EXTERNAL_REFERENCE(tty_wrap,
+                                node::TTYWrap::RegisterExternalReferences)

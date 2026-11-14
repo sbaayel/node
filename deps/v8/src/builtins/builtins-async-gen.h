@@ -6,73 +6,72 @@
 #define V8_BUILTINS_BUILTINS_ASYNC_GEN_H_
 
 #include "src/builtins/builtins-promise-gen.h"
+#include "src/objects/js-generator.h"
 
 namespace v8 {
 namespace internal {
 
 class AsyncBuiltinsAssembler : public PromiseBuiltinsAssembler {
  public:
+  enum class AwaitBehavior : bool { kNormal = false, kResumeOnly = true };
+
   explicit AsyncBuiltinsAssembler(compiler::CodeAssemblerState* state)
       : PromiseBuiltinsAssembler(state) {}
 
  protected:
+  // Allocates an await context that stores the generator as extension.
+  TNode<Context> AllocateAwaitContext(TNode<NativeContext> native_context,
+                                      TNode<JSGeneratorObject> generator);
+
+  // Callback that returns (on_resolve, on_reject) closures.
+  // Responsible for allocating context and closures, or reusing existing ones.
+  using GetClosures =
+      std::function<std::pair<TNode<JSFunction>, TNode<JSFunction>>(
+          TNode<NativeContext>)>;
+
   // Perform steps to resume generator after `value` is resolved.
-  // `on_reject_context_index` is an index into the Native Context, which should
-  // point to a SharedFunctioninfo instance used to create the closure. The
-  // value following the reject index should be a similar value for the resolve
-  // closure. Returns the Promise-wrapped `value`.
+  // Returns the Promise-wrapped `value`.
   TNode<Object> Await(TNode<Context> context,
-                      TNode<JSGeneratorObject> generator, TNode<Object> value,
+                      TNode<JSGeneratorObject> generator, TNode<JSAny> value,
                       TNode<JSPromise> outer_promise,
-                      TNode<IntPtrT> on_resolve_context_index,
-                      TNode<IntPtrT> on_reject_context_index,
-                      TNode<Oddball> is_predicted_as_caught);
+                      const GetClosures& get_closures,
+                      AwaitBehavior await_behavior);
   TNode<Object> Await(TNode<Context> context,
-                      TNode<JSGeneratorObject> generator, TNode<Object> value,
-                      TNode<JSPromise> outer_promise,
-                      int on_resolve_context_index, int on_reject_context_index,
-                      TNode<Oddball> is_predicted_as_caught) {
-    return Await(context, generator, value, outer_promise,
-                 IntPtrConstant(on_resolve_context_index),
-                 IntPtrConstant(on_reject_context_index),
-                 is_predicted_as_caught);
-  }
-  TNode<Object> Await(TNode<Context> context,
-                      TNode<JSGeneratorObject> generator, TNode<Object> value,
-                      TNode<JSPromise> outer_promise,
-                      int on_resolve_context_index, int on_reject_context_index,
-                      bool is_predicted_as_caught) {
-    return Await(context, generator, value, outer_promise,
-                 on_resolve_context_index, on_reject_context_index,
-                 BooleanConstant(is_predicted_as_caught));
-  }
+                      TNode<JSGeneratorObject> generator, TNode<JSAny> value,
+                      TNode<JSPromise> outer_promise, RootIndex on_resolve_sfi,
+                      RootIndex on_reject_sfi);
+
+  // Optimized Await for async functions that lazily allocates closures on
+  // first await and reuses them for subsequent awaits. This avoids per-await
+  // allocation of the context and closures, and saves memory for async
+  // functions that never suspend.
+  TNode<Object> AwaitWithReusableClosures(
+      TNode<Context> context,
+      TNode<JSAsyncFunctionObject> async_function_object, TNode<JSAny> value,
+      TNode<JSPromise> outer_promise);
 
   // Return a new built-in function object as defined in
   // Async Iterator Value Unwrap Functions
   TNode<JSFunction> CreateUnwrapClosure(TNode<NativeContext> native_context,
-                                        TNode<Oddball> done);
+                                        TNode<Boolean> done);
+
+  // Branches to |if_non_thenable| when |value| is guaranteed not to have a
+  // "then" property and no promise hooks/debug are active. Falls through to
+  // |if_slow| otherwise. Used to gate fast paths that skip promise/closure
+  // allocation for non-thenable awaited/yielded values.
+  void BranchIfNonThenable(TNode<Context> context, TNode<Object> value,
+                           Label* if_non_thenable, Label* if_slow);
+
+  // Allocates an AsyncResumeTask, stores all fields, and enqueues it on
+  // the microtask queue.  Used by both async generator yield and async
+  // function await fast paths.
+  void EnqueueAsyncResumeTask(TNode<NativeContext> native_context,
+                              TNode<JSGeneratorObject> generator,
+                              TNode<Object> value, int kind);
 
  private:
-  void InitializeNativeClosure(TNode<Context> context,
-                               TNode<NativeContext> native_context,
-                               TNode<HeapObject> function,
-                               TNode<IntPtrT> context_index);
   TNode<Context> AllocateAsyncIteratorValueUnwrapContext(
-      TNode<NativeContext> native_context, TNode<Oddball> done);
-
-  TNode<Object> AwaitOld(TNode<Context> context,
-                         TNode<JSGeneratorObject> generator,
-                         TNode<Object> value, TNode<JSPromise> outer_promise,
-                         TNode<IntPtrT> on_resolve_context_index,
-                         TNode<IntPtrT> on_reject_context_index,
-                         TNode<Oddball> is_predicted_as_caught);
-  TNode<Object> AwaitOptimized(TNode<Context> context,
-                               TNode<JSGeneratorObject> generator,
-                               TNode<JSPromise> promise,
-                               TNode<JSPromise> outer_promise,
-                               TNode<IntPtrT> on_resolve_context_index,
-                               TNode<IntPtrT> on_reject_context_index,
-                               TNode<Oddball> is_predicted_as_caught);
+      TNode<NativeContext> native_context, TNode<Boolean> done);
 };
 
 }  // namespace internal

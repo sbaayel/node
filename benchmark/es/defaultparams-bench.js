@@ -5,12 +5,12 @@ const assert = require('assert');
 
 const bench = common.createBenchmark(main, {
   method: ['withoutdefaults', 'withdefaults'],
-  n: [1e8]
+  n: [1e8],
 });
 
 function oldStyleDefaults(x, y) {
-  x = x || 1;
-  y = y || 2;
+  x ||= 1;
+  y ||= 2;
   assert.strictEqual(x, 1);
   assert.strictEqual(y, 2);
 }
@@ -36,8 +36,6 @@ function runDefaultParams(n) {
 
 function main({ n, method }) {
   switch (method) {
-    case '':
-      // Empty string falls through to next line as default, mostly for tests.
     case 'withoutdefaults':
       runOldStyleDefaults(n);
       break;

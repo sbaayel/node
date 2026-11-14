@@ -25,20 +25,34 @@
 // (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-#include <include/v8.h>
-
-#include <include/libplatform/libplatform.h>
-
 #include <stdlib.h>
 #include <string.h>
 
 #include <map>
 #include <string>
 
+#include "include/libplatform/libplatform.h"
+#include "include/v8-array-buffer.h"
+#include "include/v8-context.h"
+#include "include/v8-exception.h"
+#include "include/v8-external.h"
+#include "include/v8-function.h"
+#include "include/v8-initialization.h"
+#include "include/v8-isolate.h"
+#include "include/v8-local-handle.h"
+#include "include/v8-object.h"
+#include "include/v8-persistent-handle.h"
+#include "include/v8-primitive.h"
+#include "include/v8-script.h"
+#include "include/v8-snapshot.h"
+#include "include/v8-template.h"
+#include "include/v8-value.h"
+
 using std::map;
 using std::pair;
 using std::string;
 
+using v8::Boolean;
 using v8::Context;
 using v8::EscapableHandleScope;
 using v8::External;
@@ -127,19 +141,20 @@ class JsHttpRequestProcessor : public HttpRequestProcessor {
   static Local<ObjectTemplate> MakeMapTemplate(Isolate* isolate);
 
   // Callbacks that access the individual fields of request objects.
-  static void GetPath(Local<String> name,
+  static void GetPath(Local<Name> name,
                       const PropertyCallbackInfo<Value>& info);
-  static void GetReferrer(Local<String> name,
+  static void GetReferrer(Local<Name> name,
                           const PropertyCallbackInfo<Value>& info);
-  static void GetHost(Local<String> name,
+  static void GetHost(Local<Name> name,
                       const PropertyCallbackInfo<Value>& info);
-  static void GetUserAgent(Local<String> name,
+  static void GetUserAgent(Local<Name> name,
                            const PropertyCallbackInfo<Value>& info);
 
   // Callbacks that access maps
-  static void MapGet(Local<Name> name, const PropertyCallbackInfo<Value>& info);
-  static void MapSet(Local<Name> name, Local<Value> value,
-                     const PropertyCallbackInfo<Value>& info);
+  static v8::Intercepted MapGet(Local<Name> name,
+                                const PropertyCallbackInfo<Value>& info);
+  static v8::Intercepted MapSet(Local<Name> name, Local<Value> value,
+                                const PropertyCallbackInfo<Boolean>& info);
 
   // Utility methods for wrapping C++ objects as JavaScript objects,
   // and going back again.
@@ -163,16 +178,14 @@ class JsHttpRequestProcessor : public HttpRequestProcessor {
 // --- P r o c e s s o r ---
 // -------------------------
 
-
-static void LogCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
-  if (args.Length() < 1) return;
-  Isolate* isolate = args.GetIsolate();
+static void LogCallback(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  if (info.Length() < 1) return;
+  Isolate* isolate = info.GetIsolate();
   HandleScope scope(isolate);
-  Local<Value> arg = args[0];
+  Local<Value> arg = info[0];
   String::Utf8Value value(isolate, arg);
   HttpRequestProcessor::Log(*value);
 }
-
 
 // Execute the script and fetch the Process method.
 bool JsHttpRequestProcessor::Initialize(map<string, string>* opts,
@@ -183,8 +196,7 @@ bool JsHttpRequestProcessor::Initialize(map<string, string>* opts,
   // Create a template for the global object where we set the
   // built-in global functions.
   Local<ObjectTemplate> global = ObjectTemplate::New(GetIsolate());
-  global->Set(String::NewFromUtf8(GetIsolate(), "log", NewStringType::kNormal)
-                  .ToLocalChecked(),
+  global->Set(GetIsolate(), "log",
               FunctionTemplate::New(GetIsolate(), LogCallback));
 
   // Each processor gets its own context so different processors don't
@@ -210,8 +222,7 @@ bool JsHttpRequestProcessor::Initialize(map<string, string>* opts,
   // The script compiled and ran correctly.  Now we fetch out the
   // Process function from the global object.
   Local<String> process_name =
-      String::NewFromUtf8(GetIsolate(), "Process", NewStringType::kNormal)
-          .ToLocalChecked();
+      String::NewFromUtf8Literal(GetIsolate(), "Process");
   Local<Value> process_val;
   // If there is no Process function, or if it is not a function,
   // bail out
@@ -221,7 +232,7 @@ bool JsHttpRequestProcessor::Initialize(map<string, string>* opts,
   }
 
   // It is a function; cast it to a Function
-  Local<Function> process_fun = Local<Function>::Cast(process_val);
+  Local<Function> process_fun = process_val.As<Function>();
 
   // Store the function in a Global handle, since we also want
   // that to remain after this call returns
@@ -276,17 +287,13 @@ bool JsHttpRequestProcessor::InstallMaps(map<string, string>* opts,
 
   // Set the options object as a property on the global object.
   context->Global()
-      ->Set(context,
-            String::NewFromUtf8(GetIsolate(), "options", NewStringType::kNormal)
-                .ToLocalChecked(),
+      ->Set(context, String::NewFromUtf8Literal(GetIsolate(), "options"),
             opts_obj)
       .FromJust();
 
   Local<Object> output_obj = WrapMap(output);
   context->Global()
-      ->Set(context,
-            String::NewFromUtf8(GetIsolate(), "output", NewStringType::kNormal)
-                .ToLocalChecked(),
+      ->Set(context, String::NewFromUtf8Literal(GetIsolate(), "output"),
             output_obj)
       .FromJust();
 
@@ -335,14 +342,18 @@ JsHttpRequestProcessor::~JsHttpRequestProcessor() {
   process_.Reset();
 }
 
-
 Global<ObjectTemplate> JsHttpRequestProcessor::request_template_;
 Global<ObjectTemplate> JsHttpRequestProcessor::map_template_;
-
 
 // -----------------------------------
 // --- A c c e s s i n g   M a p s ---
 // -----------------------------------
+
+namespace {
+// This tag value has been picked arbitrarily between 0 and
+// V8_EXTERNAL_POINTER_TAG_COUNT.
+constexpr v8::ExternalPointerTypeTag kMapTag = 6;
+}  // namespace
 
 // Utility function that wraps a C++ http request object in a
 // JavaScript object.
@@ -365,7 +376,7 @@ Local<Object> JsHttpRequestProcessor::WrapMap(map<string, string>* obj) {
 
   // Wrap the raw C++ pointer in an External so it can be referenced
   // from within JavaScript.
-  Local<External> map_ptr = External::New(GetIsolate(), obj);
+  Local<External> map_ptr = External::New(GetIsolate(), obj, kMapTag);
 
   // Store the map pointer in the JavaScript wrapper.
   result->SetInternalField(0, map_ptr);
@@ -377,15 +388,13 @@ Local<Object> JsHttpRequestProcessor::WrapMap(map<string, string>* obj) {
   return handle_scope.Escape(result);
 }
 
-
 // Utility function that extracts the C++ map pointer from a wrapper
 // object.
 map<string, string>* JsHttpRequestProcessor::UnwrapMap(Local<Object> obj) {
-  Local<External> field = Local<External>::Cast(obj->GetInternalField(0));
-  void* ptr = field->Value();
+  Local<External> field = obj->GetInternalField(0).As<Value>().As<External>();
+  void* ptr = field->Value(kMapTag);
   return static_cast<map<string, string>*>(ptr);
 }
-
 
 // Convert a JavaScript string to a std::string.  To not bother too
 // much with string encodings we just use ascii.
@@ -394,22 +403,21 @@ string ObjectToString(v8::Isolate* isolate, Local<Value> value) {
   return string(*utf8_value);
 }
 
-
-void JsHttpRequestProcessor::MapGet(Local<Name> name,
-                                    const PropertyCallbackInfo<Value>& info) {
-  if (name->IsSymbol()) return;
+v8::Intercepted JsHttpRequestProcessor::MapGet(
+    Local<Name> name, const PropertyCallbackInfo<Value>& info) {
+  if (name->IsSymbol()) return v8::Intercepted::kNo;
 
   // Fetch the map wrapped by this object.
   map<string, string>* obj = UnwrapMap(info.Holder());
 
   // Convert the JavaScript string to a std::string.
-  string key = ObjectToString(info.GetIsolate(), Local<String>::Cast(name));
+  string key = ObjectToString(info.GetIsolate(), name.As<String>());
 
   // Look up the value if it exists using the standard STL ideom.
   map<string, string>::iterator iter = obj->find(key);
 
   // If the key is not present return an empty handle as signal
-  if (iter == obj->end()) return;
+  if (iter == obj->end()) return v8::Intercepted::kNo;
 
   // Otherwise fetch the value and wrap it in a JavaScript string
   const string& value = (*iter).second;
@@ -417,27 +425,25 @@ void JsHttpRequestProcessor::MapGet(Local<Name> name,
       String::NewFromUtf8(info.GetIsolate(), value.c_str(),
                           NewStringType::kNormal,
                           static_cast<int>(value.length())).ToLocalChecked());
+  return v8::Intercepted::kYes;
 }
 
-
-void JsHttpRequestProcessor::MapSet(Local<Name> name, Local<Value> value_obj,
-                                    const PropertyCallbackInfo<Value>& info) {
-  if (name->IsSymbol()) return;
+v8::Intercepted JsHttpRequestProcessor::MapSet(
+    Local<Name> name, Local<Value> value_obj,
+    const PropertyCallbackInfo<Boolean>& info) {
+  if (name->IsSymbol()) return v8::Intercepted::kNo;
 
   // Fetch the map wrapped by this object.
   map<string, string>* obj = UnwrapMap(info.Holder());
 
   // Convert the key and value to std::strings.
-  string key = ObjectToString(info.GetIsolate(), Local<String>::Cast(name));
+  string key = ObjectToString(info.GetIsolate(), name.As<String>());
   string value = ObjectToString(info.GetIsolate(), value_obj);
 
   // Update the map.
   (*obj)[key] = value;
-
-  // Return the value; any non-empty handle will work.
-  info.GetReturnValue().Set(value_obj);
+  return v8::Intercepted::kYes;
 }
-
 
 Local<ObjectTemplate> JsHttpRequestProcessor::MakeMapTemplate(
     Isolate* isolate) {
@@ -451,10 +457,13 @@ Local<ObjectTemplate> JsHttpRequestProcessor::MakeMapTemplate(
   return handle_scope.Escape(result);
 }
 
-
 // -------------------------------------------
 // --- A c c e s s i n g   R e q u e s t s ---
 // -------------------------------------------
+
+namespace {
+constexpr v8::ExternalPointerTypeTag kHttpRequestTag = 7;
+}  // namespace
 
 /**
  * Utility function that wraps a C++ http request object in a
@@ -479,7 +488,8 @@ Local<Object> JsHttpRequestProcessor::WrapRequest(HttpRequest* request) {
 
   // Wrap the raw C++ pointer in an External so it can be referenced
   // from within JavaScript.
-  Local<External> request_ptr = External::New(GetIsolate(), request);
+  Local<External> request_ptr =
+      External::New(GetIsolate(), request, kHttpRequestTag);
 
   // Store the request pointer in the JavaScript wrapper.
   result->SetInternalField(0, request_ptr);
@@ -491,19 +501,17 @@ Local<Object> JsHttpRequestProcessor::WrapRequest(HttpRequest* request) {
   return handle_scope.Escape(result);
 }
 
-
 /**
  * Utility function that extracts the C++ http request object from a
  * wrapper object.
  */
 HttpRequest* JsHttpRequestProcessor::UnwrapRequest(Local<Object> obj) {
-  Local<External> field = Local<External>::Cast(obj->GetInternalField(0));
-  void* ptr = field->Value();
+  Local<External> field = obj->GetInternalField(0).As<Value>().As<External>();
+  void* ptr = field->Value(kHttpRequestTag);
   return static_cast<HttpRequest*>(ptr);
 }
 
-
-void JsHttpRequestProcessor::GetPath(Local<String> name,
+void JsHttpRequestProcessor::GetPath(Local<Name> name,
                                      const PropertyCallbackInfo<Value>& info) {
   // Extract the C++ request object from the JavaScript wrapper.
   HttpRequest* request = UnwrapRequest(info.Holder());
@@ -518,10 +526,8 @@ void JsHttpRequestProcessor::GetPath(Local<String> name,
                           static_cast<int>(path.length())).ToLocalChecked());
 }
 
-
 void JsHttpRequestProcessor::GetReferrer(
-    Local<String> name,
-    const PropertyCallbackInfo<Value>& info) {
+    Local<Name> name, const PropertyCallbackInfo<Value>& info) {
   HttpRequest* request = UnwrapRequest(info.Holder());
   const string& path = request->Referrer();
   info.GetReturnValue().Set(
@@ -530,8 +536,7 @@ void JsHttpRequestProcessor::GetReferrer(
                           static_cast<int>(path.length())).ToLocalChecked());
 }
 
-
-void JsHttpRequestProcessor::GetHost(Local<String> name,
+void JsHttpRequestProcessor::GetHost(Local<Name> name,
                                      const PropertyCallbackInfo<Value>& info) {
   HttpRequest* request = UnwrapRequest(info.Holder());
   const string& path = request->Host();
@@ -541,10 +546,8 @@ void JsHttpRequestProcessor::GetHost(Local<String> name,
                           static_cast<int>(path.length())).ToLocalChecked());
 }
 
-
 void JsHttpRequestProcessor::GetUserAgent(
-    Local<String> name,
-    const PropertyCallbackInfo<Value>& info) {
+    Local<Name> name, const PropertyCallbackInfo<Value>& info) {
   HttpRequest* request = UnwrapRequest(info.Holder());
   const string& path = request->UserAgent();
   info.GetReturnValue().Set(
@@ -552,7 +555,6 @@ void JsHttpRequestProcessor::GetUserAgent(
                           NewStringType::kNormal,
                           static_cast<int>(path.length())).ToLocalChecked());
 }
-
 
 Local<ObjectTemplate> JsHttpRequestProcessor::MakeRequestTemplate(
     Isolate* isolate) {
@@ -562,21 +564,19 @@ Local<ObjectTemplate> JsHttpRequestProcessor::MakeRequestTemplate(
   result->SetInternalFieldCount(1);
 
   // Add accessors for each of the fields of the request.
-  result->SetAccessor(
-      String::NewFromUtf8(isolate, "path", NewStringType::kInternalized)
-          .ToLocalChecked(),
+  result->SetNativeDataProperty(
+      String::NewFromUtf8Literal(isolate, "path", NewStringType::kInternalized),
       GetPath);
-  result->SetAccessor(
-      String::NewFromUtf8(isolate, "referrer", NewStringType::kInternalized)
-          .ToLocalChecked(),
+  result->SetNativeDataProperty(
+      String::NewFromUtf8Literal(isolate, "referrer",
+                                 NewStringType::kInternalized),
       GetReferrer);
-  result->SetAccessor(
-      String::NewFromUtf8(isolate, "host", NewStringType::kInternalized)
-          .ToLocalChecked(),
+  result->SetNativeDataProperty(
+      String::NewFromUtf8Literal(isolate, "host", NewStringType::kInternalized),
       GetHost);
-  result->SetAccessor(
-      String::NewFromUtf8(isolate, "userAgent", NewStringType::kInternalized)
-          .ToLocalChecked(),
+  result->SetNativeDataProperty(
+      String::NewFromUtf8Literal(isolate, "userAgent",
+                                 NewStringType::kInternalized),
       GetUserAgent);
 
   // Again, return the result through the current handle scope.
@@ -650,7 +650,7 @@ MaybeLocal<String> ReadFile(Isolate* isolate, const string& name) {
   size_t size = ftell(file);
   rewind(file);
 
-  std::unique_ptr<char> chars(new char[size + 1]);
+  std::unique_ptr<char[]> chars(new char[size + 1]);
   chars.get()[size] = '\0';
   for (size_t i = 0; i < size;) {
     i += fread(&chars.get()[i], 1, size - i, file);
@@ -696,7 +696,10 @@ void PrintMap(map<string, string>* m) {
 
 
 int main(int argc, char* argv[]) {
-  v8::V8::InitializeICUDefaultLocation(argv[0]);
+  if (!v8::V8::InitializeICUDefaultLocation(argv[0])) {
+    fprintf(stderr, "Failed to initialize ICU\n");
+    return 1;
+  }
   v8::V8::InitializeExternalStartupData(argv[0]);
   std::unique_ptr<v8::Platform> platform = v8::platform::NewDefaultPlatform();
   v8::V8::InitializePlatform(platform.get());

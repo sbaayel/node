@@ -36,6 +36,7 @@ const OutgoingMessage = http.OutgoingMessage;
 
   server.on('listening', common.mustCall(function() {
     const clientRequest = http.request({
+      agent: false,
       port: server.address().port,
       method: 'GET',
       path: '/'
@@ -49,5 +50,29 @@ const OutgoingMessage = http.OutgoingMessage;
   msg._implicitHeader = function() {};
   assert.strictEqual(msg.writableLength, 0);
   msg.write('asd');
-  assert.strictEqual(msg.writableLength, 7);
+  assert.strictEqual(msg.writableLength, 3);
+}
+
+{
+  const server = http.createServer((req, res) => {
+    res.end();
+    server.close();
+  });
+
+  server.listen(0);
+
+  server.on('listening', common.mustCall(() => {
+    const req = http.request({
+      agent: false,
+      port: server.address().port,
+      method: 'GET',
+      path: '/'
+    });
+
+    assert.strictEqual(req.path, '/');
+    assert.strictEqual(req.method, 'GET');
+    assert.strictEqual(req.host, 'localhost');
+    assert.strictEqual(req.protocol, 'http:');
+    req.end();
+  }));
 }

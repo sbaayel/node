@@ -1,5 +1,7 @@
 #include "debug_utils-inl.h"  // NOLINT(build/include)
 #include "env-inl.h"
+#include "node_internals.h"
+#include "util.h"
 
 #ifdef __POSIX__
 #if defined(__linux__)
@@ -53,6 +55,40 @@
 #endif  // _WIN32
 
 namespace node {
+namespace per_process {
+EnabledDebugList enabled_debug_list;
+}
+
+using v8::Local;
+using v8::StackTrace;
+
+void EnabledDebugList::Parse(Environment* env) {
+  std::string cats;
+  credentials::SafeGetenv("NODE_DEBUG_NATIVE", &cats, env);
+  Parse(cats);
+}
+
+void EnabledDebugList::Parse(const std::string& cats) {
+  std::string debug_categories = cats;
+  while (!debug_categories.empty()) {
+    std::string::size_type comma_pos = debug_categories.find(',');
+    std::string wanted = ToLower(debug_categories.substr(0, comma_pos));
+
+#define V(name)                                                                \
+  {                                                                            \
+    static const std::string available_category = ToLower(#name);              \
+    if (available_category.find(wanted) != std::string::npos)                  \
+      set_enabled(DebugCategory::name);                                        \
+  }
+
+    DEBUG_CATEGORY_NAMES(V)
+#undef V
+
+    if (comma_pos == std::string::npos) break;
+    // Use everything after the `,` as the list for the next iteration.
+    debug_categories = debug_categories.substr(comma_pos + 1);
+  }
+}
 
 #ifdef __POSIX__
 #if HAVE_EXECINFO_H
@@ -100,16 +136,14 @@ class PosixSymbolDebuggingContext final : public NativeSymbolDebuggingContext {
 
 std::unique_ptr<NativeSymbolDebuggingContext>
 NativeSymbolDebuggingContext::New() {
-  return std::unique_ptr<NativeSymbolDebuggingContext>(
-      new PosixSymbolDebuggingContext());
+  return std::make_unique<PosixSymbolDebuggingContext>();
 }
 
 #else  // HAVE_EXECINFO_H
 
 std::unique_ptr<NativeSymbolDebuggingContext>
 NativeSymbolDebuggingContext::New() {
-  return std::unique_ptr<NativeSymbolDebuggingContext>(
-      new NativeSymbolDebuggingContext());
+  return std::make_unique<NativeSymbolDebuggingContext>();
 }
 
 #endif  // HAVE_EXECINFO_H
@@ -148,10 +182,13 @@ class Win32SymbolDebuggingContext final : public NativeSymbolDebuggingContext {
       return NameAndDisplacement(pSymbol->Name, dwDisplacement);
     } else {
       // SymFromAddr failed
-      const DWORD error = GetLastError();  // "eat" the error anyway
 #ifdef DEBUG
+      const DWORD error = GetLastError();
       fprintf(stderr, "SymFromAddr returned error : %lu\n", error);
-#endif
+#else
+      // Consume the error anyway
+      USE(GetLastError());
+#endif  // DEBUG
     }
     // End MSDN code
 
@@ -183,10 +220,13 @@ class Win32SymbolDebuggingContext final : public NativeSymbolDebuggingContext {
       sym.line = line.LineNumber;
     } else {
       // SymGetLineFromAddr64 failed
-      const DWORD error = GetLastError();  // "eat" the error anyway
 #ifdef DEBUG
+      const DWORD error = GetLastError();
       fprintf(stderr, "SymGetLineFromAddr64 returned error : %lu\n", error);
-#endif
+#else
+      // Consume the error anyway
+      USE(GetLastError());
+#endif  // DEBUG
     }
     // End MSDN code
 
@@ -206,12 +246,15 @@ class Win32SymbolDebuggingContext final : public NativeSymbolDebuggingContext {
       return szUndName;
     } else {
       // UnDecorateSymbolName failed
-      const DWORD error = GetLastError();  // "eat" the error anyway
 #ifdef DEBUG
+      const DWORD error = GetLastError();
       fprintf(stderr, "UnDecorateSymbolName returned error %lu\n", error);
-#endif
+#else
+      // Consume the error anyway
+      USE(GetLastError());
+#endif  // DEBUG
     }
-    return nullptr;
+    return {};
   }
 
   SymbolInfo LookupSymbol(void* address) override {
@@ -271,7 +314,8 @@ std::string NativeSymbolDebuggingContext::SymbolInfo::Display() const {
   return oss.str();
 }
 
-void DumpBacktrace(FILE* fp) {
+void DumpNativeBacktrace(FILE* fp) {
+  fprintf(fp, "----- Native stack trace -----\n\n");
   auto sym_ctx = NativeSymbolDebuggingContext::New();
   void* frames[256];
   const int size = sym_ctx->GetStackTrace(frames, arraysize(frames));
@@ -282,6 +326,23 @@ void DumpBacktrace(FILE* fp) {
   }
 }
 
+void DumpJavaScriptBacktrace(FILE* fp) {
+  v8::Isolate* isolate = v8::Isolate::TryGetCurrent();
+  if (isolate == nullptr) {
+    return;
+  }
+
+  Local<StackTrace> stack;
+  if (!GetCurrentStackTrace(isolate).ToLocal(&stack) ||
+      stack->GetFrameCount() == 0) {
+    return;
+  }
+
+  fprintf(fp, "\n----- JavaScript stack trace -----\n\n");
+  PrintStackTrace(isolate, stack, StackTracePrefix::kNumber);
+  fprintf(fp, "\n");
+}
+
 void CheckedUvLoopClose(uv_loop_t* loop) {
   if (uv_loop_close(loop) == 0) return;
 
@@ -289,7 +350,7 @@ void CheckedUvLoopClose(uv_loop_t* loop) {
 
   fflush(stderr);
   // Finally, abort.
-  CHECK(0 && "uv_loop_close() while having open handles");
+  UNREACHABLE("uv_loop_close() while having open handles");
 }
 
 void PrintLibuvHandleInformation(uv_loop_t* loop, FILE* stream) {
@@ -325,7 +386,7 @@ void PrintLibuvHandleInformation(uv_loop_t* loop, FILE* stream) {
     void* first_field = nullptr;
     // `handle->data` might be any value, including `nullptr`, or something
     // cast from a completely different type; therefore, check that it’s
-    // dereferencable first.
+    // dereferenceable first.
     if (sym_ctx->IsMapped(handle->data))
       first_field = *reinterpret_cast<void**>(handle->data);
 
@@ -347,7 +408,7 @@ std::vector<std::string> NativeSymbolDebuggingContext::GetLoadedLibraries() {
       [](struct dl_phdr_info* info, size_t size, void* data) {
         auto list = static_cast<std::vector<std::string>*>(data);
         if (*info->dlpi_name != '\0') {
-          list->push_back(info->dlpi_name);
+          list->emplace_back(info->dlpi_name);
         }
         return 0;
       },
@@ -356,7 +417,7 @@ std::vector<std::string> NativeSymbolDebuggingContext::GetLoadedLibraries() {
   uint32_t i = 0;
   for (const char* name = _dyld_get_image_name(i); name != nullptr;
        name = _dyld_get_image_name(++i)) {
-    list.push_back(name);
+    list.emplace_back(name);
   }
 
 #elif _AIX
@@ -381,10 +442,10 @@ std::vector<std::string> NativeSymbolDebuggingContext::GetLoadedLibraries() {
           strlen(cur_info->ldinfo_filename) + 1;
       if (*member_name != '\0') {
         str << cur_info->ldinfo_filename << "(" << member_name << ")";
-        list.push_back(str.str());
+        list.emplace_back(str.str());
         str.str("");
       } else {
-        list.push_back(cur_info->ldinfo_filename);
+        list.emplace_back(cur_info->ldinfo_filename);
       }
       buf += cur_info->ldinfo_next;
     } while (cur_info->ldinfo_next != 0);
@@ -394,7 +455,7 @@ std::vector<std::string> NativeSymbolDebuggingContext::GetLoadedLibraries() {
 
   if (dlinfo(RTLD_SELF, RTLD_DI_LINKMAP, &p) != -1) {
     for (Link_map* l = p; l != nullptr; l = l->l_next) {
-      list.push_back(l->l_name);
+      list.emplace_back(l->l_name);
     }
   }
 
@@ -411,7 +472,7 @@ std::vector<std::string> NativeSymbolDebuggingContext::GetLoadedLibraries() {
   DWORD size_2 = 0;
   // First call to get the size of module array needed
   if (EnumProcessModules(process_handle, nullptr, 0, &size_1)) {
-    MallocedBuffer<HMODULE> modules(size_1);
+    MallocedBuffer<HMODULE> modules(size_1 / sizeof(HMODULE));
 
     // Second call to populate the module array
     if (EnumProcessModules(process_handle, modules.data, size_1, &size_2)) {
@@ -420,16 +481,15 @@ std::vector<std::string> NativeSymbolDebuggingContext::GetLoadedLibraries() {
            i++) {
         WCHAR module_name[MAX_PATH];
         // Obtain and report the full pathname for each module
-        if (GetModuleFileNameExW(process_handle,
-                                 modules.data[i],
-                                 module_name,
-                                 arraysize(module_name) / sizeof(WCHAR))) {
+        if (GetModuleFileNameW(
+                modules.data[i], module_name, arraysize(module_name))) {
           DWORD size = WideCharToMultiByte(
               CP_UTF8, 0, module_name, -1, nullptr, 0, nullptr, nullptr);
           char* str = new char[size];
           WideCharToMultiByte(
               CP_UTF8, 0, module_name, -1, str, size, nullptr, nullptr);
-          list.push_back(str);
+          list.emplace_back(str);
+          delete[] str;
         }
       }
     }
@@ -468,9 +528,7 @@ void FWrite(FILE* file, const std::string& str) {
   std::vector<wchar_t> wbuf(n);
   MultiByteToWideChar(CP_UTF8, 0, str.data(), str.size(), wbuf.data(), n);
 
-  // Don't include the final null character in the output
-  CHECK_GT(n, 0);
-  WriteConsoleW(handle, wbuf.data(), n - 1, nullptr, nullptr);
+  WriteConsoleW(handle, wbuf.data(), n, nullptr, nullptr);
   return;
 #elif defined(__ANDROID__)
   if (file == stderr) {
@@ -484,5 +542,6 @@ void FWrite(FILE* file, const std::string& str) {
 }  // namespace node
 
 extern "C" void __DumpBacktrace(FILE* fp) {
-  node::DumpBacktrace(fp);
+  node::DumpNativeBacktrace(fp);
+  node::DumpJavaScriptBacktrace(fp);
 }

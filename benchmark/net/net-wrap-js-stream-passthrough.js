@@ -5,15 +5,16 @@ const common = require('../common.js');
 const { PassThrough } = require('stream');
 
 const bench = common.createBenchmark(main, {
-  len: [64, 102400, 1024 * 1024 * 16],
+  len: [64, 102400, 1024 * 64 * 16],
   type: ['utf', 'asc', 'buf'],
   dur: [5],
 }, {
-  flags: ['--expose-internals']
+  test: { len: 64 },
+  flags: ['--expose-internals'],
 });
 
-var chunk;
-var encoding;
+let chunk;
+let encoding;
 
 function main({ dur, len, type }) {
   // Can only require internals inside main().

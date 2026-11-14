@@ -19,10 +19,12 @@ testNumber(-1233);
 testNumber(986583);
 testNumber(-976675);
 
+/* eslint-disable no-loss-of-precision */
 testNumber(
   98765432213456789876546896323445679887645323232436587988766545658);
 testNumber(
   -4350987086545760976737453646576078997096876957864353245245769809);
+/* eslint-enable no-loss-of-precision */
 testNumber(Number.MIN_SAFE_INTEGER);
 testNumber(Number.MAX_SAFE_INTEGER);
 testNumber(Number.MAX_SAFE_INTEGER + 10);
@@ -48,6 +50,7 @@ testUint32(4294967295);
 testUint32(4294967296, 0);
 testUint32(4294967297, 1);
 testUint32(17 * 4294967296 + 1, 1);
+testUint32(-1, 0xffffffff);
 
 // Validate documented behavior when value is retrieved as 32-bit integer with
 // `napi_get_value_int32`

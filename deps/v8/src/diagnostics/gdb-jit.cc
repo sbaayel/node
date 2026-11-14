@@ -4,21 +4,30 @@
 
 #include "src/diagnostics/gdb-jit.h"
 
+#include <iterator>
 #include <map>
 #include <memory>
+#include <optional>
 #include <vector>
 
+#include "include/v8-callbacks.h"
 #include "src/api/api-inl.h"
+#include "src/base/address-region.h"
 #include "src/base/bits.h"
+#include "src/base/hashmap.h"
+#include "src/base/memory.h"
 #include "src/base/platform/platform.h"
+#include "src/base/platform/wrappers.h"
+#include "src/base/strings.h"
+#include "src/base/vector.h"
+#include "src/codegen/source-position.h"
 #include "src/execution/frames-inl.h"
 #include "src/execution/frames.h"
 #include "src/handles/global-handles.h"
 #include "src/init/bootstrapper.h"
+#include "src/objects/code-inl.h"
 #include "src/objects/objects.h"
-#include "src/snapshot/natives.h"
 #include "src/utils/ostreams.h"
-#include "src/utils/vector.h"
 #include "src/zone/zone-chunk-list.h"
 
 namespace v8 {
@@ -47,9 +56,9 @@ class Writer {
       : debug_object_(debug_object),
         position_(0),
         capacity_(1024),
-        buffer_(reinterpret_cast<byte*>(malloc(capacity_))) {}
+        buffer_(reinterpret_cast<uint8_t*>(base::Malloc(capacity_))) {}
 
-  ~Writer() { free(buffer_); }
+  ~Writer() { base::Free(buffer_); }
 
   uintptr_t position() const { return position_; }
 
@@ -60,7 +69,9 @@ class Writer {
 
     T* operator->() { return w_->RawSlotAt<T>(offset_); }
 
-    void set(const T& value) { *w_->RawSlotAt<T>(offset_) = value; }
+    void set(const T& value) {
+      base::WriteUnalignedValue(w_->AddressAt<T>(offset_), value);
+    }
 
     Slot<T> at(int i) { return Slot<T>(w_, offset_ + sizeof(T) * i); }
 
@@ -72,7 +83,7 @@ class Writer {
   template <typename T>
   void Write(const T& val) {
     Ensure(position_ + sizeof(T));
-    *RawSlotAt<T>(position_) = val;
+    base::WriteUnalignedValue(AddressAt<T>(position_), val);
     position_ += sizeof(T);
   }
 
@@ -98,13 +109,13 @@ class Writer {
   void Ensure(uintptr_t pos) {
     if (capacity_ < pos) {
       while (capacity_ < pos) capacity_ *= 2;
-      buffer_ = reinterpret_cast<byte*>(realloc(buffer_, capacity_));
+      buffer_ = reinterpret_cast<uint8_t*>(base::Realloc(buffer_, capacity_));
     }
   }
 
   DebugObject* debug_object() { return debug_object_; }
 
-  byte* buffer() { return buffer_; }
+  uint8_t* buffer() { return buffer_; }
 
   void Align(uintptr_t align) {
     uintptr_t delta = position_ % align;
@@ -151,6 +162,12 @@ class Writer {
   friend class Slot;
 
   template <typename T>
+  Address AddressAt(uintptr_t offset) {
+    DCHECK(offset < capacity_ && offset + sizeof(T) <= capacity_);
+    return reinterpret_cast<Address>(&buffer_[offset]);
+  }
+
+  template <typename T>
   T* RawSlotAt(uintptr_t offset) {
     DCHECK(offset < capacity_ && offset + sizeof(T) <= capacity_);
     return reinterpret_cast<T*>(&buffer_[offset]);
@@ -159,7 +176,7 @@ class Writer {
   DebugObject* debug_object_;
   uintptr_t position_;
   uintptr_t capacity_;
-  byte* buffer_;
+  uint8_t* buffer_;
 };
 
 class ELFStringTable;
@@ -220,7 +237,7 @@ class MachOSection : public DebugSectionBase<MachOSectionHeader> {
       : name_(name), segment_(segment), align_(align), flags_(flags) {
     if (align_ != 0) {
       DCHECK(base::bits::IsPowerOfTwo(align));
-      align_ = WhichPowerOf2(align_);
+      align_ = base::bits::WhichPowerOfTwo(align_);
     }
   }
 
@@ -570,8 +587,8 @@ class MachO {
 class ELF {
  public:
   explicit ELF(Zone* zone) : sections_(zone) {
-    sections_.push_back(new (zone) ELFSection("", ELFSection::TYPE_NULL, 0));
-    sections_.push_back(new (zone) ELFStringTable(".shstrtab"));
+    sections_.push_back(zone->New<ELFSection>("", ELFSection::TYPE_NULL, 0));
+    sections_.push_back(zone->New<ELFStringTable>(".shstrtab"));
   }
 
   void Write(Writer* w) {
@@ -616,14 +633,8 @@ class ELF {
     V8_TARGET_ARCH_PPC64 && V8_TARGET_LITTLE_ENDIAN
     const uint8_t ident[16] = {0x7F, 'E', 'L', 'F', 2, 1, 1, 0,
                                0,    0,   0,   0,   0, 0, 0, 0};
-#elif V8_TARGET_ARCH_PPC64 && V8_TARGET_BIG_ENDIAN && V8_OS_LINUX
-    const uint8_t ident[16] = {0x7F, 'E', 'L', 'F', 2, 2, 1, 0,
-                               0,    0,   0,   0,   0, 0, 0, 0};
 #elif V8_TARGET_ARCH_S390X
     const uint8_t ident[16] = {0x7F, 'E', 'L', 'F', 2, 2, 1, 3,
-                               0,    0,   0,   0,   0, 0, 0, 0};
-#elif V8_TARGET_ARCH_S390
-    const uint8_t ident[16] = {0x7F, 'E', 'L', 'F', 1, 2, 1, 3,
                                0,    0,   0,   0,   0, 0, 0, 0};
 #else
 #error Unsupported target architecture.
@@ -649,7 +660,7 @@ class ELF {
     // id=B81AEC1A37F5DAF185257C3E004E8845&linkid=1n0000&c_t=
     // c9xw7v5dzsj7gt1ifgf4cjbcnskqptmr
     header->machine = 21;
-#elif V8_TARGET_ARCH_S390
+#elif V8_TARGET_ARCH_S390X
     // Processor identification value is 22 (EM_S390) as defined in the ABI:
     // http://refspecs.linuxbase.org/ELF/zSeries/lzsabi0_s390.html#AEN1691
     // http://refspecs.linuxbase.org/ELF/zSeries/lzsabi0_zSeries.html#AEN1599
@@ -737,8 +748,7 @@ class ELFSymbol {
         section(section) {}
 
   Binding binding() const { return static_cast<Binding>(info >> 4); }
-#if (V8_TARGET_ARCH_IA32 || V8_TARGET_ARCH_ARM || \
-     (V8_TARGET_ARCH_S390 && V8_TARGET_ARCH_32_BIT))
+#if (V8_TARGET_ARCH_IA32 || V8_TARGET_ARCH_ARM)
   struct SerializedLayout {
     SerializedLayout(uint32_t name, uintptr_t value, uintptr_t size,
                      Binding binding, Type type, uint16_t section)
@@ -893,43 +903,62 @@ class CodeDescription {
   };
 #endif
 
-  CodeDescription(const char* name, Code code, SharedFunctionInfo shared,
-                  LineInfo* lineinfo)
-      : name_(name), code_(code), shared_info_(shared), lineinfo_(lineinfo) {}
+  CodeDescription(const char* name, base::AddressRegion region,
+                  Tagged<SharedFunctionInfo> shared, LineInfo* lineinfo,
+                  bool is_function, CodeKind kind, int opt_id = -1)
+      : name_(name),
+        shared_info_(shared),
+        lineinfo_(lineinfo),
+        is_function_(is_function),
+        code_region_(region),
+        kind_(kind),
+        opt_id_(opt_id) {}
+
+  void set_maglev_variable_locations(
+      const std::vector<maglev::MaglevVariableInfo>& vars) {
+    maglev_variable_locations_ = vars;
+  }
+  const std::vector<maglev::MaglevVariableInfo>& maglev_variable_locations()
+      const {
+    return maglev_variable_locations_;
+  }
 
   const char* name() const { return name_; }
 
   LineInfo* lineinfo() const { return lineinfo_; }
 
-  bool is_function() const {
-    Code::Kind kind = code_.kind();
-    return kind == Code::OPTIMIZED_FUNCTION;
+  bool is_function() const { return is_function_; }
+
+  bool has_scope_info() const {
+    return (kind_ == CodeKind::INTERPRETED_FUNCTION ||
+            kind_ == CodeKind::BASELINE || kind_ == CodeKind::MAGLEV) &&
+           !shared_info_.is_null();
   }
 
-  bool has_scope_info() const { return !shared_info_.is_null(); }
-
-  ScopeInfo scope_info() const {
+  Tagged<ScopeInfo> scope_info() const {
     DCHECK(has_scope_info());
-    return shared_info_.scope_info();
+    return shared_info_->scope_info();
   }
 
-  uintptr_t CodeStart() const {
-    return static_cast<uintptr_t>(code_.InstructionStart());
-  }
+  uintptr_t CodeStart() const { return code_region_.begin(); }
 
-  uintptr_t CodeEnd() const {
-    return static_cast<uintptr_t>(code_.InstructionEnd());
-  }
+  uintptr_t CodeEnd() const { return code_region_.end(); }
 
-  uintptr_t CodeSize() const { return CodeEnd() - CodeStart(); }
+  CodeKind kind() const { return kind_; }
+
+  Tagged<SharedFunctionInfo> shared_info() const { return shared_info_; }
+
+  uintptr_t CodeSize() const { return code_region_.size(); }
 
   bool has_script() {
-    return !shared_info_.is_null() && shared_info_.script().IsScript();
+    return !shared_info_.is_null() && IsScript(shared_info_->script());
   }
 
-  Script script() { return Script::cast(shared_info_.script()); }
+  Tagged<Script> script() { return Cast<Script>(shared_info_->script()); }
 
   bool IsLineInfoAvailable() { return lineinfo_ != nullptr; }
+
+  base::AddressRegion region() { return code_region_; }
 
 #if V8_TARGET_ARCH_X64
   uintptr_t GetStackStateStartAddress(StackState state) const {
@@ -944,8 +973,16 @@ class CodeDescription {
 #endif
 
   std::unique_ptr<char[]> GetFilename() {
-    if (!shared_info_.is_null()) {
-      return String::cast(script().name()).ToCString();
+    if (kind_ == CodeKind::MAGLEV && v8_flags.maglev_gdbjit &&
+        v8_flags.gdbjit_full) {
+      std::string func_name = shared_info_->DebugNameCStr().get();
+      std::string filename = GetMaglevGraphFilename(func_name, opt_id_);
+      std::unique_ptr<char[]> result(new char[filename.length() + 1]);
+      snprintf(result.get(), filename.length() + 1, "%s", filename.c_str());
+      return result;
+    }
+    if (!shared_info_.is_null() && IsString(script()->name())) {
+      return Cast<String>(script()->name())->ToCString();
     } else {
       std::unique_ptr<char[]> result(new char[1]);
       result[0] = 0;
@@ -955,7 +992,7 @@ class CodeDescription {
 
   int GetScriptLineNumber(int pos) {
     if (!shared_info_.is_null()) {
-      return script().GetLineNumber(pos) + 1;
+      return script()->GetLineNumber(pos) + 1;
     } else {
       return 0;
     }
@@ -963,9 +1000,13 @@ class CodeDescription {
 
  private:
   const char* name_;
-  Code code_;
-  SharedFunctionInfo shared_info_;
+  Tagged<SharedFunctionInfo> shared_info_;
   LineInfo* lineinfo_;
+  bool is_function_;
+  base::AddressRegion code_region_;
+  CodeKind kind_;
+  int opt_id_;
+  std::vector<maglev::MaglevVariableInfo> maglev_variable_locations_;
 #if V8_TARGET_ARCH_X64
   uintptr_t stack_state_start_addresses_[STACK_STATE_MAX];
 #endif
@@ -974,8 +1015,8 @@ class CodeDescription {
 #if defined(__ELF)
 static void CreateSymbolsTable(CodeDescription* desc, Zone* zone, ELF* elf,
                                size_t text_section_index) {
-  ELFSymbolTable* symtab = new (zone) ELFSymbolTable(".symtab", zone);
-  ELFStringTable* strtab = new (zone) ELFStringTable(".strtab");
+  ELFSymbolTable* symtab = zone->New<ELFSymbolTable>(".symtab", zone);
+  ELFStringTable* strtab = zone->New<ELFStringTable>(".strtab");
 
   // Symbol table should be followed by the linked string table.
   elf->AddSection(symtab);
@@ -984,9 +1025,13 @@ static void CreateSymbolsTable(CodeDescription* desc, Zone* zone, ELF* elf,
   symtab->Add(ELFSymbol("V8 Code", 0, 0, ELFSymbol::BIND_LOCAL,
                         ELFSymbol::TYPE_FILE, ELFSection::INDEX_ABSOLUTE));
 
-  symtab->Add(ELFSymbol(desc->name(), 0, desc->CodeSize(),
-                        ELFSymbol::BIND_GLOBAL, ELFSymbol::TYPE_FUNC,
-                        text_section_index));
+  std::string name = desc->name();
+
+  char* zone_name = zone->AllocateArray<char>(name.length() + 1);
+  snprintf(zone_name, name.length() + 1, "%s", name.c_str());
+
+  symtab->Add(ELFSymbol(zone_name, 0, desc->CodeSize(), ELFSymbol::BIND_LOCAL,
+                        ELFSymbol::TYPE_FUNC, text_section_index));
 }
 #endif  // defined(__ELF)
 
@@ -1058,10 +1103,11 @@ class DebugInfoSection : public DebugSection {
     uint32_t ty_offset = static_cast<uint32_t>(w->position() - cu_start);
     w->WriteULEB128(3);
     w->Write<uint8_t>(kSystemPointerSize);
+    w->Write<uint8_t>(DW_ATE_ADDRESS);
     w->WriteString("v8value");
 
     if (desc_->has_scope_info()) {
-      ScopeInfo scope = desc_->scope_info();
+      Tagged<ScopeInfo> scope = desc_->scope_info();
       w->WriteULEB128(2);
       w->WriteString(desc_->name());
       w->Write<intptr_t>(desc_->CodeStart());
@@ -1074,62 +1120,33 @@ class DebugInfoSection : public DebugSection {
       w->Write<uint8_t>(DW_OP_reg6);  // and here on x64.
 #elif V8_TARGET_ARCH_ARM
       UNIMPLEMENTED();
-#elif V8_TARGET_ARCH_MIPS
-      UNIMPLEMENTED();
 #elif V8_TARGET_ARCH_MIPS64
+      UNIMPLEMENTED();
+#elif V8_TARGET_ARCH_LOONG64
       UNIMPLEMENTED();
 #elif V8_TARGET_ARCH_PPC64 && V8_OS_LINUX
       w->Write<uint8_t>(DW_OP_reg31);  // The frame pointer is here on PPC64.
-#elif V8_TARGET_ARCH_S390
+#elif V8_TARGET_ARCH_S390X
       w->Write<uint8_t>(DW_OP_reg11);  // The frame pointer's here on S390.
 #else
 #error Unsupported target architecture.
 #endif
       fb_block_size.set(static_cast<uint32_t>(w->position() - fb_block_start));
 
-      int params = scope.ParameterCount();
-      int context_slots = scope.ContextLocalCount();
-      // The real slot ID is internal_slots + context_slot_id.
-      int internal_slots = Context::MIN_CONTEXT_SLOTS;
+      int params = scope->ParameterCount();
       int current_abbreviation = 4;
-
-      EmbeddedVector<char, 256> buffer;
-      StringBuilder builder(buffer.begin(), buffer.length());
 
       for (int param = 0; param < params; ++param) {
         w->WriteULEB128(current_abbreviation++);
-        builder.Reset();
-        builder.AddFormatted("param%d", param);
-        w->WriteString(builder.Finalize());
+        std::string param_name = "a" + std::to_string(param);
+        w->WriteString(param_name.c_str());
         w->Write<uint32_t>(ty_offset);
         Writer::Slot<uint32_t> block_size = w->CreateSlotHere<uint32_t>();
         uintptr_t block_start = w->position();
         w->Write<uint8_t>(DW_OP_fbreg);
-        w->WriteSLEB128(JavaScriptFrameConstants::kLastParameterOffset +
+        w->WriteSLEB128(StandardFrameConstants::kFixedFrameSizeAboveFp +
                         kSystemPointerSize * (params - param - 1));
         block_size.set(static_cast<uint32_t>(w->position() - block_start));
-      }
-
-      // See contexts.h for more information.
-      DCHECK_EQ(Context::MIN_CONTEXT_SLOTS, 4);
-      DCHECK_EQ(Context::SCOPE_INFO_INDEX, 0);
-      DCHECK_EQ(Context::PREVIOUS_INDEX, 1);
-      DCHECK_EQ(Context::EXTENSION_INDEX, 2);
-      DCHECK_EQ(Context::NATIVE_CONTEXT_INDEX, 3);
-      w->WriteULEB128(current_abbreviation++);
-      w->WriteString(".scope_info");
-      w->WriteULEB128(current_abbreviation++);
-      w->WriteString(".previous");
-      w->WriteULEB128(current_abbreviation++);
-      w->WriteString(".extension");
-      w->WriteULEB128(current_abbreviation++);
-      w->WriteString(".native_context");
-
-      for (int context_slot = 0; context_slot < context_slots; ++context_slot) {
-        w->WriteULEB128(current_abbreviation++);
-        builder.Reset();
-        builder.AddFormatted("context_slot%d", context_slot + internal_slots);
-        w->WriteString(builder.Finalize());
       }
 
       {
@@ -1139,7 +1156,7 @@ class DebugInfoSection : public DebugSection {
         Writer::Slot<uint32_t> block_size = w->CreateSlotHere<uint32_t>();
         uintptr_t block_start = w->position();
         w->Write<uint8_t>(DW_OP_fbreg);
-        w->WriteSLEB128(JavaScriptFrameConstants::kFunctionOffset);
+        w->WriteSLEB128(StandardFrameConstants::kFunctionOffset);
         block_size.set(static_cast<uint32_t>(w->position() - block_start));
       }
 
@@ -1151,6 +1168,20 @@ class DebugInfoSection : public DebugSection {
         uintptr_t block_start = w->position();
         w->Write<uint8_t>(DW_OP_fbreg);
         w->WriteSLEB128(StandardFrameConstants::kContextOffset);
+        block_size.set(static_cast<uint32_t>(w->position() - block_start));
+      }
+
+      for (const auto& info : desc_->maglev_variable_locations()) {
+        w->WriteULEB128(current_abbreviation++);
+        std::string var_name = "n" + std::to_string(info.node_id);
+        w->WriteString(var_name.c_str());
+        w->Write<uint32_t>(ty_offset);
+        Writer::Slot<uint32_t> block_size = w->CreateSlotHere<uint32_t>();
+        uintptr_t block_start = w->position();
+        w->Write<uint8_t>(DW_OP_fbreg);
+        int offset = StandardFrameConstants::kExpressionsOffset -
+                     info.spill_slot_index * kSystemPointerSize;
+        w->WriteSLEB128(offset);
         block_size.set(static_cast<uint32_t>(w->position() - block_start));
       }
 
@@ -1200,6 +1231,7 @@ class DebugAbbrevSection : public DebugSection {
     DW_AT_STMT_LIST = 0x10,
     DW_AT_LOW_PC = 0x11,
     DW_AT_HIGH_PC = 0x12,
+    DW_AT_const_value = 0x1c,
     DW_AT_ENCODING = 0x3E,
     DW_AT_FRAME_BASE = 0x40,
     DW_AT_TYPE = 0x49
@@ -1253,13 +1285,8 @@ class DebugAbbrevSection : public DebugSection {
     w->WriteULEB128(0);
 
     if (extra_info) {
-      ScopeInfo scope = desc_->scope_info();
-      int params = scope.ParameterCount();
-      int context_slots = scope.ContextLocalCount();
-      // The real slot ID is internal_slots + context_slot_id.
-      int internal_slots = Context::MIN_CONTEXT_SLOTS;
-      // Total children is params + context_slots + internal_slots + 2
-      // (__function and __context).
+      Tagged<ScopeInfo> scope = desc_->scope_info();
+      int params = scope->ParameterCount();
 
       // The extra duplication below seems to be necessary to keep
       // gdb from getting upset on OSX.
@@ -1278,9 +1305,11 @@ class DebugAbbrevSection : public DebugSection {
       w->WriteULEB128(0);
 
       w->WriteULEB128(current_abbreviation++);
-      w->WriteULEB128(DW_TAG_STRUCTURE_TYPE);
+      w->WriteULEB128(DW_TAG_BASE_TYPE);
       w->Write<uint8_t>(DW_CHILDREN_NO);
       w->WriteULEB128(DW_AT_BYTE_SIZE);
+      w->WriteULEB128(DW_FORM_DATA1);
+      w->WriteULEB128(DW_AT_ENCODING);
       w->WriteULEB128(DW_FORM_DATA1);
       w->WriteULEB128(DW_AT_NAME);
       w->WriteULEB128(DW_FORM_STRING);
@@ -1291,20 +1320,15 @@ class DebugAbbrevSection : public DebugSection {
         WriteVariableAbbreviation(w, current_abbreviation++, true, true);
       }
 
-      for (int internal_slot = 0; internal_slot < internal_slots;
-           ++internal_slot) {
-        WriteVariableAbbreviation(w, current_abbreviation++, false, false);
-      }
-
-      for (int context_slot = 0; context_slot < context_slots; ++context_slot) {
-        WriteVariableAbbreviation(w, current_abbreviation++, false, false);
-      }
-
       // The function.
       WriteVariableAbbreviation(w, current_abbreviation++, true, false);
 
       // The context.
       WriteVariableAbbreviation(w, current_abbreviation++, true, false);
+
+      for (size_t i = 0; i < desc_->maglev_variable_locations().size(); ++i) {
+        WriteVariableAbbreviation(w, current_abbreviation++, true, false);
+      }
 
       w->WriteULEB128(0);  // Terminate the sibling list.
     }
@@ -1396,7 +1420,11 @@ class DebugLineSection : public DebugSection {
 
       // Reduce bloating in the debug line table by removing duplicate line
       // entries (per DWARF2 standard).
-      intptr_t new_line = desc_->GetScriptLineNumber(info->pos_);
+      DCHECK_NE(info->pos_, kNoSourcePosition);
+      intptr_t new_line = (desc_->kind() == CodeKind::MAGLEV &&
+                           v8_flags.maglev_gdbjit && v8_flags.gdbjit_full)
+                              ? info->pos_
+                              : desc_->GetScriptLineNumber(info->pos_);
       if (new_line == line) {
         continue;
       }
@@ -1606,7 +1634,7 @@ void UnwindInfoSection::WriteFDE(Writer* w, int cie_position) {
 }
 
 void UnwindInfoSection::WriteFDEStateOnEntry(Writer* w) {
-  // The first state, just after the control has been transferred to the the
+  // The first state, just after the control has been transferred to the
   // function.
 
   // RBP for this function will be the value of RSP after pushing the RBP
@@ -1695,12 +1723,12 @@ bool UnwindInfoSection::WriteBodyInternal(Writer* w) {
 static void CreateDWARFSections(CodeDescription* desc, Zone* zone,
                                 DebugObject* obj) {
   if (desc->IsLineInfoAvailable()) {
-    obj->AddSection(new (zone) DebugInfoSection(desc));
-    obj->AddSection(new (zone) DebugAbbrevSection(desc));
-    obj->AddSection(new (zone) DebugLineSection(desc));
+    obj->AddSection(zone->New<DebugInfoSection>(desc));
+    obj->AddSection(zone->New<DebugAbbrevSection>(desc));
+    obj->AddSection(zone->New<DebugLineSection>(desc));
   }
 #if V8_TARGET_ARCH_X64
-  obj->AddSection(new (zone) UnwindInfoSection(desc));
+  obj->AddSection(zone->New<UnwindInfoSection>(desc));
 #endif
 }
 
@@ -1735,9 +1763,9 @@ void __attribute__((noinline)) __jit_debug_register_code() { __asm__(""); }
 JITDescriptor __jit_debug_descriptor = {1, 0, nullptr, nullptr};
 
 #ifdef OBJECT_PRINT
-void __gdb_print_v8_object(Object object) {
+void __gdb_print_v8_object(TaggedBase object) {
   StdoutStream os;
-  object.Print(os);
+  Print(object, os);
   os << std::flush;
 }
 #endif
@@ -1745,8 +1773,8 @@ void __gdb_print_v8_object(Object object) {
 
 static JITCodeEntry* CreateCodeEntry(Address symfile_addr,
                                      uintptr_t symfile_size) {
-  JITCodeEntry* entry =
-      static_cast<JITCodeEntry*>(malloc(sizeof(JITCodeEntry) + symfile_size));
+  JITCodeEntry* entry = static_cast<JITCodeEntry*>(
+      base::Malloc(sizeof(JITCodeEntry) + symfile_size));
 
   entry->symfile_addr_ = reinterpret_cast<Address>(entry + 1);
   entry->symfile_size_ = symfile_size;
@@ -1758,7 +1786,7 @@ static JITCodeEntry* CreateCodeEntry(Address symfile_addr,
   return entry;
 }
 
-static void DestroyCodeEntry(JITCodeEntry* entry) { free(entry); }
+static void DestroyCodeEntry(JITCodeEntry* entry) { base::Free(entry); }
 
 static void RegisterCodeEntry(JITCodeEntry* entry) {
   entry->next_ = __jit_debug_descriptor.first_entry_;
@@ -1792,8 +1820,11 @@ static JITCodeEntry* CreateELFObject(CodeDescription* desc, Isolate* isolate) {
   MachO mach_o(&zone);
   Writer w(&mach_o);
 
-  mach_o.AddSection(new (&zone) MachOTextSection(
-      kCodeAlignment, desc->CodeStart(), desc->CodeSize()));
+  const uint32_t code_alignment = static_cast<uint32_t>(kCodeAlignment);
+  static_assert(code_alignment == kCodeAlignment,
+                "Unsupported code alignment value");
+  mach_o.AddSection(zone.New<MachOTextSection>(
+      code_alignment, desc->CodeStart(), desc->CodeSize()));
 
   CreateDWARFSections(desc, &zone, &mach_o);
 
@@ -1803,7 +1834,7 @@ static JITCodeEntry* CreateELFObject(CodeDescription* desc, Isolate* isolate) {
   ELF elf(&zone);
   Writer w(&elf);
 
-  size_t text_section_index = elf.AddSection(new (&zone) FullHeaderELFSection(
+  size_t text_section_index = elf.AddSection(zone.New<FullHeaderELFSection>(
       ".text", ELFSection::TYPE_NOBITS, kCodeAlignment, desc->CodeStart(), 0,
       desc->CodeSize(), ELFSection::FLAG_ALLOC | ELFSection::FLAG_EXEC));
 
@@ -1817,32 +1848,38 @@ static JITCodeEntry* CreateELFObject(CodeDescription* desc, Isolate* isolate) {
   return CreateCodeEntry(reinterpret_cast<Address>(w.buffer()), w.position());
 }
 
-struct AddressRange {
-  Address start;
-  Address end;
-};
-
-struct AddressRangeLess {
-  bool operator()(const AddressRange& a, const AddressRange& b) const {
-    if (a.start == b.start) return a.end < b.end;
-    return a.start < b.start;
+// Like base::AddressRegion::StartAddressLess but also compares |end| when
+// |begin| is equal.
+struct AddressRegionLess {
+  bool operator()(const base::AddressRegion& a,
+                  const base::AddressRegion& b) const {
+    if (a.begin() == b.begin()) return a.end() < b.end();
+    return a.begin() < b.begin();
   }
 };
 
-struct CodeMapConfig {
-  using Key = AddressRange;
-  using Value = JITCodeEntry*;
-  using Less = AddressRangeLess;
-};
-
-using CodeMap =
-    std::map<CodeMapConfig::Key, CodeMapConfig::Value, CodeMapConfig::Less>;
+using CodeMap = std::map<base::AddressRegion, JITCodeEntry*, AddressRegionLess>;
 
 static CodeMap* GetCodeMap() {
   // TODO(jgruber): Don't leak.
   static CodeMap* code_map = nullptr;
   if (code_map == nullptr) code_map = new CodeMap();
   return code_map;
+}
+
+using MaglevVariablesMap =
+    std::map<uintptr_t, std::vector<maglev::MaglevVariableInfo>>;
+static base::LazyMutex maglev_vars_mutex = LAZY_MUTEX_INITIALIZER;
+static MaglevVariablesMap* GetMaglevVariablesMap() {
+  static MaglevVariablesMap* map = nullptr;
+  if (map == nullptr) map = new MaglevVariablesMap();
+  return map;
+}
+
+void RegisterMaglevVariableLocations(
+    uintptr_t code_start, const std::vector<maglev::MaglevVariableInfo>& vars) {
+  base::MutexGuard lock_guard(maglev_vars_mutex.Pointer());
+  GetMaglevVariablesMap()->emplace(code_start, vars);
 }
 
 static uint32_t HashCodeAddress(Address addr) {
@@ -1910,127 +1947,186 @@ static void AddUnwindInfo(CodeDescription* desc) {
 
 static base::LazyMutex mutex = LAZY_MUTEX_INITIALIZER;
 
-// Remove entries from the map that intersect the given address range,
-// and deregister them from GDB.
-static void RemoveJITCodeEntries(CodeMap* map, const AddressRange& range) {
-  DCHECK(range.start < range.end);
+static std::optional<std::pair<CodeMap::iterator, CodeMap::iterator>>
+GetOverlappingRegions(CodeMap* map, const base::AddressRegion region) {
+  DCHECK_LT(region.begin(), region.end());
 
-  if (map->empty()) return;
+  if (map->empty()) return {};
 
   // Find the first overlapping entry.
 
-  // If successful, points to the first element not less than `range`. The
+  // If successful, points to the first element not less than `region`. The
   // returned iterator has the key in `first` and the value in `second`.
-  auto it = map->lower_bound(range);
+  auto it = map->lower_bound(region);
   auto start_it = it;
 
   if (it == map->end()) {
     start_it = map->begin();
+    // Find the first overlapping entry.
+    for (; start_it != map->end(); ++start_it) {
+      if (start_it->first.end() > region.begin()) {
+        break;
+      }
+    }
   } else if (it != map->begin()) {
     for (--it; it != map->begin(); --it) {
-      if ((*it).first.end <= range.start) break;
+      if ((*it).first.end() <= region.begin()) break;
+      start_it = it;
+    }
+    if (it == map->begin() && it->first.end() > region.begin()) {
       start_it = it;
     }
   }
 
-  DCHECK(start_it != map->end());
-
-  // Find the first non-overlapping entry after `range`.
-
-  const auto end_it = map->lower_bound({range.end, 0});
-
-  // Evict intersecting ranges.
-
-  if (std::distance(start_it, end_it) < 1) return;  // No overlapping entries.
-
-  for (auto it = start_it; it != end_it; it++) {
-    JITCodeEntry* old_entry = (*it).second;
-    UnregisterCodeEntry(old_entry);
-    DestroyCodeEntry(old_entry);
+  if (start_it == map->end()) {
+    return {};
   }
 
-  map->erase(start_it, end_it);
+  // Find the first non-overlapping entry after `region`.
+
+  const auto end_it = map->lower_bound({region.end(), 0});
+
+  // Return a range containing intersecting regions.
+
+  if (std::distance(start_it, end_it) < 1) {
+    return {};  // No overlapping entries.
+  }
+
+  return {{start_it, end_it}};
+}
+
+// Remove entries from the map that intersect the given address region,
+// and deregister them from GDB.
+static void RemoveJITCodeEntries(CodeMap* map,
+                                 const base::AddressRegion region) {
+  if (auto overlap = GetOverlappingRegions(map, region)) {
+    auto start_it = overlap->first;
+    auto end_it = overlap->second;
+    for (auto it = start_it; it != end_it; it++) {
+      JITCodeEntry* old_entry = (*it).second;
+      UnregisterCodeEntry(old_entry);
+      DestroyCodeEntry(old_entry);
+    }
+
+    map->erase(start_it, end_it);
+  }
 }
 
 // Insert the entry into the map and register it with GDB.
-static void AddJITCodeEntry(CodeMap* map, const AddressRange& range,
+static void AddJITCodeEntry(CodeMap* map, const base::AddressRegion region,
                             JITCodeEntry* entry, bool dump_if_enabled,
                             const char* name_hint) {
 #if defined(DEBUG) && !V8_OS_WIN
   static int file_num = 0;
-  if (FLAG_gdbjit_dump && dump_if_enabled) {
+  if (v8_flags.gdbjit_dump && dump_if_enabled) {
     static const int kMaxFileNameSize = 64;
     char file_name[64];
 
-    SNPrintF(Vector<char>(file_name, kMaxFileNameSize), "/tmp/elfdump%s%d.o",
-             (name_hint != nullptr) ? name_hint : "", file_num++);
-    WriteBytes(file_name, reinterpret_cast<byte*>(entry->symfile_addr_),
+    SNPrintF(base::Vector<char>(file_name, kMaxFileNameSize),
+             "/tmp/elfdump%s%d.o", (name_hint != nullptr) ? name_hint : "",
+             file_num++);
+    WriteBytes(file_name, reinterpret_cast<uint8_t*>(entry->symfile_addr_),
                static_cast<int>(entry->symfile_size_));
   }
 #endif
 
-  auto result = map->emplace(range, entry);
+  auto result = map->emplace(region, entry);
   DCHECK(result.second);  // Insertion happened.
   USE(result);
 
   RegisterCodeEntry(entry);
 }
 
-static void AddCode(const char* name, Code code, SharedFunctionInfo shared,
-                    LineInfo* lineinfo) {
-  DisallowHeapAllocation no_gc;
+static void AddCode(const char* name, base::AddressRegion region,
+                    Tagged<SharedFunctionInfo> shared, LineInfo* lineinfo,
+                    Isolate* isolate, bool is_function, CodeKind kind,
+                    int opt_id) {
+  DisallowGarbageCollection no_gc;
+  CodeDescription code_desc(name, region, shared, lineinfo, is_function, kind,
+                            opt_id);
+
+  if (kind == CodeKind::MAGLEV) {
+    base::MutexGuard lock_guard(maglev_vars_mutex.Pointer());
+    auto map = GetMaglevVariablesMap();
+    auto it = map->find(region.begin());
+    if (it != map->end()) {
+      code_desc.set_maglev_variable_locations(it->second);
+      map->erase(it);
+    }
+  }
 
   CodeMap* code_map = GetCodeMap();
-  AddressRange range;
-  range.start = code.address();
-  range.end = code.address() + code.CodeSize();
-  RemoveJITCodeEntries(code_map, range);
+  RemoveJITCodeEntries(code_map, region);
 
-  CodeDescription code_desc(name, code, shared, lineinfo);
-
-  if (!FLAG_gdbjit_full && !code_desc.IsLineInfoAvailable()) {
+  if (!v8_flags.gdbjit_full && !code_desc.IsLineInfoAvailable()) {
     delete lineinfo;
     return;
   }
 
   AddUnwindInfo(&code_desc);
-  Isolate* isolate = code.GetIsolate();
   JITCodeEntry* entry = CreateELFObject(&code_desc, isolate);
 
   delete lineinfo;
 
   const char* name_hint = nullptr;
   bool should_dump = false;
-  if (FLAG_gdbjit_dump) {
-    if (strlen(FLAG_gdbjit_dump_filter) == 0) {
+  if (v8_flags.gdbjit_dump) {
+    if (strlen(v8_flags.gdbjit_dump_filter) == 0) {
       name_hint = name;
       should_dump = true;
     } else if (name != nullptr) {
-      name_hint = strstr(name, FLAG_gdbjit_dump_filter);
+      name_hint = strstr(name, v8_flags.gdbjit_dump_filter);
       should_dump = (name_hint != nullptr);
     }
   }
-  AddJITCodeEntry(code_map, range, entry, should_dump, name_hint);
+  AddJITCodeEntry(code_map, region, entry, should_dump, name_hint);
 }
 
 void EventHandler(const v8::JitCodeEvent* event) {
-  if (!FLAG_gdbjit) return;
-  if (event->code_type != v8::JitCodeEvent::JIT_CODE) return;
+  if (!v8_flags.gdbjit) return;
+  if ((event->code_type != v8::JitCodeEvent::JIT_CODE) &&
+      (event->code_type != v8::JitCodeEvent::WASM_CODE)) {
+    return;
+  }
   base::MutexGuard lock_guard(mutex.Pointer());
   switch (event->type) {
     case v8::JitCodeEvent::CODE_ADDED: {
       Address addr = reinterpret_cast<Address>(event->code_start);
-      Isolate* isolate = reinterpret_cast<Isolate*>(event->isolate);
-      Code code = isolate->heap()->GcSafeFindCodeForInnerPointer(addr);
       LineInfo* lineinfo = GetLineInfo(addr);
-      EmbeddedVector<char, 256> buffer;
-      StringBuilder builder(buffer.begin(), buffer.length());
-      builder.AddSubstring(event->name.str, static_cast<int>(event->name.len));
+      std::string event_name(event->name.str, event->name.len);
       // It's called UnboundScript in the API but it's a SharedFunctionInfo.
-      SharedFunctionInfo shared = event->script.IsEmpty()
-                                      ? SharedFunctionInfo()
-                                      : *Utils::OpenHandle(*event->script);
-      AddCode(builder.Finalize(), code, shared, lineinfo);
+      Tagged<SharedFunctionInfo> shared =
+          event->script.IsEmpty() ? Tagged<SharedFunctionInfo>()
+                                  : *Utils::OpenDirectHandle(*event->script);
+      Isolate* isolate = reinterpret_cast<Isolate*>(event->isolate);
+      bool is_function = false;
+      // TODO(zhin): See if we can use event->code_type to determine
+      // is_function, the difference currently is that JIT_CODE is SparkPlug,
+      // TurboProp, TurboFan, whereas CodeKindIsOptimizedJSFunction is only
+      // TurboProp and TurboFan. is_function is used for AddUnwindInfo, and the
+      // prologue that SP generates probably matches that of TP/TF, so we can
+      // use event->code_type here instead of finding the Code.
+      // TODO(zhin): Rename is_function to be more accurate.
+      CodeKind kind = CodeKind::INTERPRETED_FUNCTION;
+      int opt_id = -1;
+      if (event->code_type == v8::JitCodeEvent::JIT_CODE) {
+        Tagged<Code> lookup_result =
+            isolate->heap()->FindCodeForInnerPointer(addr);
+        is_function = CodeKindIsOptimizedJSFunction(lookup_result->kind());
+        kind = lookup_result->kind();
+        // Skip GDB JIT registration for builtins because it is very slow. Also,
+        // we already emit debug information in the embedded blob.
+        if (kind == CodeKind::BUILTIN || kind == CodeKind::BYTECODE_HANDLER) {
+          delete lineinfo;
+          return;
+        }
+        if (kind == CodeKind::MAGLEV) {
+          opt_id =
+              lookup_result->deoptimization_data()->OptimizationId().value();
+        }
+      }
+      AddCode(event_name.c_str(), {addr, event->code_len}, shared, lineinfo,
+              isolate, is_function, kind, opt_id);
       break;
     }
     case v8::JitCodeEvent::CODE_MOVED:
@@ -2060,6 +2156,23 @@ void EventHandler(const v8::JitCodeEvent* event) {
     }
   }
 }
+
+void AddRegionForTesting(const base::AddressRegion region) {
+  // For testing purposes we don't care about JITCodeEntry, pass nullptr.
+  auto result = GetCodeMap()->emplace(region, nullptr);
+  DCHECK(result.second);  // Insertion happened.
+  USE(result);
+}
+
+void ClearCodeMapForTesting() { GetCodeMap()->clear(); }
+
+size_t NumOverlapEntriesForTesting(const base::AddressRegion region) {
+  if (auto overlaps = GetOverlappingRegions(GetCodeMap(), region)) {
+    return std::distance(overlaps->first, overlaps->second);
+  }
+  return 0;
+}
+
 #endif
 }  // namespace GDBJITInterface
 }  // namespace internal

@@ -9,20 +9,26 @@ const util = require('util');
 // run the function with those settings.
 // if not, then queue up a bunch of child processes.
 const bench = common.createBenchmark(main, {
-  len: [102400, 1024 * 1024 * 16],
+  len: [102400, 1024 * 64 * 16],
   type: ['utf', 'asc', 'buf'],
-  dur: [5]
+  dur: [5],
 }, {
-  flags: [ '--expose-internals', '--no-warnings' ]
+  test: { len: 1024 },
+  flags: [ '--expose-internals', '--no-warnings' ],
 });
 
 function main({ dur, len, type }) {
   const {
     TCP,
     TCPConnectWrap,
-    constants: TCPConstants
+    constants: TCPConstants,
   } = common.binding('tcp_wrap');
-  const { WriteWrap } = common.binding('stream_wrap');
+  const {
+    WriteWrap,
+    kReadBytesOrError,
+    kArrayBufferOffset,
+    streamBaseState,
+  } = common.binding('stream_wrap');
   const PORT = common.PORT;
 
   function fail(err, syscall) {
@@ -31,7 +37,7 @@ function main({ dur, len, type }) {
 
   // Server
   const serverHandle = new TCP(TCPConstants.SERVER);
-  var err = serverHandle.bind('127.0.0.1', PORT);
+  let err = serverHandle.bind('127.0.0.1', PORT);
   if (err)
     fail(err, 'bind');
 
@@ -49,9 +55,11 @@ function main({ dur, len, type }) {
       if (!buffer)
         fail('read');
 
+      const nread = streamBaseState[kReadBytesOrError];
+      const offset = streamBaseState[kArrayBufferOffset];
       const writeReq = new WriteWrap();
       writeReq.async = false;
-      err = clientHandle.writeBuffer(writeReq, Buffer.from(buffer));
+      err = clientHandle.writeBuffer(writeReq, Buffer.from(buffer, offset, nread));
 
       if (err)
         fail(err, 'write');
@@ -66,7 +74,7 @@ function main({ dur, len, type }) {
   };
 
   // Client
-  var chunk;
+  let chunk;
   switch (type) {
     case 'buf':
       chunk = Buffer.alloc(len, 'x');
@@ -83,7 +91,7 @@ function main({ dur, len, type }) {
 
   const clientHandle = new TCP(TCPConstants.SOCKET);
   const connectReq = new TCPConnectWrap();
-  var bytes = 0;
+  let bytes = 0;
 
   err = clientHandle.connect(connectReq, '127.0.0.1', PORT);
   if (err)
@@ -93,7 +101,7 @@ function main({ dur, len, type }) {
     if (!buffer)
       fail('read');
 
-    bytes += buffer.byteLength;
+    bytes += streamBaseState[kReadBytesOrError];
   };
 
   connectReq.oncomplete = function(err) {
@@ -118,7 +126,7 @@ function main({ dur, len, type }) {
   function write() {
     const writeReq = new WriteWrap();
     writeReq.oncomplete = afterWrite;
-    var err;
+    let err;
     switch (type) {
       case 'buf':
         err = clientHandle.writeBuffer(writeReq, chunk);

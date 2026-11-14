@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # Copyright 2016 the V8 project authors. All rights reserved.
 # Use of this source code is governed by a BSD-style license that can be
 # found in the LICENSE file.
@@ -69,7 +69,7 @@ EXCLUSIONS = [
 
 # Executables found in the build output for which no coverage is generated.
 # Exclude them from the coverage data file.
-EXE_BLACKLIST = [
+EXE_EXCLUSIONS = [
   'generate-bytecode-expectations',
   'hello-world',
   'mksnapshot',
@@ -109,7 +109,7 @@ def executables(build_dir):
     file_path = os.path.join(build_dir, f)
     if (os.path.isfile(file_path) and
         os.access(file_path, os.X_OK) and
-        f not in EXE_BLACKLIST):
+        f not in EXE_EXCLUSIONS):
       yield file_path
 
 
@@ -168,9 +168,9 @@ def get_instrumented_lines(executable):
   # We don't call the sancov tool to get more speed.
   process = subprocess.Popen(
       'objdump -d %s | '
-      'grep \'^\s\+[0-9a-f]\+:.*\scall\(q\|\)\s\+[0-9a-f]\+ '
-      '<__sanitizer_cov\(_with_check\|\|_trace_pc_guard\)\(@plt\|\)>\' | '
-      'grep \'^\s\+[0-9a-f]\+\' -o | '
+      r"grep '^\s\+[0-9a-f]\+:.*\scall\(q\|\)\s\+[0-9a-f]\+ "
+      r"<__sanitizer_cov\(_with_check\|\|_trace_pc_guard\)\(@plt\|\)>' | "
+      r"grep '^\s\+[0-9a-f]\+' -o | "
       '%s | '
       '%s --obj %s -functions=none' %
           (executable, SANITIZE_PCS, SYMBOLIZER, executable),

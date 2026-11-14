@@ -27,8 +27,6 @@
 
 // Tests supportedLocalesOf method.
 
-// Flags: --harmony-intl-segmenter
-
 var services = [
   Intl.Collator,
   Intl.DateTimeFormat,
@@ -51,7 +49,8 @@ for (const service of services) {
   assertEquals("sr", strLocale[0]);
 
   var locales = ["sr-Thai-RS", "de", "zh-CN"];
-  let multiLocale = service.supportedLocalesOf(locales);
+  let multiLocale = service.supportedLocalesOf(
+      locales, {localeMatcher: "lookup"});
   assertEquals("sr-Thai-RS", multiLocale[0]);
   assertEquals("de", multiLocale[1]);
   assertEquals("zh-CN", multiLocale[2]);

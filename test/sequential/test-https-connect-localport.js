@@ -17,7 +17,7 @@ const assert = require('assert');
     res.end();
   }));
 
-  server.listen(0, 'localhost', common.mustCall(() => {
+  server.listen(0, '127.0.0.1', common.mustCall(() => {
     const port = server.address().port;
     const req = https.get({
       host: 'localhost',
@@ -26,7 +26,9 @@ const assert = require('assert');
       family: 4,
       localPort: common.PORT,
       rejectUnauthorized: false,
-    }, common.mustCall(() => {
+      agent: false,
+    }, common.mustCall((res) => {
+      res.resume();
       assert.strictEqual(req.socket.localPort, common.PORT);
       assert.strictEqual(req.socket.remotePort, port);
     }));

@@ -21,10 +21,13 @@
 
 #include "async_wrap-inl.h"
 #include "env-inl.h"
-#include "node.h"
 #include "handle_wrap.h"
+#include "node.h"
+#include "node_external_reference.h"
+#include "permission/permission.h"
 #include "string_bytes.h"
 
+#include <string>
 
 namespace node {
 
@@ -35,6 +38,7 @@ using v8::FunctionCallbackInfo;
 using v8::FunctionTemplate;
 using v8::HandleScope;
 using v8::Integer;
+using v8::Isolate;
 using v8::Local;
 using v8::MaybeLocal;
 using v8::Object;
@@ -42,6 +46,7 @@ using v8::PropertyAttribute;
 using v8::ReadOnly;
 using v8::Signature;
 using v8::String;
+using v8::TryCatch;
 using v8::Value;
 
 namespace {
@@ -52,6 +57,7 @@ class FSEventWrap: public HandleWrap {
                          Local<Value> unused,
                          Local<Context> context,
                          void* priv);
+  static void RegisterExternalReferences(ExternalReferenceRegistry* registry);
   static void New(const FunctionCallbackInfo<Value>& args);
   static void Start(const FunctionCallbackInfo<Value>& args);
   static void GetInitialized(const FunctionCallbackInfo<Value>& args);
@@ -71,6 +77,9 @@ class FSEventWrap: public HandleWrap {
 
   uv_fs_event_t handle_;
   enum encoding encoding_ = kDefaultEncoding;
+  // The path being watched, used to re-check read permission for the
+  // descendants reported by libuv when the permission model is enabled.
+  std::string watched_path_;
 };
 
 
@@ -94,20 +103,19 @@ void FSEventWrap::Initialize(Local<Object> target,
                              Local<Context> context,
                              void* priv) {
   Environment* env = Environment::GetCurrent(context);
+  Isolate* isolate = env->isolate();
 
-  auto fsevent_string = FIXED_ONE_BYTE_STRING(env->isolate(), "FSEvent");
-  Local<FunctionTemplate> t = env->NewFunctionTemplate(New);
-  t->InstanceTemplate()->SetInternalFieldCount(1);
-  t->SetClassName(fsevent_string);
+  Local<FunctionTemplate> t = NewFunctionTemplate(isolate, New);
+  t->InstanceTemplate()->SetInternalFieldCount(
+      FSEventWrap::kInternalFieldCount);
 
-  t->Inherit(AsyncWrap::GetConstructorTemplate(env));
-  env->SetProtoMethod(t, "start", Start);
-  env->SetProtoMethod(t, "close", Close);
+  t->Inherit(HandleWrap::GetConstructorTemplate(env));
+  SetProtoMethod(isolate, t, "start", Start);
 
   Local<FunctionTemplate> get_initialized_templ =
       FunctionTemplate::New(env->isolate(),
                             GetInitialized,
-                            env->as_callback_data(),
+                            Local<Value>(),
                             Signature::New(env->isolate(), t));
 
   t->PrototypeTemplate()->SetAccessorProperty(
@@ -116,11 +124,15 @@ void FSEventWrap::Initialize(Local<Object> target,
       Local<FunctionTemplate>(),
       static_cast<PropertyAttribute>(ReadOnly | DontDelete | DontEnum));
 
-  target->Set(env->context(),
-              fsevent_string,
-              t->GetFunction(context).ToLocalChecked()).Check();
+  SetConstructorFunction(context, target, "FSEvent", t);
 }
 
+void FSEventWrap::RegisterExternalReferences(
+    ExternalReferenceRegistry* registry) {
+  registry->Register(New);
+  registry->Register(Start);
+  registry->Register(GetInitialized);
+}
 
 void FSEventWrap::New(const FunctionCallbackInfo<Value>& args) {
   CHECK(args.IsConstructCall());
@@ -141,6 +153,9 @@ void FSEventWrap::Start(const FunctionCallbackInfo<Value>& args) {
 
   BufferValue path(env->isolate(), args[0]);
   CHECK_NOT_NULL(*path);
+  THROW_IF_INSUFFICIENT_PERMISSIONS(
+      env, permission::PermissionScope::kFileSystemRead, *path);
+  wrap->watched_path_ = *path;
 
   unsigned int flags = 0;
   if (args[2]->IsTrue())
@@ -199,7 +214,7 @@ void FSEventWrap::OnEvent(uv_fs_event_t* handle, const char* filename,
   } else if (events & UV_CHANGE) {
     event_string = env->change_string();
   } else {
-    CHECK(0 && "bad fs events flag");
+    UNREACHABLE("bad fs events flag");
   }
 
   Local<Value> argv[] = {
@@ -208,19 +223,34 @@ void FSEventWrap::OnEvent(uv_fs_event_t* handle, const char* filename,
     Null(env->isolate())
   };
 
+  // When the permission model is enabled, a recursive watch can report
+  // descendants that fall outside the granted read scope (for example a nested
+  // path under an exact, non-wildcard grant). Do not leak those names; report
+  // the event without a filename instead.
+  if (filename != nullptr && env->permission()->enabled()) {
+    std::string full_path = wrap->watched_path_;
+    full_path += kPathSeparator;
+    full_path += filename;
+    if (!env->permission()->is_granted(
+            env, permission::PermissionScope::kFileSystemRead, full_path)) {
+      filename = nullptr;
+    }
+  }
+
   if (filename != nullptr) {
-    Local<Value> error;
-    MaybeLocal<Value> fn = StringBytes::Encode(env->isolate(),
-                                               filename,
-                                               wrap->encoding_,
-                                               &error);
+    // TODO(@jasnell): Historically, this code has failed to correctly
+    // propagate any error returned by the StringBytes::Encode method,
+    // and would instead just crash the process. That behavior is preserved
+    // here but should be looked at. Preferably errors would be handled
+    // correctly here.
+    TryCatch try_catch(env->isolate());
+    MaybeLocal<Value> fn =
+        StringBytes::Encode(env->isolate(), filename, wrap->encoding_);
     if (fn.IsEmpty()) {
       argv[0] = Integer::New(env->isolate(), UV_EINVAL);
-      argv[2] = StringBytes::Encode(env->isolate(),
-                                    filename,
-                                    strlen(filename),
-                                    BUFFER,
-                                    &error).ToLocalChecked();
+      argv[2] = StringBytes::Encode(
+                    env->isolate(), filename, strlen(filename), BUFFER)
+                    .ToLocalChecked();
     } else {
       argv[2] = fn.ToLocalChecked();
     }
@@ -232,4 +262,7 @@ void FSEventWrap::OnEvent(uv_fs_event_t* handle, const char* filename,
 }  // anonymous namespace
 }  // namespace node
 
-NODE_MODULE_CONTEXT_AWARE_INTERNAL(fs_event_wrap, node::FSEventWrap::Initialize)
+NODE_BINDING_CONTEXT_AWARE_INTERNAL(fs_event_wrap,
+                                    node::FSEventWrap::Initialize)
+NODE_BINDING_EXTERNAL_REFERENCE(fs_event_wrap,
+                                node::FSEventWrap::RegisterExternalReferences)

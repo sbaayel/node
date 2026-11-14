@@ -1,8 +1,12 @@
 'use strict';
 
-require('../common');
+const common = require('../common');
 const assert = require('assert');
 const { Worker } = require('worker_threads');
+
+if (process.config.variables.node_without_node_options) {
+  common.skip('missing NODE_OPTIONS support');
+}
 
 {
   const expectedErr = {
@@ -31,5 +35,19 @@ const { Worker } = require('worker_threads');
   }, expectedErr);
   assert.throws(() => {
     new Worker(__filename, { execArgv: ['--redirect-warnings'] });
+  }, expectedErr);
+}
+
+{
+  const expectedErr = {
+    code: 'ERR_WORKER_INVALID_EXEC_ARGV',
+    name: 'Error'
+  };
+  assert.throws(() => {
+    new Worker(__filename, {
+      env: {
+        NODE_OPTIONS: '--nonexistent-options'
+      }
+    });
   }, expectedErr);
 }

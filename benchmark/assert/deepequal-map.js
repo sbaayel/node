@@ -5,7 +5,7 @@ const { deepEqual, deepStrictEqual, notDeepEqual, notDeepStrictEqual } =
   require('assert');
 
 const bench = common.createBenchmark(main, {
-  n: [5e2],
+  n: [2e3],
   len: [5e2],
   strict: [0, 1],
   method: [
@@ -31,11 +31,9 @@ function benchmark(method, n, values, values2) {
 }
 
 function main({ n, len, method, strict }) {
-  const array = Array(len).fill(1);
+  const array = Array.from({ length: len }, () => '');
 
   switch (method) {
-    case '':
-      // Empty string falls through to next line as default, mostly for tests.
     case 'deepEqual_primitiveOnly': {
       const values = array.map((_, i) => [`str_${i}`, 123]);
       benchmark(strict ? deepStrictEqual : deepEqual, n, values);
@@ -48,7 +46,7 @@ function main({ n, len, method, strict }) {
     }
     case 'deepEqual_mixed': {
       const values = array.map(
-        (_, i) => [i % 2 ? [`str_${i}`, 1] : `str_${i}`, 123]
+        (_, i) => [i % 2 ? [`str_${i}`, 1] : `str_${i}`, 123],
       );
       benchmark(strict ? deepStrictEqual : deepEqual, n, values);
       break;
@@ -69,7 +67,7 @@ function main({ n, len, method, strict }) {
     }
     case 'notDeepEqual_mixed': {
       const values = array.map(
-        (_, i) => [i % 2 ? [`str_${i}`, 1] : `str_${i}`, 123]
+        (_, i) => [i % 2 ? [`str_${i}`, 1] : `str_${i}`, 123],
       );
       const values2 = values.slice(0);
       values2[0] = ['w00t', 123];

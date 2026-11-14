@@ -20,22 +20,21 @@ $L$SEH_begin_sha256_block_data_order:
 
 
 
-	lea	r11,[OPENSSL_ia32cap_P]
-	mov	r9d,DWORD[r11]
-	mov	r10d,DWORD[4+r11]
-	mov	r11d,DWORD[8+r11]
+	lea	r10,[OPENSSL_ia32cap_P]
+	mov	r9,QWORD[r10]
+	mov	r11d,DWORD[8+r10]
 	test	r11d,536870912
 	jnz	NEAR _shaext_shortcut
 	and	r11d,296
 	cmp	r11d,296
 	je	NEAR $L$avx2_shortcut
-	and	r9d,1073741824
-	and	r10d,268435968
-	or	r10d,r9d
-	cmp	r10d,1342177792
+$L$avx_dispatch:
+	mov	r11,1152923704703844352
+	and	r9,r11
+	cmp	r9,r11
 	je	NEAR $L$avx_shortcut
-	test	r10d,512
-	jnz	NEAR $L$ssse3_shortcut
+	bt	r9,41
+	jc	NEAR $L$ssse3_shortcut
 	mov	rax,rsp
 
 	push	rbx
@@ -1744,6 +1743,7 @@ $L$epilogue:
 	DB	0F3h,0C3h		;repret
 
 $L$SEH_end_sha256_block_data_order:
+section	.rdata rdata align=64
 ALIGN	64
 
 K256:
@@ -1789,8 +1789,9 @@ K256:
 DB	83,72,65,50,53,54,32,98,108,111,99,107,32,116,114,97
 DB	110,115,102,111,114,109,32,102,111,114,32,120,56,54,95,54
 DB	52,44,32,67,82,89,80,84,79,71,65,77,83,32,98,121
-DB	32,60,97,112,112,114,111,64,111,112,101,110,115,115,108,46
-DB	111,114,103,62,0
+DB	32,60,104,116,116,112,115,58,47,47,103,105,116,104,117,98
+DB	46,99,111,109,47,100,111,116,45,97,115,109,62,0
+section .text
 
 ALIGN	64
 sha256_block_data_order_shaext:
@@ -1804,6 +1805,7 @@ $L$SEH_begin_sha256_block_data_order_shaext:
 
 
 _shaext_shortcut:
+
 	lea	rsp,[((-88))+rsp]
 	movaps	XMMWORD[(-8-80)+rax],xmm6
 	movaps	XMMWORD[(-8-64)+rax],xmm7
@@ -2022,6 +2024,7 @@ $L$epilogue_shaext:
 	mov	rdi,QWORD[8+rsp]	;WIN64 epilogue
 	mov	rsi,QWORD[16+rsp]
 	DB	0F3h,0C3h		;repret
+
 $L$SEH_end_sha256_block_data_order_shaext:
 
 ALIGN	64
@@ -5476,6 +5479,8 @@ $L$ower_avx2:
 
 	lea	rsp,[448+rsp]
 
+
+
 	add	eax,DWORD[rdi]
 	add	ebx,DWORD[4+rdi]
 	add	ecx,DWORD[8+rdi]
@@ -5501,15 +5506,17 @@ $L$ower_avx2:
 	jbe	NEAR $L$oop_avx2
 	lea	rbp,[rsp]
 
+
+
+
 $L$done_avx2:
-	lea	rsp,[rbp]
-	mov	rsi,QWORD[88+rsp]
+	mov	rsi,QWORD[88+rbp]
 
 	vzeroupper
-	movaps	xmm6,XMMWORD[((64+32))+rsp]
-	movaps	xmm7,XMMWORD[((64+48))+rsp]
-	movaps	xmm8,XMMWORD[((64+64))+rsp]
-	movaps	xmm9,XMMWORD[((64+80))+rsp]
+	movaps	xmm6,XMMWORD[((64+32))+rbp]
+	movaps	xmm7,XMMWORD[((64+48))+rbp]
+	movaps	xmm8,XMMWORD[((64+64))+rbp]
+	movaps	xmm9,XMMWORD[((64+80))+rbp]
 	mov	r15,QWORD[((-48))+rsi]
 
 	mov	r14,QWORD[((-40))+rsi]

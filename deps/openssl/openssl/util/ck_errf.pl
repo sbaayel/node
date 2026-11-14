@@ -1,7 +1,7 @@
 #! /usr/bin/env perl
-# Copyright 1995-2018 The OpenSSL Project Authors. All Rights Reserved.
+# Copyright 1995-2026 The OpenSSL Project Authors. All Rights Reserved.
 #
-# Licensed under the OpenSSL license (the "License").  You may not use
+# Licensed under the Apache License 2.0 (the "License").  You may not use
 # this file except in compliance with the License.  You can obtain a copy
 # in the file LICENSE in the source distribution or at
 # https://www.openssl.org/source/license.html
@@ -72,11 +72,39 @@ if ( $internal ) {
     die "Extra parameters given.\n" if @ARGV;
     $config = "crypto/err/openssl.ec" unless defined $config;
     @source = ( glob('crypto/*.c'), glob('crypto/*/*.c'),
-                glob('ssl/*.c'), glob('ssl/*/*.c') );
+                glob('ssl/*.c'), glob('ssl/*/*.c'), glob('providers/*.c'),
+                glob('providers/*/*.c'), glob('providers/*/*/*.c') );
 } else {
     die "Configuration file not given.\nSee '$0 -help' for information\n"
         unless defined $config;
     @source = @ARGV;
+}
+
+# util/mkerr.pl keeps a stamp file next to its statefile recording the
+# last completed error-code pass over the tree.  While the stamp is
+# newer than the config file, the statefile and every source file,
+# this check has already run against the current tree; skip the scan.
+# (If the config file names its statefile with an S line, this
+# derivation misses it and the check simply never skips.)
+if ( !$debug ) {
+    my $statefile = $config;
+
+    $statefile =~ s/\.ec$/.txt/;
+    my $stamp = (stat "$statefile.stamp")[9];
+
+    if ( defined $stamp ) {
+        my $uptodate = 1;
+
+        foreach my $file ( $config, $statefile, @source ) {
+            my $mtime = (stat $file)[9];
+
+            if ( !defined $mtime || $mtime >= $stamp ) {
+                $uptodate = 0;
+                last;
+            }
+        }
+        exit 0 if $uptodate;
+    }
 }
 
 # To detect if there is any error generation for a libcrypto/libssl libs

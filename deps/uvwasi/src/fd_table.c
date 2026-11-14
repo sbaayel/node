@@ -8,15 +8,58 @@
 
 #include "uv.h"
 #include "fd_table.h"
+#include "path_resolver.h"
 #include "wasi_types.h"
 #include "wasi_rights.h"
 #include "uv_mapping.h"
 #include "uvwasi_alloc.h"
 
 
+static uvwasi_errno_t uvwasi__insert_stdio(uvwasi_t* uvwasi,
+                                           struct uvwasi_fd_table_t* table,
+                                           const uvwasi_fd_t fd,
+                                           const uvwasi_fd_t expected,
+                                           const char* name) {
+  struct uvwasi_fd_wrap_t* wrap;
+  uvwasi_filetype_t type;
+  uvwasi_rights_t base;
+  uvwasi_rights_t inheriting;
+  uvwasi_errno_t err;
+
+  err = uvwasi__get_filetype_by_fd(fd, &type);
+  if (err != UVWASI_ESUCCESS)
+    return err;
+
+  err = uvwasi__get_rights(fd, UV_FS_O_RDWR, type, &base, &inheriting);
+  if (err != UVWASI_ESUCCESS)
+    return err;
+
+  err = uvwasi_fd_table_insert(uvwasi,
+                               table,
+                               fd,
+                               NULL,
+                               name,
+                               name,
+                               type,
+                               base,
+                               inheriting,
+                               0,
+                               &wrap);
+  if (err != UVWASI_ESUCCESS)
+    return err;
+
+  if (wrap->id != expected)
+    err = UVWASI_EBADF;
+
+  uv_mutex_unlock(&wrap->mutex);
+  return err;
+}
+
+
 uvwasi_errno_t uvwasi_fd_table_insert(uvwasi_t* uvwasi,
                                       struct uvwasi_fd_table_t* table,
                                       uv_file fd,
+                                      uv_tcp_t* sock,
                                       const char* mapped_path,
                                       const char* real_path,
                                       uvwasi_filetype_t type,
@@ -28,26 +71,50 @@ uvwasi_errno_t uvwasi_fd_table_insert(uvwasi_t* uvwasi,
   struct uvwasi_fd_wrap_t** new_fds;
   uvwasi_errno_t err;
   uint32_t new_size;
-  int index;
+  uint32_t index;
   uint32_t i;
   int r;
   size_t mp_len;
   char* mp_copy;
   size_t rp_len;
   char* rp_copy;
+  char* np_copy;
 
-  mp_len = strlen(mapped_path);
-  rp_len = strlen(real_path);
+  if (type != UVWASI_FILETYPE_SOCKET_STREAM) {
+    mp_len = strlen(mapped_path);
+    rp_len = strlen(real_path);
+  } else {
+    mp_len = 0;
+    rp_len = 0;
+    rp_copy = NULL;
+    mp_copy = NULL;
+    np_copy = NULL;
+  }
+
+  /* Reserve room for the mapped path, real path, and normalized mapped path. */
   entry = (struct uvwasi_fd_wrap_t*)
-    uvwasi__malloc(uvwasi, sizeof(*entry) + mp_len + rp_len + 2);
-  if (entry == NULL) return UVWASI_ENOMEM;
+    uvwasi__malloc(uvwasi, sizeof(*entry) + mp_len + mp_len + rp_len + 3);
+  if (entry == NULL)
+    return UVWASI_ENOMEM;
 
-  mp_copy = (char*)(entry + 1);
-  rp_copy = mp_copy + mp_len + 1;
-  memcpy(mp_copy, mapped_path, mp_len);
-  mp_copy[mp_len] = '\0';
-  memcpy(rp_copy, real_path, rp_len);
-  rp_copy[rp_len] = '\0';
+  if (type != UVWASI_FILETYPE_SOCKET_STREAM) {
+    mp_copy = (char*)(entry + 1);
+    rp_copy = mp_copy + mp_len + 1;
+    np_copy = rp_copy + rp_len + 1;
+    memcpy(mp_copy, mapped_path, mp_len);
+    mp_copy[mp_len] = '\0';
+    memcpy(rp_copy, real_path, rp_len);
+    rp_copy[rp_len] = '\0';
+
+    /* Calculate the normalized version of the mapped path, as it will be used for
+       any path calculations on this fd. Use the length of the mapped path as an
+       upper bound for the normalized path length. */
+    err = uvwasi__normalize_path(mp_copy, mp_len, np_copy, mp_len);
+    if (err) {
+      uvwasi__free(uvwasi, entry);
+      goto exit;
+    }
+  }
 
   uv_rwlock_wrlock(&table->rwlock);
 
@@ -69,16 +136,17 @@ uvwasi_errno_t uvwasi_fd_table_insert(uvwasi_t* uvwasi,
     table->size = new_size;
   } else {
     /* The table is big enough, so find an empty slot for the new data. */
-    index = -1;
+    int valid_slot = 0;
     for (i = 0; i < table->size; ++i) {
       if (table->fds[i] == NULL) {
+        valid_slot = 1;
         index = i;
         break;
       }
     }
 
-    /* index should never be -1. */
-    if (index == -1) {
+    /* This should never happen. */
+    if (valid_slot == 0) {
       uvwasi__free(uvwasi, entry);
       err = UVWASI_ENOSPC;
       goto exit;
@@ -95,8 +163,10 @@ uvwasi_errno_t uvwasi_fd_table_insert(uvwasi_t* uvwasi,
 
   entry->id = index;
   entry->fd = fd;
+  entry->sock = sock;
   entry->path = mp_copy;
   entry->real_path = rp_copy;
+  entry->normalized_path = np_copy;
   entry->type = type;
   entry->rights_base = rights_base;
   entry->rights_inheriting = rights_inheriting;
@@ -116,73 +186,51 @@ exit:
 
 
 uvwasi_errno_t uvwasi_fd_table_init(uvwasi_t* uvwasi,
-                                    struct uvwasi_fd_table_t* table,
-                                    uint32_t init_size) {
-  struct uvwasi_fd_wrap_t* wrap;
-  uvwasi_filetype_t type;
-  uvwasi_rights_t base;
-  uvwasi_rights_t inheriting;
+                                    const uvwasi_options_t* options) {
+  struct uvwasi_fd_table_t* table;
   uvwasi_errno_t err;
-  uvwasi_fd_t i;
   int r;
 
   /* Require an initial size of at least three to store the stdio FDs. */
-  if (table == NULL || init_size < 3)
+  if (uvwasi == NULL || options == NULL || options->fd_table_size < 3)
     return UVWASI_EINVAL;
 
-  table->fds = NULL;
-  table->used = 0;
-  table->size = init_size;
-  table->fds = uvwasi__calloc(uvwasi,
-                              init_size,
-                              sizeof(struct uvwasi_fd_wrap_t*));
-
-  if (table->fds == NULL)
+  table = uvwasi__malloc(uvwasi, sizeof(*table));
+  if (table == NULL)
     return UVWASI_ENOMEM;
+
+  table->used = 0;
+  table->size = options->fd_table_size;
+  table->fds = uvwasi__calloc(uvwasi,
+                              options->fd_table_size,
+                              sizeof(struct uvwasi_fd_wrap_t*));
+  if (table->fds == NULL) {
+    uvwasi__free(uvwasi, table);
+    return UVWASI_ENOMEM;
+  }
 
   r = uv_rwlock_init(&table->rwlock);
   if (r != 0) {
     err = uvwasi__translate_uv_error(r);
-    /* Free table->fds and set it to NULL here. This is done explicitly instead
-       of jumping to error_exit because uvwasi_fd_table_free() relies on fds
-       being NULL to know whether or not to destroy the rwlock.
-    */
     uvwasi__free(uvwasi, table->fds);
-    table->fds = NULL;
+    uvwasi__free(uvwasi, table);
     return err;
   }
 
   /* Create the stdio FDs. */
-  for (i = 0; i < 3; ++i) {
-    err = uvwasi__get_filetype_by_fd(i, &type);
-    if (err != UVWASI_ESUCCESS)
-      goto error_exit;
+  err = uvwasi__insert_stdio(uvwasi, table, options->in, 0, "<stdin>");
+  if (err != UVWASI_ESUCCESS)
+    goto error_exit;
 
-    err = uvwasi__get_rights(i, UV_FS_O_RDWR, type, &base, &inheriting);
-    if (err != UVWASI_ESUCCESS)
-      goto error_exit;
+  err = uvwasi__insert_stdio(uvwasi, table, options->out, 1, "<stdout>");
+  if (err != UVWASI_ESUCCESS)
+    goto error_exit;
 
-    err = uvwasi_fd_table_insert(uvwasi,
-                                 table,
-                                 i,
-                                 "",
-                                 "",
-                                 type,
-                                 base,
-                                 inheriting,
-                                 0,
-                                 &wrap);
-    if (err != UVWASI_ESUCCESS)
-      goto error_exit;
+  err = uvwasi__insert_stdio(uvwasi, table, options->err, 2, "<stderr>");
+  if (err != UVWASI_ESUCCESS)
+    goto error_exit;
 
-    r = wrap->id != i || wrap->id != (uvwasi_fd_t) wrap->fd;
-    uv_mutex_unlock(&wrap->mutex);
-    if (r) {
-      err = UVWASI_EBADF;
-      goto error_exit;
-    }
-  }
-
+  uvwasi->fds = table;
   return UVWASI_ESUCCESS;
 error_exit:
   uvwasi_fd_table_free(uvwasi, table);
@@ -194,12 +242,14 @@ void uvwasi_fd_table_free(uvwasi_t* uvwasi, struct uvwasi_fd_table_t* table) {
   struct uvwasi_fd_wrap_t* entry;
   uint32_t i;
 
-  if (table == NULL)
+  if (uvwasi == NULL || table == NULL)
     return;
 
   for (i = 0; i < table->size; i++) {
     entry = table->fds[i];
-    if (entry == NULL) continue;
+
+    if (entry == NULL)
+      continue;
 
     uv_mutex_destroy(&entry->mutex);
     uvwasi__free(uvwasi, entry);
@@ -212,6 +262,8 @@ void uvwasi_fd_table_free(uvwasi_t* uvwasi, struct uvwasi_fd_table_t* table) {
     table->used = 0;
     uv_rwlock_destroy(&table->rwlock);
   }
+
+  uvwasi__free(uvwasi, table);
 }
 
 
@@ -242,11 +294,32 @@ uvwasi_errno_t uvwasi_fd_table_insert_preopen(uvwasi_t* uvwasi,
   return uvwasi_fd_table_insert(uvwasi,
                                 table,
                                 fd,
+                                NULL,
                                 path,
                                 real_path,
                                 UVWASI_FILETYPE_DIRECTORY,
                                 UVWASI__RIGHTS_DIRECTORY_BASE,
                                 UVWASI__RIGHTS_DIRECTORY_INHERITING,
+                                1,
+                                NULL);
+}
+
+
+uvwasi_errno_t uvwasi_fd_table_insert_preopen_socket(uvwasi_t* uvwasi,
+                                              struct uvwasi_fd_table_t* table,
+                                              uv_tcp_t* sock) {
+  if (table == NULL || sock == NULL)
+    return UVWASI_EINVAL;
+
+  return uvwasi_fd_table_insert(uvwasi,
+                                table,
+                                -1,
+                                sock,
+                                NULL,
+                                NULL,
+                                UVWASI_FILETYPE_SOCKET_STREAM,
+                                UVWASI__RIGHTS_SOCKET_BASE,
+                                UVWASI__RIGHTS_SOCKET_INHERITING,
                                 1,
                                 NULL);
 }

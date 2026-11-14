@@ -6,10 +6,14 @@
 
 #include <limits.h>
 
+#include "include/v8-container.h"
+#include "include/v8-context.h"
+#include "include/v8-function.h"
+#include "include/v8-inspector.h"
+#include "include/v8-microtask-queue.h"
+#include "include/v8-regexp.h"
 #include "src/inspector/string-util.h"
 #include "src/inspector/v8-inspector-impl.h"
-
-#include "include/v8-inspector.h"
 
 namespace v8_inspector {
 
@@ -18,7 +22,12 @@ V8Regex::V8Regex(V8InspectorImpl* inspector, const String16& pattern,
     : m_inspector(inspector) {
   v8::Isolate* isolate = m_inspector->isolate();
   v8::HandleScope handleScope(isolate);
-  v8::Local<v8::Context> context = m_inspector->regexContext();
+  v8::Local<v8::Context> context;
+  if (!m_inspector->regexContext().ToLocal(&context)) {
+    DCHECK(isolate->IsExecutionTerminating());
+    m_errorMessage = "terminated";
+    return;
+  }
   v8::Context::Scope contextScope(context);
   v8::TryCatch tryCatch(isolate);
 
@@ -27,14 +36,18 @@ V8Regex::V8Regex(V8InspectorImpl* inspector, const String16& pattern,
   if (multiline) flags |= v8::RegExp::kMultiline;
 
   v8::Local<v8::RegExp> regex;
+  // Protect against reentrant debugger calls via interrupts.
+  v8::debug::PostponeInterruptsScope no_interrupts(m_inspector->isolate());
+  v8::Isolate::AllowJavascriptExecutionScope allow_js(m_inspector->isolate());
   if (v8::RegExp::New(context, toV8String(isolate, pattern),
                       static_cast<v8::RegExp::Flags>(flags))
-          .ToLocal(&regex))
+          .ToLocal(&regex)) {
     m_regex.Reset(isolate, regex);
-  else if (tryCatch.HasCaught())
+  } else if (tryCatch.HasCaught()) {
     m_errorMessage = toProtocolString(isolate, tryCatch.Message()->Get());
-  else
+  } else {
     m_errorMessage = "Internal error";
+  }
 }
 
 int V8Regex::match(const String16& string, int startFrom,
@@ -48,24 +61,33 @@ int V8Regex::match(const String16& string, int startFrom,
 
   v8::Isolate* isolate = m_inspector->isolate();
   v8::HandleScope handleScope(isolate);
-  v8::Local<v8::Context> context = m_inspector->regexContext();
+  v8::Local<v8::Context> context;
+  if (!m_inspector->regexContext().ToLocal(&context)) {
+    DCHECK(isolate->IsExecutionTerminating());
+    return -1;
+  }
   v8::Context::Scope contextScope(context);
-  v8::MicrotasksScope microtasks(isolate,
+  v8::MicrotasksScope microtasks(context,
                                  v8::MicrotasksScope::kDoNotRunMicrotasks);
+  // Protect against reentrant debugger calls via interrupts.
+  v8::debug::PostponeInterruptsScope no_interrupts(m_inspector->isolate());
+  v8::Isolate::AllowJavascriptExecutionScope allow_js(m_inspector->isolate());
   v8::TryCatch tryCatch(isolate);
 
   v8::Local<v8::RegExp> regex = m_regex.Get(isolate);
   v8::Local<v8::Value> exec;
   if (!regex->Get(context, toV8StringInternalized(isolate, "exec"))
-           .ToLocal(&exec))
+           .ToLocal(&exec)) {
     return -1;
+  }
   v8::Local<v8::Value> argv[] = {
       toV8String(isolate, string.substring(startFrom))};
   v8::Local<v8::Value> returnValue;
   if (!exec.As<v8::Function>()
            ->Call(context, regex, arraysize(argv), argv)
-           .ToLocal(&returnValue))
+           .ToLocal(&returnValue)) {
     return -1;
+  }
 
   // RegExp#exec returns null if there's no match, otherwise it returns an
   // Array of strings with the first being the whole match string and others
@@ -80,8 +102,9 @@ int V8Regex::match(const String16& string, int startFrom,
   v8::Local<v8::Array> result = returnValue.As<v8::Array>();
   v8::Local<v8::Value> matchOffset;
   if (!result->Get(context, toV8StringInternalized(isolate, "index"))
-           .ToLocal(&matchOffset))
+           .ToLocal(&matchOffset)) {
     return -1;
+  }
   if (matchLength) {
     v8::Local<v8::Value> match;
     if (!result->Get(context, 0).ToLocal(&match)) return -1;

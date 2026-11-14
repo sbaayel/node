@@ -1,6 +1,5 @@
-#include "arm_arch.h"
+#include "arch/arm_arch.h"
 
-.text
 #if defined(__thumb2__)
 .syntax	unified
 .thumb
@@ -8,10 +7,16 @@
 .code	32
 #endif
 
+.text
+
 #if __ARM_MAX_ARCH__>=7
 .align	5
 .LOPENSSL_armcap:
+# ifdef	_WIN32
+.word	OPENSSL_armcap_P
+# else
 .word	OPENSSL_armcap_P-.Lbn_mul_mont
+# endif
 #endif
 
 .globl	bn_mul_mont
@@ -25,12 +30,14 @@ bn_mul_mont:
 #if __ARM_MAX_ARCH__>=7
 	tst	ip,#7
 	bne	.Lialu
-	adr	r0,.Lbn_mul_mont
-	ldr	r2,.LOPENSSL_armcap
+	ldr	r0,.LOPENSSL_armcap
+#if !defined(_WIN32)
+	adr	r2,.Lbn_mul_mont
 	ldr	r0,[r0,r2]
-#ifdef	__APPLE__
+# endif
+# if defined(__APPLE__) || defined(_WIN32)
 	ldr	r0,[r0]
-#endif
+# endif
 	tst	r0,#ARMV7_NEON		@ NEON available?
 	ldmia	sp, {r0,r2}
 	beq	.Lialu
@@ -886,7 +893,7 @@ bn_mul8x_mont_neon:
 
 	vst1.32	{d10[0]}, [r7, :32]		@ top-most bit
 	sub	r3,r3,r5,lsl#2			@ rewind r3
-	subs	r1,sp,#0				@ clear carry flag
+	subs	r1,sp,#0				@ set carry flag
 	add	r2,sp,r5,lsl#2
 
 .LNEON_sub:
@@ -945,9 +952,10 @@ bn_mul8x_mont_neon:
 	bx	lr						@ bx lr
 .size	bn_mul8x_mont_neon,.-bn_mul8x_mont_neon
 #endif
-.byte	77,111,110,116,103,111,109,101,114,121,32,109,117,108,116,105,112,108,105,99,97,116,105,111,110,32,102,111,114,32,65,82,77,118,52,47,78,69,79,78,44,32,67,82,89,80,84,79,71,65,77,83,32,98,121,32,60,97,112,112,114,111,64,111,112,101,110,115,115,108,46,111,114,103,62,0
+.byte	77,111,110,116,103,111,109,101,114,121,32,109,117,108,116,105,112,108,105,99,97,116,105,111,110,32,102,111,114,32,65,82,77,118,52,47,78,69,79,78,44,32,67,82,89,80,84,79,71,65,77,83,32,98,121,32,60,104,116,116,112,115,58,47,47,103,105,116,104,117,98,46,99,111,109,47,100,111,116,45,97,115,109,62,0
 .align	2
 .align	2
 #if __ARM_MAX_ARCH__>=7
-.comm	OPENSSL_armcap_P,4,4
+
+.hidden	OPENSSL_armcap_P
 #endif

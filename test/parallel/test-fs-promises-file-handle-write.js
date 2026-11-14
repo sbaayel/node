@@ -41,11 +41,11 @@ async function validateEmptyWrite() {
 async function validateNonUint8ArrayWrite() {
   const filePathForHandle = path.resolve(tmpDir, 'tmp-data-write.txt');
   const fileHandle = await open(filePathForHandle, 'w+');
-  const buffer = Buffer.from('Hello world', 'utf8').toString('base64');
+  const string = Buffer.from('Hello world', 'utf8').toString('base64');
 
-  await fileHandle.write(buffer, 0, buffer.length);
+  await fileHandle.write(string, 0, 'utf8');
   const readFileData = fs.readFileSync(filePathForHandle);
-  assert.deepStrictEqual(Buffer.from(buffer, 'utf8'), readFileData);
+  assert.deepStrictEqual(Buffer.from(string, 'utf8'), readFileData);
 
   await fileHandle.close();
 }
@@ -53,14 +53,18 @@ async function validateNonUint8ArrayWrite() {
 async function validateNonStringValuesWrite() {
   const filePathForHandle = path.resolve(tmpDir, 'tmp-non-string-write.txt');
   const fileHandle = await open(filePathForHandle, 'w+');
-  const nonStringValues = [123, {}, new Map()];
+  const nonStringValues = [
+    123, {}, new Map(), null, undefined, 0n, () => {}, Symbol(), true,
+    new String('notPrimitive'),
+    { toString() { return 'amObject'; } },
+    { [Symbol.toPrimitive]: (hint) => 'amObject' },
+  ];
   for (const nonStringValue of nonStringValues) {
-    await fileHandle.write(nonStringValue);
+    await assert.rejects(
+      fileHandle.write(nonStringValue),
+      { message: /"buffer"/, code: 'ERR_INVALID_ARG_TYPE' }
+    );
   }
-
-  const readFileData = fs.readFileSync(filePathForHandle);
-  const expected = ['123', '[object Object]', '[object Map]'].join('');
-  assert.deepStrictEqual(Buffer.from(expected, 'utf8'), readFileData);
 
   await fileHandle.close();
 }
@@ -69,5 +73,5 @@ Promise.all([
   validateWrite(),
   validateEmptyWrite(),
   validateNonUint8ArrayWrite(),
-  validateNonStringValuesWrite()
+  validateNonStringValuesWrite(),
 ]).then(common.mustCall());

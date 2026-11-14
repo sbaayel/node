@@ -33,14 +33,10 @@
 # that the resulting binary is easier transferable between different
 # environments.
 
-CLANG_RELEASE=8.0
-
 THIS_DIR="$(readlink -f "$(dirname "${0}")")"
-LLVM_DIR="${THIS_DIR}/../../third_party/llvm"
-CLANG_DIR="${THIS_DIR}/../../third_party/clang"
-BUILD_DIR="${THIS_DIR}/../../third_party/llvm+clang-build"
-
-LLVM_REPO_URL=${LLVM_URL:-https://llvm.org/svn/llvm-project}
+BUILD_TYPE="Release"
+# BUILD_TYPE="Debug"
+BUILD_DIR="${THIS_DIR}/bootstrap/build"
 
 # Die if any command dies.
 set -e
@@ -72,28 +68,63 @@ if [[ "${OS}" = "Darwin" ]] && xcodebuild -version | grep -q 'Xcode 3.2' ; then
   fi
 fi
 
-echo Getting LLVM release "${CLANG_RELEASE}" in "${LLVM_DIR}"
-if ! svn co --force \
-    "${LLVM_REPO_URL}/llvm/branches/release_${CLANG_RELEASE/./}" \
-    "${LLVM_DIR}"; then
-  echo Checkout failed, retrying
-  rm -rf "${LLVM_DIR}"
-  svn co --force \
-      "${LLVM_REPO_URL}/llvm/branches/release_${CLANG_RELEASE/./}" \
-      "${LLVM_DIR}"
+# TODO(leszeks): Use centralized Chromium Clang tooling
+# (tools/clang/scripts/build.py --skip-build) once build.py supports shallow
+# checkouts and handles fresh/empty target directories without failing git
+# restore.
+CLANG_REVISION=$(vpython3 -c "
+import sys, os
+sys.path.append(os.path.join('${THIS_DIR}', '../clang/scripts'))
+import update
+print(update.CLANG_REVISION)
+")
+LLVM_COMMIT=$(echo "${CLANG_REVISION}" | sed -n 's/.*-g\([0-9a-f]\{7,\}\)/\1/p')
+if [ -z "${LLVM_COMMIT}" ]; then
+  LLVM_COMMIT="${CLANG_REVISION}"
 fi
 
-echo Getting clang release "${CLANG_RELEASE}" in "${CLANG_DIR}"
-svn co --force \
-    "${LLVM_REPO_URL}/cfe/branches/release_${CLANG_RELEASE/./}" \
-    "${CLANG_DIR}"
+LLVM_PROJECT_DIR="${THIS_DIR}/bootstrap/llvm"
+
+echo "Getting LLVM revision ${CLANG_REVISION} in ${LLVM_PROJECT_DIR}"
+LLVM_URL="https://chromium.googlesource.com/external/github.com/llvm/llvm-project.git"
+if ! [ -d "${LLVM_PROJECT_DIR}" ] || \
+   ! git -C "${LLVM_PROJECT_DIR}" remote get-url origin | grep -q -F "${LLVM_URL}" ; then
+  rm -rf "${LLVM_PROJECT_DIR}"
+  git clone --depth 1 "${LLVM_URL}" "${LLVM_PROJECT_DIR}"
+fi
+
+# Git servers (e.g. googlesource) do not allow fetching arbitrary commit SHAs
+# directly (uploadpack.allowReachableSHA1InWant=false), so we fetch main
+# with exponentially increasing depth until the required commit is fetched.
+if ! git -C "${LLVM_PROJECT_DIR}" checkout "${LLVM_COMMIT}" 2>/dev/null; then
+  DEPTH=100
+  MAX_DEPTH=100000
+  while [ "${DEPTH}" -le "${MAX_DEPTH}" ]; do
+    echo "Fetching LLVM history with depth=${DEPTH}..."
+    git -C "${LLVM_PROJECT_DIR}" fetch --depth="${DEPTH}" origin main 2>/dev/null
+    if git -C "${LLVM_PROJECT_DIR}" checkout "${LLVM_COMMIT}" 2>/dev/null; then
+      break
+    fi
+    DEPTH=$((DEPTH * 4))
+  done
+
+  if ! git -C "${LLVM_PROJECT_DIR}" cat-file -e "${LLVM_COMMIT}^{commit}" 2>/dev/null; then
+    echo "Error: Could not find commit ${LLVM_COMMIT} within depth ${MAX_DEPTH}." >&2
+    exit 1
+  fi
+fi
 
 # Echo all commands
 set -x
 
 NUM_JOBS=3
 if [[ "${OS}" = "Linux" ]]; then
-  NUM_JOBS="$(grep -c "^processor" /proc/cpuinfo)"
+  if [[ -e "/proc/cpuinfo" ]]; then
+    NUM_JOBS="$(grep -c "^processor" /proc/cpuinfo)"
+  else
+    # Hack when running in chroot
+    NUM_JOBS="32"
+  fi
 elif [ "${OS}" = "Darwin" ]; then
   NUM_JOBS="$(sysctl -n hw.ncpu)"
 fi
@@ -103,28 +134,36 @@ if [ ! -e "${BUILD_DIR}" ]; then
   mkdir "${BUILD_DIR}"
 fi
 cd "${BUILD_DIR}"
-cmake -DCMAKE_CXX_FLAGS="-static-libstdc++" -DLLVM_ENABLE_TERMINFO=OFF \
-    -DCMAKE_BUILD_TYPE=Release -DLLVM_ENABLE_PROJECTS=clang "${LLVM_DIR}"
-MACOSX_DEPLOYMENT_TARGET=10.5 make -j"${NUM_JOBS}"
+cmake -GNinja -DCMAKE_CXX_FLAGS="-static-libstdc++" -DLLVM_ENABLE_TERMINFO=OFF \
+    -DCMAKE_BUILD_TYPE=$BUILD_TYPE -DLLVM_ENABLE_PROJECTS=clang \
+    -DLLVM_ENABLE_Z3_SOLVER=OFF "${LLVM_PROJECT_DIR}/llvm"
+MACOSX_DEPLOYMENT_TARGET=10.5 ninja -j"${NUM_JOBS}" clang
 
-# Strip the clang binary.
-STRIP_FLAGS=
-if [ "${OS}" = "Darwin" ]; then
-  # See http://crbug.com/256342
-  STRIP_FLAGS=-x
+if [[ "${BUILD_TYPE}" = "Release" ]]; then
+  # Strip the clang binary.
+  STRIP_FLAGS=
+  if [ "${OS}" = "Darwin" ]; then
+    # See http://crbug.com/256342
+    STRIP_FLAGS=-x
+  fi
+  strip ${STRIP_FLAGS} bin/clang
 fi
-strip ${STRIP_FLAGS} bin/clang
 cd -
 
 # Build libgcmole.so
 make -C "${THIS_DIR}" clean
-make -C "${THIS_DIR}" LLVM_SRC_ROOT="${LLVM_DIR}" \
-    CLANG_SRC_ROOT="${CLANG_DIR}" BUILD_ROOT="${BUILD_DIR}" libgcmole.so
+make -C "${THIS_DIR}" LLVM_SRC_ROOT="${LLVM_PROJECT_DIR}/llvm" \
+    CLANG_SRC_ROOT="${LLVM_PROJECT_DIR}/clang" \
+    BUILD_ROOT="${BUILD_DIR}" $BUILD_TYPE
 
 set +x
 
+echo '#########################################################################'
+echo 'Congratulations you compiled clang and libgcmole.so'
 echo
-echo You can now run gcmole using this command:
-echo
-echo CLANG_BIN=\"third_party/llvm+clang-build/bin\" lua tools/gcmole/gcmole.lua
+echo '# You can now run gcmole:'
+echo 'tools/gcmole/gcmole.py full \'
+echo '   --clang-bin-dir="tools/gcmole/bootstrap/build/bin" \'
+echo '   --clang-plugins-dir="tools/gcmole" \'
+echo '   --v8-target-cpu=$CPU'
 echo

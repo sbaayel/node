@@ -15,27 +15,24 @@ const defEncoded = zlib.gzipSync(def);
 
 const data = Buffer.concat([
   abcEncoded,
-  defEncoded
+  defEncoded,
 ]);
 
 assert.strictEqual(zlib.gunzipSync(data).toString(), (abc + def));
 
-zlib.gunzip(data, common.mustCall((err, result) => {
-  assert.ifError(err);
+zlib.gunzip(data, common.mustSucceed((result) => {
   assert.strictEqual(result.toString(), (abc + def));
 }));
 
-zlib.unzip(data, common.mustCall((err, result) => {
-  assert.ifError(err);
+zlib.unzip(data, common.mustSucceed((result) => {
   assert.strictEqual(result.toString(), (abc + def));
 }));
 
 // Multi-member support does not apply to zlib inflate/deflate.
 zlib.unzip(Buffer.concat([
   zlib.deflateSync('abc'),
-  zlib.deflateSync('def')
-]), common.mustCall((err, result) => {
-  assert.ifError(err);
+  zlib.deflateSync('def'),
+]), common.mustSucceed((result) => {
   assert.strictEqual(result.toString(), abc);
 }));
 
@@ -50,9 +47,7 @@ const pmmResultBuffers = [];
 
 fs.createReadStream(pmmFileGz)
   .pipe(zlib.createGunzip())
-  .on('error', (err) => {
-    assert.ifError(err);
-  })
+  .on('error', common.mustNotCall())
   .on('data', (data) => pmmResultBuffers.push(data))
   .on('finish', common.mustCall(() => {
     // Result should match original random garbage
@@ -64,9 +59,7 @@ fs.createReadStream(pmmFileGz)
   const resultBuffers = [];
 
   const unzip = zlib.createGunzip()
-    .on('error', (err) => {
-      assert.ifError(err);
-    })
+    .on('error', common.mustNotCall())
     .on('data', (data) => resultBuffers.push(data))
     .on('finish', common.mustCall(() => {
       assert.strictEqual(
@@ -78,7 +71,7 @@ fs.createReadStream(pmmFileGz)
 
   // First write: write "abc" + the first bytes of "def"
   unzip.write(Buffer.concat([
-    abcEncoded, defEncoded.slice(0, offset)
+    abcEncoded, defEncoded.slice(0, offset),
   ]));
 
   // Write remaining bytes of "def"

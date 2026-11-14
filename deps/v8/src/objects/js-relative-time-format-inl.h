@@ -2,14 +2,16 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+#ifndef V8_OBJECTS_JS_RELATIVE_TIME_FORMAT_INL_H_
+#define V8_OBJECTS_JS_RELATIVE_TIME_FORMAT_INL_H_
+
 #ifndef V8_INTL_SUPPORT
 #error Internationalization is expected to be enabled.
 #endif  // V8_INTL_SUPPORT
 
-#ifndef V8_OBJECTS_JS_RELATIVE_TIME_FORMAT_INL_H_
-#define V8_OBJECTS_JS_RELATIVE_TIME_FORMAT_INL_H_
-
 #include "src/objects/js-relative-time-format.h"
+// Include the non-inl header before the rest of the headers.
+
 #include "src/objects/objects-inl.h"
 
 // Has to be the last include (doesn't have include guards):
@@ -18,37 +20,45 @@
 namespace v8 {
 namespace internal {
 
-OBJECT_CONSTRUCTORS_IMPL(JSRelativeTimeFormat, JSObject)
-
-// Base relative time format accessors.
-ACCESSORS(JSRelativeTimeFormat, locale, String, kLocaleOffset)
-ACCESSORS(JSRelativeTimeFormat, icu_formatter,
-          Managed<icu::RelativeDateTimeFormatter>, kIcuFormatterOffset)
-SMI_ACCESSORS(JSRelativeTimeFormat, flags, kFlagsOffset)
-
-inline void JSRelativeTimeFormat::set_style(Style style) {
-  DCHECK_GE(StyleBits::kMax, style);
-  int hints = flags();
-  hints = StyleBits::update(hints, style);
-  set_flags(hints);
+Tagged<String> JSRelativeTimeFormat::locale() const { return locale_.load(); }
+void JSRelativeTimeFormat::set_locale(Tagged<String> value,
+                                      WriteBarrierMode mode) {
+  locale_.store(this, value, mode);
 }
 
-inline JSRelativeTimeFormat::Style JSRelativeTimeFormat::style() const {
-  return StyleBits::decode(flags());
+Tagged<String> JSRelativeTimeFormat::numberingSystem() const {
+  return numberingSystem_.load();
+}
+void JSRelativeTimeFormat::set_numberingSystem(Tagged<String> value,
+                                               WriteBarrierMode mode) {
+  numberingSystem_.store(this, value, mode);
+}
+
+Tagged<Managed<icu::RelativeDateTimeFormatter>>
+JSRelativeTimeFormat::icu_formatter() const {
+  return Cast<Managed<icu::RelativeDateTimeFormatter>>(icu_formatter_.load());
+}
+void JSRelativeTimeFormat::set_icu_formatter(
+    Tagged<Managed<icu::RelativeDateTimeFormatter>> value,
+    WriteBarrierMode mode) {
+  icu_formatter_.store(this, value, mode);
+}
+
+int JSRelativeTimeFormat::flags() const { return flags_.load().value(); }
+void JSRelativeTimeFormat::set_flags(int value) {
+  flags_.store(this, Smi::FromInt(value));
 }
 
 inline void JSRelativeTimeFormat::set_numeric(Numeric numeric) {
-  DCHECK_GE(NumericBits::kMax, numeric);
+  DCHECK(NumericBit::is_valid(numeric));
   int hints = flags();
-  hints = NumericBits::update(hints, numeric);
+  hints = NumericBit::update(hints, numeric);
   set_flags(hints);
 }
 
 inline JSRelativeTimeFormat::Numeric JSRelativeTimeFormat::numeric() const {
-  return NumericBits::decode(flags());
+  return NumericBit::decode(flags());
 }
-
-CAST_ACCESSOR(JSRelativeTimeFormat)
 
 }  // namespace internal
 }  // namespace v8

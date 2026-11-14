@@ -6,7 +6,6 @@ const fixtures = require('../common/fixtures');
 // Test --tls-keylog CLI flag.
 
 const assert = require('assert');
-const path = require('path');
 const fs = require('fs');
 const { fork } = require('child_process');
 
@@ -15,7 +14,7 @@ if (process.argv[2] === 'test')
 
 const tmpdir = require('../common/tmpdir');
 tmpdir.refresh();
-const file = path.resolve(tmpdir.path, 'keylog.log');
+const file = tmpdir.resolve('keylog.log');
 
 const child = fork(__filename, ['test'], {
   execArgv: ['--tls-keylog=' + file]
@@ -24,8 +23,11 @@ const child = fork(__filename, ['test'], {
 child.on('close', common.mustCall((code, signal) => {
   assert.strictEqual(code, 0);
   assert.strictEqual(signal, null);
-  const log = fs.readFileSync(file, 'utf8');
-  assert(/SECRET/.test(log));
+  const log = fs.readFileSync(file, 'utf8').trim().split('\n');
+  // Both client and server should log their secrets,
+  // so we should have two identical lines in the log
+  assert.strictEqual(log.length, 2);
+  assert.strictEqual(log[0], log[1]);
 }));
 
 function test() {
@@ -40,7 +42,9 @@ function test() {
     },
     server: {
       cert: keys.agent6.cert,
-      key: keys.agent6.key
+      key: keys.agent6.key,
+      // Number of keylog events is dependent on protocol version
+      maxVersion: 'TLSv1.2',
     },
   }, common.mustCall((err, pair, cleanup) => {
     if (pair.server.err) {

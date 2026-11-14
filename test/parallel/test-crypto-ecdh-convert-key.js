@@ -6,6 +6,7 @@ if (!common.hasCrypto)
 const assert = require('assert');
 
 const { ECDH, createSign, getCurves } = require('crypto');
+const { hasFIPS } = require('../common/crypto');
 
 // A valid private key for the secp256k1 curve.
 const cafebabeKey = 'cafebabe'.repeat(8);
@@ -37,7 +38,7 @@ assert.throws(
   () => ECDH.convertKey(cafebabePubPtComp, 'badcurve'),
   {
     name: 'TypeError',
-    message: 'Invalid ECDH curve name'
+    message: 'Invalid EC curve name'
   });
 
 if (getCurves().includes('secp256k1')) {
@@ -93,11 +94,17 @@ if (getCurves().includes('secp256k1')) {
 
   // Compare to getPublicKey.
   const ecdh1 = ECDH('secp256k1');
-  ecdh1.generateKeys();
-  ecdh1.setPrivateKey(cafebabeKey, 'hex');
-  assert.strictEqual(ecdh1.getPublicKey('hex', 'uncompressed'), uncompressed);
-  assert.strictEqual(ecdh1.getPublicKey('hex', 'compressed'), compressed);
-  assert.strictEqual(ecdh1.getPublicKey('hex', 'hybrid'), hybrid);
+  if (hasFIPS(3)) {
+    assert.throws(() => ecdh1.generateKeys(), {
+      code: 'ERR_CRYPTO_OPERATION_FAILED',
+    });
+  } else {
+    ecdh1.generateKeys();
+    ecdh1.setPrivateKey(cafebabeKey, 'hex');
+    assert.strictEqual(ecdh1.getPublicKey('hex', 'uncompressed'), uncompressed);
+    assert.strictEqual(ecdh1.getPublicKey('hex', 'compressed'), compressed);
+    assert.strictEqual(ecdh1.getPublicKey('hex', 'hybrid'), hybrid);
+  }
 }
 
 // See https://github.com/nodejs/node/issues/26133, failed ConvertKey
@@ -117,7 +124,7 @@ if (getCurves().includes('secp256k1')) {
   // rather than Node's generic error message.
   const badKey = 'f'.repeat(128);
   assert.throws(
-    () => ECDH.convertKey(badKey, 'secp256k1', 'hex', 'hex', 'compressed'),
+    () => ECDH.convertKey(badKey, 'secp521r1', 'hex', 'hex', 'compressed'),
     /Failed to convert Buffer to EC_POINT/);
 
   // Next statement should not throw an exception.

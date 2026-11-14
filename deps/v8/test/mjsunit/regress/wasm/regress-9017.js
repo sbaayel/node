@@ -2,8 +2,6 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 //
-// Flags: --liftoff --nowasm-tier-up
-//
 // This test is intended to make Liftoff generate code that uses a very large
 // stack frame, and then try to call another function (which would write to the
 // stack pointer location). On Windows, large frames need extra code to touch
@@ -11,12 +9,12 @@
 // stack, and trying to access past that area, even into memory that was
 // intentionally reserved for this thread's stack, will crash the program.
 
-load('test/mjsunit/wasm/wasm-module-builder.js');
+d8.file.execute('test/mjsunit/wasm/wasm-module-builder.js');
 
 var builder = new WasmModuleBuilder();
 
 var func_idx = builder.addFunction('helper', kSig_i_v)
-    .addLocals({i32_count: 1})
+    .addLocals(kWasmI32, 1)
     .addBody([
         kExprI32Const, 0x01,
     ]).index;

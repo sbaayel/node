@@ -15,7 +15,7 @@ namespace compiler {
 // Forward declarations.
 class CommonOperatorBuilder;
 struct ElementAccess;
-class Graph;
+class TFGraph;
 class JSGraph;
 class MachineOperatorBuilder;
 class Node;
@@ -32,16 +32,19 @@ class MemoryLowering final : public Reducer {
   // An allocation state is propagated on the effect paths through the graph.
   class AllocationState final : public ZoneObject {
    public:
+    AllocationState(const AllocationState&) = delete;
+    AllocationState& operator=(const AllocationState&) = delete;
+
     static AllocationState const* Empty(Zone* zone) {
-      return new (zone) AllocationState();
+      return zone->New<AllocationState>();
     }
     static AllocationState const* Closed(AllocationGroup* group, Node* effect,
                                          Zone* zone) {
-      return new (zone) AllocationState(group, effect);
+      return zone->New<AllocationState>(group, effect);
     }
     static AllocationState const* Open(AllocationGroup* group, intptr_t size,
                                        Node* top, Node* effect, Zone* zone) {
-      return new (zone) AllocationState(group, size, top, effect);
+      return zone->New<AllocationState>(group, size, top, effect);
     }
 
     bool IsYoungGenerationAllocation() const;
@@ -52,6 +55,8 @@ class MemoryLowering final : public Reducer {
     intptr_t size() const { return size_; }
 
    private:
+    friend Zone;
+
     AllocationState();
     explicit AllocationState(AllocationGroup* group, Node* effect);
     AllocationState(AllocationGroup* group, intptr_t size, Node* top,
@@ -63,21 +68,19 @@ class MemoryLowering final : public Reducer {
     intptr_t const size_;
     Node* const top_;
     Node* const effect_;
-
-    DISALLOW_COPY_AND_ASSIGN(AllocationState);
   };
 
   using WriteBarrierAssertFailedCallback = std::function<void(
       Node* node, Node* object, const char* name, Zone* temp_zone)>;
 
   MemoryLowering(
-      JSGraph* jsgraph, Zone* zone, PoisoningMitigationLevel poisoning_level,
+      JSGraph* jsgraph, Zone* zone, JSGraphAssembler* graph_assembler,
+      bool is_wasm,
       AllocationFolding allocation_folding =
           AllocationFolding::kDontAllocationFolding,
       WriteBarrierAssertFailedCallback callback = [](Node*, Node*, const char*,
                                                      Zone*) { UNREACHABLE(); },
       const char* function_debug_name = nullptr);
-  ~MemoryLowering() = default;
 
   const char* reducer_name() const override { return "MemoryReducer"; }
 
@@ -87,7 +90,6 @@ class MemoryLowering final : public Reducer {
   // Specific reducers for each optype to enable keeping track of
   // AllocationState by the MemoryOptimizer.
   Reduction ReduceAllocateRaw(Node* node, AllocationType allocation_type,
-                              AllowLargeObjects allow_large_objects,
                               AllocationState const** state);
   Reduction ReduceLoadFromObject(Node* node);
   Reduction ReduceLoadElement(Node* node);
@@ -106,23 +108,35 @@ class MemoryLowering final : public Reducer {
                                            Node* value,
                                            AllocationState const* state,
                                            WriteBarrierKind);
+  Reduction ReduceLoadExternalPointerField(Node* node);
+  Reduction ReduceLoadBoundedSize(Node* node);
+  Reduction ReduceLoadMap(Node* node);
   Node* ComputeIndex(ElementAccess const& access, Node* node);
-  bool NeedsPoisoning(LoadSensitivity load_sensitivity) const;
+  void EnsureAllocateOperator();
+  Node* GetWasmInstanceNode();
 
-  Graph* graph() const;
-  Isolate* isolate() const;
+  // Align the value to kObjectAlignment8GbHeap if V8_COMPRESS_POINTERS_8GB is
+  // defined.
+  Node* AlignToAllocationAlignment(Node* address);
+
+  TFGraph* graph() const { return graph_; }
+  Isolate* isolate() const { return isolate_; }
   Zone* zone() const { return zone_; }
-  JSGraph* jsgraph() const { return jsgraph_; }
-  CommonOperatorBuilder* common() const;
-  MachineOperatorBuilder* machine() const;
-  GraphAssembler* gasm() { return &graph_assembler_; }
+  inline Zone* graph_zone() const;
+  CommonOperatorBuilder* common() const { return common_; }
+  MachineOperatorBuilder* machine() const { return machine_; }
+  JSGraphAssembler* gasm() const { return graph_assembler_; }
 
   SetOncePointer<const Operator> allocate_operator_;
-  JSGraph* const jsgraph_;
+  SetOncePointer<Node> wasm_instance_node_;
+  Isolate* isolate_;
   Zone* zone_;
-  GraphAssembler graph_assembler_;
+  TFGraph* graph_;
+  CommonOperatorBuilder* common_;
+  MachineOperatorBuilder* machine_;
+  JSGraphAssembler* graph_assembler_;
+  bool is_wasm_;
   AllocationFolding allocation_folding_;
-  PoisoningMitigationLevel poisoning_level_;
   WriteBarrierAssertFailedCallback write_barrier_assert_failed_;
   const char* function_debug_name_;
 

@@ -23,12 +23,12 @@ server.listen(0, common.mustCall(() => {
     }, {
       code: 'ERR_INVALID_ARG_TYPE',
       name: 'TypeError',
-      message: 'The "method" argument must be of type string.' +
+      message: 'The "options.method" property must be of type string.' +
                common.invalidArgTypeHelper(method)
     });
   });
 
   expectedSuccesses.forEach((method) => {
-    http.request({ method, port: server.address().port }).end();
+    http.request({ method, port: server.address().port, agent: false }).end();
   });
 }));

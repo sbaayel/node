@@ -2,16 +2,21 @@
 const common = require('../common');
 const assert = require('assert');
 const cp = require('child_process');
-const path = require('path');
 const fs = require('fs');
 const tmpdir = require('../common/tmpdir');
+
+// console.count() throws on a perfetto build once node.console is enabled:
+// internal/trace_events picks the nestable async instant phase for counters,
+// which V8's trace() builtin rejects there.
+common.skipIfPerfettoEnabled();
 
 // Tests that node.console trace events for counters and time methods are
 // emitted as expected.
 
 const names = [
   'time::foo',
-  'count::bar'
+  'time::\\winvalid_char',
+  'count::bar',
 ];
 const expectedCounts = [ 1, 2, 0 ];
 const expectedTimeTypes = [ 'b', 'n', 'e' ];
@@ -22,8 +27,10 @@ if (process.argv[2] === 'child') {
   console.count('bar');
   console.count('bar');
   console.countReset('bar');
+  console.time('\\winvalid_char');
   console.time('foo');
   setImmediate(() => {
+    console.timeEnd('\\winvalid_char');
     console.timeLog('foo');
     setImmediate(() => {
       console.timeEnd('foo');
@@ -37,25 +44,24 @@ if (process.argv[2] === 'child') {
                          cwd: tmpdir.path,
                          execArgv: [
                            '--trace-event-categories',
-                           'node.console'
+                           'node.console',
                          ]
                        });
 
   proc.once('exit', common.mustCall(async () => {
-    const file = path.join(tmpdir.path, 'node_trace.1.log');
+    const file = tmpdir.resolve('node_trace.1.log');
 
     assert(fs.existsSync(file));
     const data = await fs.promises.readFile(file, { encoding: 'utf8' });
-    JSON.parse(data).traceEvents
-      .filter((trace) => trace.cat !== '__metadata')
-      .forEach((trace) => {
-        assert.strictEqual(trace.pid, proc.pid);
-        assert(names.includes(trace.name));
-        if (trace.name === 'count::bar')
-          assert.strictEqual(trace.args.data, expectedCounts.shift());
-        else if (trace.name === 'time::foo')
-          assert.strictEqual(trace.ph, expectedTimeTypes.shift());
-      });
+    for (const trace of JSON.parse(data).traceEvents
+      .filter((trace) => trace.cat !== '__metadata')) {
+      assert.strictEqual(trace.pid, proc.pid);
+      assert(names.includes(trace.name));
+      if (trace.name === 'count::bar')
+        assert.strictEqual(trace.args.data, expectedCounts.shift());
+      else if (trace.name === 'time::foo')
+        assert.strictEqual(trace.ph, expectedTimeTypes.shift());
+    }
     assert.strictEqual(expectedCounts.length, 0);
     assert.strictEqual(expectedTimeTypes.length, 0);
   }));

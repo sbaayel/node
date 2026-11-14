@@ -7,6 +7,7 @@
 
 #include "src/heap/heap.h"
 #include "src/heap/read-only-heap.h"
+#include "src/heap/safepoint.h"
 #include "src/objects/objects.h"
 
 namespace v8 {
@@ -14,14 +15,13 @@ namespace internal {
 
 // This class allows iteration over the entire heap (Heap and ReadOnlyHeap). It
 // uses the HeapObjectIterator to iterate over non-read-only objects and accepts
-// the same filtering option. (Interrupting iteration while filtering
-// unreachable objects is still forbidden)
+// the same filtering option.
 class V8_EXPORT_PRIVATE CombinedHeapObjectIterator final {
  public:
   CombinedHeapObjectIterator(
       Heap* heap, HeapObjectIterator::HeapObjectsFiltering filtering =
                       HeapObjectIterator::HeapObjectsFiltering::kNoFiltering);
-  HeapObject Next();
+  Tagged<HeapObject> Next();
 
  private:
   HeapObjectIterator heap_iterator_;
@@ -29,8 +29,18 @@ class V8_EXPORT_PRIVATE CombinedHeapObjectIterator final {
 };
 
 V8_WARN_UNUSED_RESULT inline bool IsValidHeapObject(Heap* heap,
-                                                    HeapObject object) {
-  return ReadOnlyHeap::Contains(object) || heap->Contains(object);
+                                                    Tagged<HeapObject> object) {
+  return ReadOnlyHeap::Contains(object) || heap->Contains(object) ||
+         heap->SharedHeapContains(object);
+}
+
+V8_WARN_UNUSED_RESULT inline bool IsValidCodeObject(Heap* heap,
+                                                    Tagged<HeapObject> object) {
+  if (V8_EXTERNAL_CODE_SPACE_BOOL) {
+    return heap->ContainsCode(object);
+  } else {
+    return ReadOnlyHeap::Contains(object) || heap->ContainsCode(object);
+  }
 }
 
 }  // namespace internal

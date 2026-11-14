@@ -14,7 +14,7 @@ namespace v8_inspector {
 
 namespace ConsoleAgentState {
 static const char consoleEnabled[] = "consoleEnabled";
-}
+}  // namespace ConsoleAgentState
 
 V8ConsoleAgentImpl::V8ConsoleAgentImpl(
     V8InspectorSessionImpl* session, protocol::FrontendChannel* frontendChannel,
@@ -27,27 +27,26 @@ V8ConsoleAgentImpl::V8ConsoleAgentImpl(
 V8ConsoleAgentImpl::~V8ConsoleAgentImpl() = default;
 
 Response V8ConsoleAgentImpl::enable() {
-  if (m_enabled) return Response::OK();
+  if (m_enabled) return Response::Success();
   m_state->setBoolean(ConsoleAgentState::consoleEnabled, true);
   m_enabled = true;
-  m_session->inspector()->enableStackCapturingIfNeeded();
   reportAllMessages();
-  return Response::OK();
+  return Response::Success();
 }
 
 Response V8ConsoleAgentImpl::disable() {
-  if (!m_enabled) return Response::OK();
-  m_session->inspector()->disableStackCapturingIfNeeded();
+  if (!m_enabled) return Response::Success();
   m_state->setBoolean(ConsoleAgentState::consoleEnabled, false);
   m_enabled = false;
-  return Response::OK();
+  return Response::Success();
 }
 
-Response V8ConsoleAgentImpl::clearMessages() { return Response::OK(); }
+Response V8ConsoleAgentImpl::clearMessages() { return Response::Success(); }
 
 void V8ConsoleAgentImpl::restore() {
-  if (!m_state->booleanProperty(ConsoleAgentState::consoleEnabled, false))
+  if (!m_state->booleanProperty(ConsoleAgentState::consoleEnabled, false)) {
     return;
+  }
   enable();
 }
 
@@ -61,9 +60,23 @@ void V8ConsoleAgentImpl::reportAllMessages() {
   V8ConsoleMessageStorage* storage =
       m_session->inspector()->ensureConsoleMessageStorage(
           m_session->contextGroupId());
-  for (const auto& message : storage->messages()) {
-    if (message->origin() == V8MessageOrigin::kConsole) {
-      if (!reportMessage(message.get(), false)) return;
+  // The message queue can be cleared by a getter during message formatting.
+  // Make a copy of the message to avoid a UAF.
+  // Also, the storage itself can be destroyed and recreated, so re-fetch the
+  // storage on each iteration.
+  size_t size = storage->messages().size();
+  uint64_t storageId = storage->id();
+  for (size_t i = 0; i < size; ++i) {
+    V8ConsoleMessageStorage* inspectorStorage =
+        m_session->inspector()->consoleMessageStorage(
+            m_session->contextGroupId());
+    if (!inspectorStorage || inspectorStorage->id() != storageId) {
+      break;
+    }
+    if (i >= storage->messages().size()) break;
+    V8ConsoleMessage message = *storage->messages()[i];
+    if (!reportMessage(&message, false)) {
+      break;
     }
   }
 }

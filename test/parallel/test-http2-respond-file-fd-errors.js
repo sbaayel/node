@@ -7,6 +7,7 @@ const fixtures = require('../common/fixtures');
 const assert = require('assert');
 const http2 = require('http2');
 const fs = require('fs');
+const { inspect } = require('util');
 
 const optionsWithTypeError = {
   offset: 'number',
@@ -64,9 +65,9 @@ server.on('stream', common.mustCall((stream) => {
         }),
         {
           name: 'TypeError',
-          code: 'ERR_INVALID_OPT_VALUE',
-          message: `The value "${String(types[type])}" is invalid ` +
-                   `for option "${option}"`
+          code: 'ERR_INVALID_ARG_VALUE',
+          message: `The property 'options.${option}' is invalid. ` +
+            `Received ${inspect(types[type])}`
         }
       );
     });
@@ -116,6 +117,7 @@ server.listen(0, common.mustCall(() => {
   const client = http2.connect(`http://localhost:${server.address().port}`);
   const req = client.request();
 
+  req.on('error', () => {});
   req.on('close', common.mustCall(() => {
     client.close();
     server.close();

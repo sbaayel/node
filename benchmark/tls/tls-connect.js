@@ -5,14 +5,14 @@ const tls = require('tls');
 const common = require('../common.js');
 const bench = common.createBenchmark(main, {
   concurrency: [1, 10],
-  dur: [5]
+  dur: [5],
 });
 
-var clientConn = 0;
-var serverConn = 0;
-var dur;
-var concurrency;
-var running = true;
+let clientConn = 0;
+let serverConn = 0;
+let dur;
+let concurrency;
+let running = true;
 
 function main(conf) {
   dur = conf.dur;
@@ -21,7 +21,8 @@ function main(conf) {
     key: fixtures.readKey('rsa_private.pem'),
     cert: fixtures.readKey('rsa_cert.crt'),
     ca: fixtures.readKey('rsa_ca.crt'),
-    ciphers: 'AES256-GCM-SHA384'
+    ciphers: 'AES256-GCM-SHA384',
+    maxVersion: 'TLSv1.2',
   };
 
   const server = tls.createServer(options, onConnection);
@@ -31,7 +32,7 @@ function main(conf) {
 function onListening() {
   setTimeout(done, dur * 1000);
   bench.start();
-  for (var i = 0; i < concurrency; i++)
+  for (let i = 0; i < concurrency; i++)
     makeConnection();
 }
 
@@ -42,7 +43,7 @@ function onConnection(conn) {
 function makeConnection() {
   const options = {
     port: common.PORT,
-    rejectUnauthorized: false
+    rejectUnauthorized: false,
   };
   const conn = tls.connect(options, () => {
     clientConn++;

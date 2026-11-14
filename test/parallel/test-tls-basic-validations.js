@@ -30,7 +30,7 @@ assert.throws(
   {
     code: 'ERR_INVALID_ARG_TYPE',
     name: 'TypeError',
-    message: 'Pass phrase must be a string'
+    message: /The "options\.passphrase" property must be of type string/
   });
 
 assert.throws(
@@ -38,7 +38,7 @@ assert.throws(
   {
     code: 'ERR_INVALID_ARG_TYPE',
     name: 'TypeError',
-    message: 'Pass phrase must be a string'
+    message: /The "options\.passphrase" property must be of type string/
   });
 
 assert.throws(
@@ -46,7 +46,7 @@ assert.throws(
   {
     code: 'ERR_INVALID_ARG_TYPE',
     name: 'TypeError',
-    message: 'ECDH curve name must be a string'
+    message: /The "options\.ecdhCurve" property must be of type string/
   });
 
 assert.throws(
@@ -64,7 +64,7 @@ assert.throws(
   {
     code: 'ERR_INVALID_ARG_TYPE',
     name: 'TypeError',
-    message: 'Session timeout must be a 32-bit integer'
+    message: /The "options\.sessionTimeout" property must be of type number/
   });
 
 assert.throws(
@@ -72,37 +72,35 @@ assert.throws(
   {
     code: 'ERR_INVALID_ARG_TYPE',
     name: 'TypeError',
-    message: 'Ticket keys must be a buffer'
+    message: /The "options\.ticketKeys" property must be an instance of/
   });
 
-assert.throws(() => tls.createServer({ ticketKeys: Buffer.alloc(0) }),
-              /TypeError: Ticket keys length must be 48 bytes/);
-
-assert.throws(
-  () => tls.createSecurePair({}),
-  {
-    message: 'context must be a SecureContext',
-    code: 'ERR_TLS_INVALID_CONTEXT',
-    name: 'TypeError',
-  }
-);
+assert.throws(() => tls.createServer({ ticketKeys: Buffer.alloc(0) }), {
+  code: 'ERR_INVALID_ARG_VALUE',
+  message: /The property 'options\.ticketKeys' must be exactly 48 bytes/
+});
 
 {
-  const buffer = Buffer.from('abcd');
+  const buffer = Buffer.from([3, 0x61, 0x62, 0x63]);
   const out = {};
   tls.convertALPNProtocols(buffer, out);
-  out.ALPNProtocols.write('efgh');
-  assert(buffer.equals(Buffer.from('abcd')));
-  assert(out.ALPNProtocols.equals(Buffer.from('efgh')));
+  out.ALPNProtocols.write('def', 1);
+  assert(buffer.equals(Buffer.from([3, 0x61, 0x62, 0x63])));
+  assert(out.ALPNProtocols.equals(Buffer.from([3, 0x64, 0x65, 0x66])));
 }
 
 {
-  const arrayBufferViewStr = 'abcd';
-  const inputBuffer = Buffer.from(arrayBufferViewStr.repeat(8), 'utf8');
+  const inputBuffer = Buffer.concat([
+    Buffer.from([31]),
+    Buffer.alloc(31, 0x61),
+  ]);
   for (const expectView of common.getArrayBufferViews(inputBuffer)) {
     const out = {};
+    const expected = Buffer.from(expectView.buffer.slice(),
+                                 expectView.byteOffset,
+                                 expectView.byteLength);
     tls.convertALPNProtocols(expectView, out);
-    assert(out.ALPNProtocols.equals(Buffer.from(expectView)));
+    assert(out.ALPNProtocols.equals(expected));
   }
 }
 
@@ -130,3 +128,12 @@ assert.throws(() => { tls.createSecureContext({ maxVersion: 'fhqwhgads' }); },
                 code: 'ERR_TLS_INVALID_PROTOCOL_VERSION',
                 name: 'TypeError'
               });
+
+for (const checkServerIdentity of [undefined, null, 1, true]) {
+  assert.throws(() => {
+    tls.connect({ checkServerIdentity });
+  }, {
+    code: 'ERR_INVALID_ARG_TYPE',
+    name: 'TypeError',
+  });
+}

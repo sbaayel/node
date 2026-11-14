@@ -1,4 +1,4 @@
-// Flags: --expose_internals
+// Flags: --expose-internals
 
 'use strict';
 
@@ -52,7 +52,8 @@ server.on('stream', common.mustCall(function(stream, headers) {
   assert(inspectedTimersList.includes('      _idleNext: [Timeout]'));
   assert(!inspectedTimersList.includes('       _idleNext: [Timeout]'));
 
-  assert.throws(() => socket.destroy, errMsg);
+  assert.strictEqual(typeof socket.destroy, 'function');
+
   assert.throws(() => socket.emit, errMsg);
   assert.throws(() => socket.end, errMsg);
   assert.throws(() => socket.pause, errMsg);
@@ -63,7 +64,6 @@ server.on('stream', common.mustCall(function(stream, headers) {
   assert.throws(() => socket.setKeepAlive, errMsg);
   assert.throws(() => socket.setNoDelay, errMsg);
 
-  assert.throws(() => (socket.destroy = undefined), errMsg);
   assert.throws(() => (socket.emit = undefined), errMsg);
   assert.throws(() => (socket.end = undefined), errMsg);
   assert.throws(() => (socket.pause = undefined), errMsg);
@@ -85,10 +85,14 @@ server.on('stream', common.mustCall(function(stream, headers) {
 
   stream.respond();
 
-  socket.writable = 0;
-  socket.readable = 0;
-  assert.strictEqual(socket.writable, 0);
-  assert.strictEqual(socket.readable, 0);
+  socket.writable = true;
+  socket.readable = true;
+  assert.strictEqual(socket.writable, true);
+  assert.strictEqual(socket.readable, true);
+  socket.writable = false;
+  socket.readable = false;
+  assert.strictEqual(socket.writable, false);
+  assert.strictEqual(socket.readable, false);
 
   stream.end();
 

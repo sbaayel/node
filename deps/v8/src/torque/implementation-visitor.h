@@ -6,24 +6,25 @@
 #define V8_TORQUE_IMPLEMENTATION_VISITOR_H_
 
 #include <memory>
+#include <optional>
 #include <string>
 
 #include "src/base/macros.h"
 #include "src/torque/ast.h"
 #include "src/torque/cfg.h"
+#include "src/torque/cpp-builder.h"
 #include "src/torque/declarations.h"
 #include "src/torque/global-context.h"
 #include "src/torque/type-oracle.h"
 #include "src/torque/types.h"
 #include "src/torque/utils.h"
 
-namespace v8 {
-namespace internal {
-namespace torque {
+namespace v8::internal::torque {
 
 template <typename T>
 class Binding;
-struct LocalValue;
+class LocalValue;
+class ImplementationVisitor;
 
 // LocationReference is the representation of an l-value, so a value that might
 // allow for assignment. For uniformity, this class can also represent
@@ -35,7 +36,7 @@ class LocationReference {
   // An assignable stack range.
   static LocationReference VariableAccess(
       VisitResult variable,
-      base::Optional<Binding<LocalValue>*> binding = base::nullopt) {
+      std::optional<Binding<LocalValue>*> binding = std::nullopt) {
     DCHECK(variable.IsOnStack());
     LocationReference result;
     result.variable_ = std::move(variable);
@@ -52,19 +53,23 @@ class LocationReference {
   }
   // A heap reference, that is, a tagged value and an offset to encode an inner
   // pointer.
-  static LocationReference HeapReference(VisitResult heap_reference) {
+  static LocationReference HeapReference(
+      VisitResult heap_reference,
+      FieldSynchronization synchronization = FieldSynchronization::kNone) {
     LocationReference result;
-    DCHECK(StructType::MatchUnaryGeneric(heap_reference.type(),
-                                         TypeOracle::GetReferenceGeneric()));
+    DCHECK(TypeOracle::MatchReferenceGeneric(heap_reference.type()));
     result.heap_reference_ = std::move(heap_reference);
+    result.heap_reference_synchronization_ = synchronization;
     return result;
   }
   // A reference to an array on the heap. That is, a tagged value, an offset to
   // encode an inner pointer, and the number of elements.
   static LocationReference HeapSlice(VisitResult heap_slice) {
     LocationReference result;
-    DCHECK(StructType::MatchUnaryGeneric(heap_slice.type(),
-                                         TypeOracle::GetSliceGeneric()));
+    DCHECK(Type::MatchUnaryGeneric(heap_slice.type(),
+                                   TypeOracle::GetConstSliceGeneric()) ||
+           Type::MatchUnaryGeneric(heap_slice.type(),
+                                   TypeOracle::GetMutableSliceGeneric()));
     result.heap_slice_ = std::move(heap_slice);
     return result;
   }
@@ -83,8 +88,25 @@ class LocationReference {
     result.call_arguments_ = {object};
     return result;
   }
+  static LocationReference BitFieldAccess(const LocationReference& object,
+                                          BitField field) {
+    LocationReference result;
+    result.bit_field_struct_ = std::make_shared<LocationReference>(object);
+    result.bit_field_ = std::move(field);
+    return result;
+  }
 
-  bool IsConst() const { return temporary_.has_value(); }
+  bool IsConst() const {
+    if (IsHeapReference()) {
+      bool is_const;
+      bool success =
+          TypeOracle::MatchReferenceGeneric(heap_reference().type(), &is_const)
+              .has_value();
+      CHECK(success);
+      return is_const;
+    }
+    return IsTemporary();
+  }
 
   bool IsVariableAccess() const { return variable_.has_value(); }
   const VisitResult& variable() const {
@@ -101,21 +123,48 @@ class LocationReference {
     DCHECK(IsHeapReference());
     return *heap_reference_;
   }
+  FieldSynchronization heap_reference_synchronization() const {
+    DCHECK(IsHeapReference());
+    return heap_reference_synchronization_;
+  }
   bool IsHeapSlice() const { return heap_slice_.has_value(); }
   const VisitResult& heap_slice() const {
     DCHECK(IsHeapSlice());
     return *heap_slice_;
   }
+  bool IsBitFieldAccess() const {
+    bool is_bitfield_access = bit_field_struct_ != nullptr;
+    DCHECK_EQ(is_bitfield_access, bit_field_.has_value());
+    return is_bitfield_access;
+  }
+  const LocationReference& bit_field_struct_location() const {
+    DCHECK(IsBitFieldAccess());
+    return *bit_field_struct_;
+  }
+  const BitField& bit_field() const {
+    DCHECK(IsBitFieldAccess());
+    return *bit_field_;
+  }
 
-  const Type* ReferencedType() const {
+  std::optional<const Type*> ReferencedType() const {
     if (IsHeapReference()) {
-      return *StructType::MatchUnaryGeneric(heap_reference().type(),
-                                            TypeOracle::GetReferenceGeneric());
-    } else if (IsHeapSlice()) {
-      return *StructType::MatchUnaryGeneric(heap_slice().type(),
-                                            TypeOracle::GetSliceGeneric());
+      return *TypeOracle::MatchReferenceGeneric(heap_reference().type());
     }
-    return GetVisitResult().type();
+    if (IsHeapSlice()) {
+      if (auto type = Type::MatchUnaryGeneric(
+              heap_slice().type(), TypeOracle::GetMutableSliceGeneric())) {
+        return *type;
+      }
+      return Type::MatchUnaryGeneric(heap_slice().type(),
+                                     TypeOracle::GetConstSliceGeneric());
+    }
+    if (IsBitFieldAccess()) {
+      return bit_field_->name_and_type.type;
+    }
+    if (IsVariableAccess() || IsHeapSlice() || IsTemporary()) {
+      return GetVisitResult().type();
+    }
+    return std::nullopt;
   }
 
   const VisitResult& GetVisitResult() const {
@@ -148,21 +197,30 @@ class LocationReference {
     DCHECK(IsCallAccess());
     return *assign_function_;
   }
-  base::Optional<Binding<LocalValue>*> binding() const {
+  std::optional<Binding<LocalValue>*> binding() const {
     DCHECK(IsVariableAccess());
     return binding_;
   }
 
  private:
-  base::Optional<VisitResult> variable_;
-  base::Optional<VisitResult> temporary_;
-  base::Optional<std::string> temporary_description_;
-  base::Optional<VisitResult> heap_reference_;
-  base::Optional<VisitResult> heap_slice_;
-  base::Optional<std::string> eval_function_;
-  base::Optional<std::string> assign_function_;
+  std::optional<VisitResult> variable_;
+  std::optional<VisitResult> temporary_;
+  std::optional<std::string> temporary_description_;
+  std::optional<VisitResult> heap_reference_;
+  FieldSynchronization heap_reference_synchronization_ =
+      FieldSynchronization::kNone;
+  std::optional<VisitResult> heap_slice_;
+  std::optional<std::string> eval_function_;
+  std::optional<std::string> assign_function_;
   VisitResultVector call_arguments_;
-  base::Optional<Binding<LocalValue>*> binding_;
+  std::optional<Binding<LocalValue>*> binding_;
+
+  // The location of the bitfield struct that contains this bitfield, if this
+  // reference is a bitfield access. Uses a shared_ptr so that LocationReference
+  // is copyable, allowing us to set this field equal to a copy of a
+  // stack-allocated LocationReference.
+  std::shared_ptr<const LocationReference> bit_field_struct_;
+  std::optional<BitField> bit_field_;
 
   LocationReference() = default;
 };
@@ -172,14 +230,22 @@ struct InitializerResults {
   std::map<std::string, VisitResult> field_value_map;
 };
 
+struct LayoutForInitialization {
+  std::map<std::string, VisitResult> array_lengths;
+  std::map<std::string, VisitResult> offsets;
+  VisitResult size;
+};
+
+extern uint64_t next_unique_binding_index;
+
 template <class T>
 class Binding;
 
 template <class T>
 class BindingsManager {
  public:
-  base::Optional<Binding<T>*> TryLookup(const std::string& name) {
-    if (name.length() >= 2 && name[0] == '_' && name[1] != '_') {
+  std::optional<Binding<T>*> TryLookup(const std::string& name) {
+    if (StartsWithSingleUnderscore(name)) {
       Error("Trying to reference '", name, "' which is marked as unused.")
           .Throw();
     }
@@ -192,8 +258,7 @@ class BindingsManager {
 
  private:
   friend class Binding<T>;
-  std::unordered_map<std::string, base::Optional<Binding<T>*>>
-      current_bindings_;
+  std::unordered_map<std::string, std::optional<Binding<T>*>> current_bindings_;
 };
 
 template <class T>
@@ -206,7 +271,8 @@ class Binding : public T {
         name_(name),
         previous_binding_(this),
         used_(false),
-        written_(false) {
+        written_(false),
+        unique_index_(next_unique_binding_index++) {
     std::swap(previous_binding_, manager_->current_bindings_[name]);
   }
   template <class... Args>
@@ -229,6 +295,8 @@ class Binding : public T {
 
     manager_->current_bindings_[name_] = previous_binding_;
   }
+  Binding(const Binding&) = delete;
+  Binding& operator=(const Binding&) = delete;
 
   std::string BindingTypeString() const;
   bool CheckWritten() const;
@@ -242,36 +310,42 @@ class Binding : public T {
   bool Written() const { return written_; }
   void SetWritten() { written_ = true; }
 
+  uint64_t unique_index() const { return unique_index_; }
+
  private:
   bool SkipLintCheck() const { return name_.length() > 0 && name_[0] == '_'; }
 
   BindingsManager<T>* manager_;
   const std::string name_;
-  base::Optional<Binding*> previous_binding_;
+  std::optional<Binding*> previous_binding_;
   SourcePosition declaration_position_ = CurrentSourcePosition::Get();
   bool used_;
   bool written_;
-  DISALLOW_COPY_AND_ASSIGN(Binding);
+  uint64_t unique_index_;
 };
 
 template <class T>
 class BlockBindings {
  public:
   explicit BlockBindings(BindingsManager<T>* manager) : manager_(manager) {}
-  void Add(std::string name, T value, bool mark_as_used = false) {
+  Binding<T>* Add(std::string name, T value, bool mark_as_used = false) {
     ReportErrorIfAlreadyBound(name);
     auto binding =
         std::make_unique<Binding<T>>(manager_, name, std::move(value));
+    Binding<T>* result = binding.get();
     if (mark_as_used) binding->SetUsed();
     bindings_.push_back(std::move(binding));
+    return result;
   }
 
-  void Add(const Identifier* name, T value, bool mark_as_used = false) {
+  Binding<T>* Add(const Identifier* name, T value, bool mark_as_used = false) {
     ReportErrorIfAlreadyBound(name->value);
     auto binding =
         std::make_unique<Binding<T>>(manager_, name, std::move(value));
+    Binding<T>* result = binding.get();
     if (mark_as_used) binding->SetUsed();
     bindings_.push_back(std::move(binding));
+    return result;
   }
 
   std::vector<Binding<T>*> bindings() const {
@@ -299,9 +373,37 @@ class BlockBindings {
   std::vector<std::unique_ptr<Binding<T>>> bindings_;
 };
 
-struct LocalValue {
-  bool is_const;
-  VisitResult value;
+class LocalValue {
+ public:
+  explicit LocalValue(LocationReference reference)
+      : value(std::move(reference)) {}
+  explicit LocalValue(std::string inaccessible_explanation)
+      : inaccessible_explanation(std::move(inaccessible_explanation)) {}
+  explicit LocalValue(std::function<LocationReference()> lazy)
+      : lazy(std::move(lazy)) {}
+
+  LocationReference GetLocationReference(Binding<LocalValue>* binding) {
+    if (value) {
+      const LocationReference& ref = *value;
+      if (ref.IsVariableAccess()) {
+        // Attach the binding to enable the never-assigned-to lint check.
+        return LocationReference::VariableAccess(ref.GetVisitResult(), binding);
+      }
+      return ref;
+    } else if (lazy) {
+      return (*lazy)();
+    } else {
+      Error("Cannot access ", binding->name(), ": ", inaccessible_explanation)
+          .Throw();
+    }
+  }
+
+  bool IsAccessibleNonLazy() const { return value.has_value(); }
+
+ private:
+  std::optional<LocationReference> value;
+  std::optional<std::function<LocationReference()>> lazy;
+  std::string inaccessible_explanation;
 };
 
 struct LocalLabel {
@@ -321,7 +423,10 @@ template <>
 inline bool Binding<LocalValue>::CheckWritten() const {
   // Do the check only for non-const variables and non struct types.
   auto binding = *manager_->current_bindings_[name_];
-  return !binding->is_const && !binding->value.type()->IsStructType();
+  if (!binding->IsAccessibleNonLazy()) return false;
+  const LocationReference& ref = binding->GetLocationReference(binding);
+  if (!ref.IsVariableAccess()) return false;
+  return !ref.GetVisitResult().type()->StructSupertype();
 }
 template <>
 inline std::string Binding<LocalLabel>::BindingTypeString() const {
@@ -345,60 +450,94 @@ class ImplementationVisitor {
  public:
   void GenerateBuiltinDefinitionsAndInterfaceDescriptors(
       const std::string& output_directory);
-  void GenerateClassFieldOffsets(const std::string& output_directory);
-  void GeneratePrintDefinitions(const std::string& output_directory);
+  void GenerateBitFields(const std::string& output_directory);
   void GenerateClassDefinitions(const std::string& output_directory);
   void GenerateInstanceTypes(const std::string& output_directory);
-  void GenerateClassVerifiers(const std::string& output_directory);
+  void GenerateEnumVerifiers(const std::string& output_directory);
   void GenerateClassDebugReaders(const std::string& output_directory);
   void GenerateExportedMacrosAssembler(const std::string& output_directory);
   void GenerateCSATypes(const std::string& output_directory);
-  void GenerateCppForInternalClasses(const std::string& output_directory);
 
   VisitResult Visit(Expression* expr);
   const Type* Visit(Statement* stmt);
 
+  template <typename T>
   void CheckInitializersWellformed(
-      const std::string& aggregate_name,
-      const std::vector<Field>& aggregate_fields,
+      const std::string& aggregate_name, const std::vector<T>& aggregate_fields,
       const std::vector<NameAndExpression>& initializers,
-      bool ignore_first_field = false);
+      bool ignore_first_field = false) {
+    size_t fields_offset = ignore_first_field ? 1 : 0;
+    size_t fields_size = aggregate_fields.size() - fields_offset;
+    for (size_t i = 0; i < std::min(fields_size, initializers.size()); i++) {
+      const std::string& field_name =
+          aggregate_fields[i + fields_offset].name_and_type.name;
+      Identifier* found_name = initializers[i].name;
+      if (field_name != found_name->value) {
+        Error("Expected field name \"", field_name, "\" instead of \"",
+              found_name->value, "\"")
+            .Position(found_name->pos)
+            .Throw();
+      }
+    }
+    if (fields_size != initializers.size()) {
+      ReportError("expected ", fields_size, " initializers for ",
+                  aggregate_name, " found ", initializers.size());
+    }
+  }
 
   InitializerResults VisitInitializerResults(
       const ClassType* class_type,
       const std::vector<NameAndExpression>& expressions);
-
-  void InitializeFieldFromSpread(VisitResult object, const Field& field,
-                                 const InitializerResults& initializer_results);
-
-  VisitResult AddVariableObjectSize(
-      VisitResult object_size, const ClassType* current_class,
+  LocationReference GenerateFieldReference(
+      VisitResult object, const Field& field, const ClassType* class_type,
+      bool treat_optional_as_indexed = false);
+  LocationReference GenerateFieldReferenceForInit(
+      VisitResult object, const Field& field,
+      const LayoutForInitialization& layout);
+  VisitResult GenerateArrayLength(
+      Expression* array_length, Namespace* nspace,
+      const std::map<std::string, LocalValue>& bindings);
+  VisitResult GenerateArrayLength(VisitResult object, const Field& field);
+  VisitResult GenerateArrayLength(const ClassType* class_type,
+                                  const InitializerResults& initializer_results,
+                                  const Field& field);
+  LayoutForInitialization GenerateLayoutForInitialization(
+      const ClassType* class_type,
       const InitializerResults& initializer_results);
 
   void InitializeClass(const ClassType* class_type, VisitResult allocate_result,
-                       const InitializerResults& initializer_results);
+                       const InitializerResults& initializer_results,
+                       const LayoutForInitialization& layout);
 
   VisitResult Visit(StructExpression* decl);
 
   LocationReference GetLocationReference(Expression* location);
+  LocationReference LookupLocalValue(const std::string& name);
   LocationReference GetLocationReference(IdentifierExpression* expr);
   LocationReference GetLocationReference(DereferenceExpression* expr);
   LocationReference GetLocationReference(FieldAccessExpression* expr);
+  LocationReference GenerateFieldAccess(
+      LocationReference reference, const std::string& fieldname,
+      bool ignore_stuct_field_constness = false,
+      std::optional<SourcePosition> pos = {});
   LocationReference GetLocationReference(ElementAccessExpression* expr);
+  LocationReference GenerateReferenceToItemInHeapSlice(LocationReference slice,
+                                                       VisitResult index);
 
   VisitResult GenerateFetchFromLocation(const LocationReference& reference);
 
   VisitResult GetBuiltinCode(Builtin* builtin);
 
   VisitResult Visit(LocationExpression* expr);
+  VisitResult Visit(FieldAccessExpression* expr);
 
   void VisitAllDeclarables();
-  void Visit(Declarable* delarable);
+  void Visit(Declarable* delarable, std::optional<SourceId> file = {});
   void Visit(TypeAlias* decl);
   VisitResult InlineMacro(Macro* macro,
-                          base::Optional<LocationReference> this_reference,
+                          std::optional<LocationReference> this_reference,
                           const std::vector<VisitResult>& arguments,
-                          const std::vector<Block*> label_blocks);
+                          const std::vector<Block*>& label_blocks);
   void VisitMacroCommon(Macro* macro);
   void Visit(ExternMacro* macro) {}
   void Visit(TorqueMacro* macro);
@@ -419,7 +558,8 @@ class ImplementationVisitor {
   VisitResult Visit(IncrementDecrementExpression* expr);
   VisitResult Visit(AssignmentExpression* expr);
   VisitResult Visit(StringLiteralExpression* expr);
-  VisitResult Visit(NumberLiteralExpression* expr);
+  VisitResult Visit(FloatingPointLiteralExpression* expr);
+  VisitResult Visit(IntegerLiteralExpression* expr);
   VisitResult Visit(AssumeTypeImpossibleExpression* expr);
   VisitResult Visit(TryLabelExpression* expr);
   VisitResult Visit(StatementExpression* expr);
@@ -440,9 +580,15 @@ class ImplementationVisitor {
   const Type* Visit(ExpressionStatement* stmt);
   const Type* Visit(DebugStatement* stmt);
   const Type* Visit(AssertStatement* stmt);
+  const Type* Visit(TypeswitchStatement* stmt) {
+    // This should have been desugared before.
+    UNREACHABLE();
+  }
 
-  void BeginCSAFiles();
-  void EndCSAFiles();
+  void BeginGeneratedFiles();
+  void EndGeneratedFiles();
+  void BeginDebugMacrosFile();
+  void EndDebugMacrosFile();
 
   void GenerateImplementation(const std::string& dir);
 
@@ -453,7 +599,7 @@ class ImplementationVisitor {
   DECLARE_CONTEXTUAL_VARIABLE(CurrentCallable, Callable*);
   DECLARE_CONTEXTUAL_VARIABLE(CurrentFileStreams,
                               GlobalContext::PerFileStreams*);
-  DECLARE_CONTEXTUAL_VARIABLE(CurrentReturnValue, base::Optional<VisitResult>);
+  DECLARE_CONTEXTUAL_VARIABLE(CurrentReturnValue, std::optional<VisitResult>);
 
   // A BindingsManagersScope has to be active for local bindings to be created.
   // Shadowing an existing BindingsManagersScope by creating a new one hides all
@@ -466,8 +612,8 @@ class ImplementationVisitor {
   void SetDryRun(bool is_dry_run) { is_dry_run_ = is_dry_run; }
 
  private:
-  base::Optional<Block*> GetCatchBlock();
-  void GenerateCatchBlock(base::Optional<Block*> catch_block);
+  std::optional<Block*> GetCatchBlock();
+  void GenerateCatchBlock(std::optional<Block*> catch_block);
 
   // {StackScope} records the stack height at creation time and reconstructs it
   // when being destructed by emitting a {DeleteRangeInstruction}, except for
@@ -483,7 +629,7 @@ class ImplementationVisitor {
   //   // ... create temporary slots ...
   //   result = stack_scope.Yield(surviving_slots);
   // }
-  class StackScope {
+  class V8_NODISCARD StackScope {
    public:
     explicit StackScope(ImplementationVisitor* visitor) : visitor_(visitor) {
       base_ = visitor_->assembler().CurrentStack().AboveTop();
@@ -545,9 +691,9 @@ class ImplementationVisitor {
     Binding<LocalLabel> continue_binding_;
   };
 
-  base::Optional<Binding<LocalValue>*> TryLookupLocalValue(
+  std::optional<Binding<LocalValue>*> TryLookupLocalValue(
       const std::string& name);
-  base::Optional<Binding<LocalLabel>*> TryLookupLabel(const std::string& name);
+  std::optional<Binding<LocalLabel>*> TryLookupLabel(const std::string& name);
   Binding<LocalLabel>* LookupLabel(const std::string& name);
   Block* LookupSimpleLabel(const std::string& name);
   template <class Container>
@@ -571,6 +717,10 @@ class ImplementationVisitor {
                        const Arguments& arguments,
                        const TypeVector& specialization_types);
 
+  TypeArgumentInference InferSpecializationTypes(
+      GenericCallable* generic, const TypeVector& explicit_specialization_types,
+      const TypeVector& explicit_arguments);
+
   const Type* GetCommonType(const Type* left, const Type* right);
 
   VisitResult GenerateCopy(const VisitResult& to_copy);
@@ -582,10 +732,11 @@ class ImplementationVisitor {
                         const Type* parameter_type,
                         std::vector<VisitResult>* converted_arguments,
                         StackRange* argument_range,
-                        std::vector<std::string>* constexpr_arguments);
+                        std::vector<std::string>* constexpr_arguments,
+                        bool inline_macro);
 
   VisitResult GenerateCall(Callable* callable,
-                           base::Optional<LocationReference> this_parameter,
+                           std::optional<LocationReference> this_parameter,
                            Arguments parameters,
                            const TypeVector& specialization_types = {},
                            bool tail_call = false);
@@ -610,19 +761,24 @@ class ImplementationVisitor {
   void GenerateExpressionBranch(Expression* expression, Block* true_block,
                                 Block* false_block);
 
-  void GenerateMacroFunctionDeclaration(std::ostream& o,
-                                        const std::string& macro_prefix,
-                                        Macro* macro);
-  std::vector<std::string> GenerateFunctionDeclaration(
-      std::ostream& o, const std::string& macro_prefix, const std::string& name,
-      const Signature& signature, const NameVector& parameter_names,
-      bool pass_code_assembler_state = true);
+  cpp::Function GenerateMacroFunctionDeclaration(Macro* macro);
+
+  cpp::Function GenerateFunction(
+      cpp::Class* owner, const std::string& name, const Signature& signature,
+      const NameVector& parameter_names, bool pass_code_assembler_state = true,
+      std::vector<std::string>* generated_parameter_names = nullptr);
 
   VisitResult GenerateImplicitConvert(const Type* destination_type,
                                       VisitResult source);
 
   StackRange GenerateLabelGoto(LocalLabel* label,
-                               base::Optional<StackRange> arguments = {});
+                               std::optional<StackRange> arguments = {});
+
+  VisitResult GenerateSetBitField(const Type* bitfield_struct_type,
+                                  const BitField& bitfield,
+                                  VisitResult bitfield_struct,
+                                  VisitResult value,
+                                  bool starts_as_zero = false);
 
   std::vector<Binding<LocalLabel>*> LabelsFromIdentifiers(
       const std::vector<Identifier*>& names);
@@ -638,22 +794,37 @@ class ImplementationVisitor {
                                          size_t i);
   std::string ExternalParameterName(const std::string& name);
 
-  std::ostream& source_out() {
+  std::ostream& csa_ccfile() {
     if (auto* streams = CurrentFileStreams::Get()) {
-      return streams->csa_ccfile;
+      switch (output_type_) {
+        case OutputType::kCSA:
+          return streams->csa_ccfile;
+        case OutputType::kCCDebug:
+          return debug_macros_cc_;
+        default:
+          UNREACHABLE();
+      }
     }
     return null_stream_;
   }
-  std::ostream& header_out() {
+  std::ostream& csa_headerfile() {
     if (auto* streams = CurrentFileStreams::Get()) {
-      return streams->csa_headerfile;
+      switch (output_type_) {
+        case OutputType::kCSA:
+          return streams->csa_headerfile;
+        case OutputType::kCCDebug:
+          return debug_macros_h_;
+        default:
+          UNREACHABLE();
+      }
     }
     return null_stream_;
   }
+
   CfgAssembler& assembler() { return *assembler_; }
 
   void SetReturnValue(VisitResult return_value) {
-    base::Optional<VisitResult>& current_return_value =
+    std::optional<VisitResult>& current_return_value =
         CurrentReturnValue::Get();
     DCHECK_IMPLIES(current_return_value, *current_return_value == return_value);
     current_return_value = std::move(return_value);
@@ -661,7 +832,7 @@ class ImplementationVisitor {
 
   VisitResult GetAndClearReturnValue() {
     VisitResult return_value = *CurrentReturnValue::Get();
-    CurrentReturnValue::Get() = base::nullopt;
+    CurrentReturnValue::Get() = std::nullopt;
     return return_value;
   }
 
@@ -670,15 +841,49 @@ class ImplementationVisitor {
     ReplaceFileContentsIfDifferent(file, content);
   }
 
-  base::Optional<CfgAssembler> assembler_;
+  const Identifier* TryGetSourceForBitfieldExpression(
+      const Expression* expr) const {
+    auto it = bitfield_expressions_.find(expr);
+    if (it == bitfield_expressions_.end()) return nullptr;
+    return it->second;
+  }
+
+  void PropagateBitfieldMark(const Expression* original,
+                             const Expression* derived) {
+    if (const Identifier* source =
+            TryGetSourceForBitfieldExpression(original)) {
+      bitfield_expressions_[derived] = source;
+    }
+  }
+
+  class MacroInliningScope;
+
+  std::optional<CfgAssembler> assembler_;
   NullOStream null_stream_;
   bool is_dry_run_;
+
+  // Just for allowing us to emit warnings. After visiting an Expression, if
+  // that Expression is a bitfield load, plus an optional inversion or an
+  // equality check with a constant, then that Expression will be present in
+  // this map. The Identifier associated is the bitfield struct that contains
+  // the value to load.
+  std::unordered_map<const Expression*, const Identifier*>
+      bitfield_expressions_;
+
+  // For emitting warnings. Contains the current set of macros being inlined in
+  // calls to InlineMacro.
+  std::unordered_set<const Macro*> inlining_macros_;
+
+  // The contents of the debug macros output files. These contain all Torque
+  // macros that have been generated using the C++ backend with debug purpose.
+  std::stringstream debug_macros_cc_;
+  std::stringstream debug_macros_h_;
+
+  OutputType output_type_ = OutputType::kCSA;
 };
 
 void ReportAllUnusedMacros();
 
-}  // namespace torque
-}  // namespace internal
-}  // namespace v8
+}  // namespace v8::internal::torque
 
 #endif  // V8_TORQUE_IMPLEMENTATION_VISITOR_H_

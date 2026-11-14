@@ -22,8 +22,9 @@
 'use strict';
 const common = require('../common');
 const http = require('http');
+const assert = require('assert');
 
-const server = http.Server(function(req, res) {
+const server = new http.Server(function(req, res) {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
   res.end('Hello World\n');
   server.close();
@@ -43,6 +44,12 @@ server.listen(0, common.mustCall(function() {
       });
     }));
 
-    res.on('end', common.mustCall());
+    res.on('end', common.mustCall(() => {
+      assert.strictEqual(res.destroyed, false);
+    }));
+    assert.strictEqual(res.destroyed, false);
+    res.on('close', common.mustCall(() => {
+      assert.strictEqual(res.destroyed, true);
+    }));
   }));
 }));

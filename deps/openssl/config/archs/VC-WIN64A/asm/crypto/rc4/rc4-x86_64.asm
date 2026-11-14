@@ -19,13 +19,15 @@ $L$SEH_begin_RC4:
 	mov	rdx,r8
 	mov	rcx,r9
 
+
+
+DB	243,15,30,250
 	or	rsi,rsi
 	jne	NEAR $L$entry
 	mov	rdi,QWORD[8+rsp]	;WIN64 epilogue
 	mov	rsi,QWORD[16+rsp]
 	DB	0F3h,0C3h		;repret
 $L$entry:
-
 	push	rbx
 
 	push	r12
@@ -558,6 +560,8 @@ $L$SEH_begin_RC4_set_key:
 	mov	rdx,r8
 
 
+
+DB	243,15,30,250
 	lea	rdi,[8+rdi]
 	lea	rdx,[rsi*1+rdx]
 	neg	rsi
@@ -626,12 +630,15 @@ $L$exit_key:
 	mov	rdi,QWORD[8+rsp]	;WIN64 epilogue
 	mov	rsi,QWORD[16+rsp]
 	DB	0F3h,0C3h		;repret
+
 $L$SEH_end_RC4_set_key:
 
 global	RC4_options
 
 ALIGN	16
 RC4_options:
+
+DB	243,15,30,250
 	lea	rax,[$L$opts]
 	mov	edx,DWORD[OPENSSL_ia32cap_P]
 	bt	edx,20
@@ -644,15 +651,16 @@ $L$8xchar:
 	add	rax,12
 $L$done:
 	DB	0F3h,0C3h		;repret
+
 ALIGN	64
 $L$opts:
 DB	114,99,52,40,56,120,44,105,110,116,41,0
 DB	114,99,52,40,56,120,44,99,104,97,114,41,0
 DB	114,99,52,40,49,54,120,44,105,110,116,41,0
 DB	82,67,52,32,102,111,114,32,120,56,54,95,54,52,44,32
-DB	67,82,89,80,84,79,71,65,77,83,32,98,121,32,60,97
-DB	112,112,114,111,64,111,112,101,110,115,115,108,46,111,114,103
-DB	62,0
+DB	67,82,89,80,84,79,71,65,77,83,32,98,121,32,60,104
+DB	116,116,112,115,58,47,47,103,105,116,104,117,98,46,99,111
+DB	109,47,100,111,116,45,97,115,109,62,0
 ALIGN	64
 
 EXTERN	__imp_RtlVirtualUnwind

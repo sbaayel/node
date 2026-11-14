@@ -6,11 +6,11 @@ const lookup = require('dns').lookup;
 const bench = common.createBenchmark(main, {
   name: ['127.0.0.1', '::1'],
   all: ['true', 'false'],
-  n: [5e6]
+  n: [5e6],
 });
 
 function main({ name, n, all }) {
-  var i = 0;
+  let i = 0;
 
   if (all === 'true') {
     const opts = { all: true };

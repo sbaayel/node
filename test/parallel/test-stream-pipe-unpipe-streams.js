@@ -45,13 +45,12 @@ assert.strictEqual(source._readableState.pipes.length, 0);
   const checkSrcCleanup = common.mustCall(() => {
     assert.strictEqual(source._readableState.pipes.length, 0);
     assert.strictEqual(source._readableState.flowing, false);
-
-    srcCheckEventNames.forEach((eventName) => {
+    for (const eventName of srcCheckEventNames) {
       assert.strictEqual(
         source.listenerCount(eventName), 0,
         `source's '${eventName}' event listeners not removed`
       );
-    });
+    }
   });
 
   function checkDestCleanup(dest) {
@@ -65,13 +64,13 @@ assert.strictEqual(source._readableState.pipes.length, 0);
         'listener which is `unpipeChecker`'
       );
       dest.removeListener('unpipe', unpipeChecker);
-      destCheckEventNames.forEach((eventName) => {
+      for (const eventName of destCheckEventNames) {
         assert.strictEqual(
           dest.listenerCount(eventName), 0,
           `destination{${currentDestId}}'s '${eventName}' event ` +
           'listeners not removed'
         );
-      });
+      }
 
       if (--destCount === 0)
         checkSrcCleanup();
@@ -83,4 +82,14 @@ assert.strictEqual(source._readableState.pipes.length, 0);
   checkDestCleanup(dest1);
   checkDestCleanup(dest2);
   source.unpipe();
+}
+
+{
+  const src = Readable({ read: () => {} });
+  const dst = Writable({ write: () => {} });
+  src.pipe(dst);
+  src.on('resume', common.mustCall(() => {
+    src.on('pause', common.mustCall());
+    src.unpipe(dst);
+  }));
 }

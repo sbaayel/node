@@ -33,7 +33,7 @@ static int uv__random(void* buf, size_t buflen) {
 
 #if defined(__PASE__)
   rc = uv__random_readpath("/dev/urandom", buf, buflen);
-#elif defined(_AIX)
+#elif defined(_AIX) || defined(__QNX__)
   rc = uv__random_readpath("/dev/random", buf, buflen);
 #elif defined(__APPLE__) || defined(__OpenBSD__) || \
      (defined(__ANDROID_API__) && __ANDROID_API__ >= 28)
@@ -61,7 +61,7 @@ static int uv__random(void* buf, size_t buflen) {
 # endif
 #elif defined(_WIN32)
   uv__once_init();
-  rc = uv__random_rtlgenrandom(buf, buflen);
+  rc = uv__random_winrandom(buf, buflen);
 #else
   rc = uv__random_devurandom(buf, buflen);
 #endif
@@ -82,7 +82,7 @@ static void uv__random_done(struct uv__work* w, int status) {
   uv_random_t* req;
 
   req = container_of(w, uv_random_t, work_req);
-  uv__req_unregister(req->loop, req);
+  uv__req_unregister(req->loop);
 
   if (status == 0)
     status = req->status;

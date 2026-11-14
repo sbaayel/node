@@ -5,8 +5,8 @@
 #ifndef V8_OBJECTS_PROPERTY_CELL_H_
 #define V8_OBJECTS_PROPERTY_CELL_H_
 
+#include "src/objects/dependent-code.h"
 #include "src/objects/heap-object.h"
-#include "torque-generated/field-offsets-tq.h"
 
 // Has to be the last include (doesn't have include guards):
 #include "src/objects/object-macros.h"
@@ -14,55 +14,101 @@
 namespace v8 {
 namespace internal {
 
-class PropertyCell : public HeapObject {
+class FixedArray;
+class WeakFixedArray;
+
+V8_OBJECT class PropertyCell : public HeapObject {
  public:
   // [name]: the name of the global property.
-  DECL_ACCESSORS(name, Name)
+  inline Tagged<Name> name() const;
+  inline void set_name(Tagged<Name> value,
+                       WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
+
   // [property_details]: details of the global property.
-  DECL_ACCESSORS(property_details_raw, Smi)
-  // [value]: value of the global property.
-  DECL_ACCESSORS(value, Object)
-  // [dependent_code]: dependent code that depends on the type of the global
-  // property.
-  DECL_ACCESSORS(dependent_code, DependentCode)
+  inline Tagged<Smi> property_details_raw() const;
+  inline Tagged<Smi> property_details_raw(AcquireLoadTag tag) const;
+  inline void set_property_details_raw(
+      Tagged<Smi> value, WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
+  inline void set_property_details_raw(
+      Tagged<Smi> value, ReleaseStoreTag,
+      WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
 
   inline PropertyDetails property_details() const;
-  inline void set_property_details(PropertyDetails details);
+  inline PropertyDetails property_details(AcquireLoadTag tag) const;
+  inline void UpdatePropertyDetailsExceptCellType(PropertyDetails details);
 
-  PropertyCellConstantType GetConstantType();
+  // [value]: value of the global property.
+  inline Tagged<Object> value() const;
+  inline Tagged<Object> value(AcquireLoadTag) const;
+  inline void set_value(Tagged<Object> value,
+                        WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
+  inline void set_value(Tagged<Object> value, ReleaseStoreTag,
+                        WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
+
+  // [dependent_code]: code that depends on the type of the global property.
+  inline Tagged<DependentCode> dependent_code() const;
+  inline void set_dependent_code(Tagged<DependentCode> value,
+                                 WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
+
+  // Changes the value and/or property details.
+  // For global properties:
+  inline void Transition(PropertyDetails new_details,
+                         DirectHandle<Object> new_value);
+  // For protectors:
+  void InvalidateProtector(Isolate* isolate);
+
+  static PropertyCellType InitialType(Isolate* isolate, Tagged<Object> value);
 
   // Computes the new type of the cell's contents for the given value, but
   // without actually modifying the details.
   static PropertyCellType UpdatedType(Isolate* isolate,
-                                      Handle<PropertyCell> cell,
-                                      Handle<Object> value,
+                                      Tagged<PropertyCell> cell,
+                                      Tagged<Object> value,
                                       PropertyDetails details);
-  // Prepares property cell at given entry for receiving given value.
-  // As a result the old cell could be invalidated and/or dependent code could
-  // be deoptimized. Returns the prepared property cell.
-  static Handle<PropertyCell> PrepareForValue(
-      Isolate* isolate, Handle<GlobalDictionary> dictionary, int entry,
-      Handle<Object> value, PropertyDetails details);
 
-  static Handle<PropertyCell> InvalidateEntry(
-      Isolate* isolate, Handle<GlobalDictionary> dictionary, int entry);
+  // Prepares property cell at given entry for receiving given value and sets
+  // that value.  As a result the old cell could be invalidated and/or dependent
+  // code could be deoptimized. Returns the (possibly new) property cell.
+  static Handle<PropertyCell> PrepareForAndSetValue(
+      Isolate* isolate, DirectHandle<GlobalDictionary> dictionary,
+      InternalIndex entry, DirectHandle<Object> value, PropertyDetails details);
 
-  static void SetValueWithInvalidation(Isolate* isolate, const char* cell_name,
-                                       Handle<PropertyCell> cell,
-                                       Handle<Object> new_value);
+  void ClearAndInvalidate(Isolate* isolate);
+  static Handle<PropertyCell> InvalidateAndReplaceEntry(
+      Isolate* isolate, DirectHandle<GlobalDictionary> dictionary,
+      InternalIndex entry, PropertyDetails new_details,
+      DirectHandle<Object> new_value);
 
-  DECL_CAST(PropertyCell)
+  // Whether or not the {details} and {value} fit together. This is an
+  // approximation with false positives.
+  static bool CheckDataIsCompatible(PropertyDetails details,
+                                    Tagged<Object> value);
 
-  // Dispatched behavior.
   DECL_PRINTER(PropertyCell)
   DECL_VERIFIER(PropertyCell)
 
-  DEFINE_FIELD_OFFSET_CONSTANTS(HeapObject::kHeaderSize,
-                                TORQUE_GENERATED_PROPERTY_CELL_FIELDS)
+ private:
+  friend class Factory;
 
-  using BodyDescriptor = FixedBodyDescriptor<kNameOffset, kSize, kSize>;
+#ifdef DEBUG
+  // Whether the property cell can transition to the given state. This is an
+  // approximation with false positives.
+  bool CanTransitionTo(PropertyDetails new_details,
+                       Tagged<Object> new_value) const;
+#endif  // DEBUG
 
-  OBJECT_CONSTRUCTORS(PropertyCell, HeapObject);
+ public:
+  TaggedMember<Name> name_;
+  TaggedMember<Smi> property_details_raw_;
+  TaggedMember<Object> value_;
+  TaggedMember<DependentCode> dependent_code_;
+} V8_OBJECT_END;
+
+template <>
+struct ObjectTraits<PropertyCell> {
+  using BodyDescriptor =
+      FixedBodyDescriptor<offsetof(PropertyCell, name_), sizeof(PropertyCell),
+                          sizeof(PropertyCell)>;
 };
 
 }  // namespace internal

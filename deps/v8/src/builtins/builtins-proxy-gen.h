@@ -10,7 +10,6 @@
 
 namespace v8 {
 namespace internal {
-using compiler::Node;
 
 class ProxiesCodeStubAssembler : public CodeStubAssembler {
  public:
@@ -18,7 +17,7 @@ class ProxiesCodeStubAssembler : public CodeStubAssembler {
       : CodeStubAssembler(state) {}
 
   TNode<JSProxy> AllocateProxy(TNode<Context> context, TNode<JSReceiver> target,
-                               TNode<JSReceiver> handler);
+                               TNode<JSReceiver> handler, TNode<Int32T> flags);
   TNode<JSFunction> AllocateProxyRevokeFunction(TNode<Context> context,
                                                 TNode<JSProxy> proxy);
 
@@ -33,18 +32,14 @@ class ProxiesCodeStubAssembler : public CodeStubAssembler {
   void CheckDeleteTrapResult(TNode<Context> context, TNode<JSReceiver> target,
                              TNode<JSProxy> proxy, TNode<Name> name);
 
- protected:
   enum ProxyRevokeFunctionContextSlot {
     kProxySlot = Context::MIN_CONTEXT_SLOTS,
     kProxyContextLength,
   };
 
-  Node* AllocateJSArrayForCodeStubArguments(Node* context,
-                                            const CodeStubArguments& args,
-                                            Node* argc, ParameterMode mode);
-
  private:
-  Node* CreateProxyRevokeFunctionContext(Node* proxy, Node* native_context);
+  TNode<Context> CreateProxyRevokeFunctionContext(
+      TNode<JSProxy> proxy, TNode<NativeContext> native_context);
 };
 
 }  // namespace internal

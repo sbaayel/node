@@ -25,11 +25,11 @@
 // (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-// Flags: --allow-natives-syntax
+// Flags: --allow-natives-syntax --turbofan --no-lazy-feedback-allocation
 
-/**
- * @fileoverview Test reduce and reduceRight
- */
+// TODO(v8:10195): Fix these tests s.t. we assert deoptimization occurs when
+// expected (e.g. in a %DeoptimizeNow call), then remove
+// --no-lazy-feedback-allocation.
 
 function clone(v) {
   // Shallow-copies arrays, returns everything else verbatim.
@@ -718,6 +718,7 @@ assertEquals(undefined, arr.reduceRight(function(val) { return val }));
 })();
 
 (function ReduceCatch() {
+  let array = [1, 2, 3];
   let f = (a,current) => {
     return a + current;
   };
@@ -1050,6 +1051,7 @@ assertEquals(undefined, arr.reduceRight(function(val) { return val }));
 })();
 
 (function ReduceCatch() {
+  let array = [1, 2, 3];
   let f = (a,current) => {
     return a + current;
   };

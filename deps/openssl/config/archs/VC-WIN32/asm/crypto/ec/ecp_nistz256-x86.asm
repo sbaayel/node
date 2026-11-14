@@ -2387,8 +2387,9 @@ L$ONE:
 dd	1,0,0,0,0,0,0,0
 db	69,67,80,95,78,73,83,90,50,53,54,32,102,111,114,32
 db	120,56,54,47,83,83,69,50,44,32,67,82,89,80,84,79
-db	71,65,77,83,32,98,121,32,60,97,112,112,114,111,64,111
-db	112,101,110,115,115,108,46,111,114,103,62,0
+db	71,65,77,83,32,98,121,32,60,104,116,116,112,115,58,47
+db	47,103,105,116,104,117,98,46,99,111,109,47,100,111,116,45
+db	97,115,109,62,0
 align	64
 global	_ecp_nistz256_mul_by_2
 align	16
@@ -4386,19 +4387,15 @@ L$009pic:
 	or	eax,DWORD [4+edi]
 	or	eax,DWORD [8+edi]
 	or	eax,DWORD [12+edi]
+	mov	ebx,DWORD [576+esp]
+	not	ebx
+	or	eax,ebx
+	mov	ebx,DWORD [580+esp]
+	not	ebx
+	or	eax,ebx
+	or	eax,DWORD [584+esp]
 db	62
 	jnz	NEAR L$010add_proceed
-	mov	eax,DWORD [576+esp]
-	and	eax,DWORD [580+esp]
-	mov	ebx,DWORD [584+esp]
-	jz	NEAR L$010add_proceed
-	test	ebx,ebx
-	jz	NEAR L$011add_double
-	mov	edi,DWORD [616+esp]
-	xor	eax,eax
-	mov	ecx,24
-db	252,243,171
-	jmp	NEAR L$012add_done
 align	16
 L$011add_double:
 	mov	esi,DWORD [620+esp]
@@ -5129,4 +5126,4 @@ L$013pic:
 	pop	ebp
 	ret
 segment	.bss
-common	_OPENSSL_ia32cap_P 16
+common	_OPENSSL_ia32cap_P 40

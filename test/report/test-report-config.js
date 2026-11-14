@@ -1,12 +1,7 @@
-// Flags: --experimental-report --report-on-fatalerror --report-on-signal --report-uncaught-exception
+// Flags: --report-on-fatalerror --report-on-signal --report-uncaught-exception --report-compact
 'use strict';
 const common = require('../common');
-common.skipIfReportDisabled();
 const assert = require('assert');
-
-common.expectWarning('ExperimentalWarning',
-                     'report is an experimental feature. This feature could ' +
-                     'change at any time');
 
 // Verify that process.report.directory behaves properly.
 assert.strictEqual(process.report.directory, '');
@@ -60,6 +55,28 @@ assert.throws(() => {
 }, { code: 'ERR_INVALID_ARG_TYPE' });
 assert.strictEqual(process.report.reportOnSignal, true);
 
+// Verify that process.report.reportCompact behaves properly.
+assert.strictEqual(process.report.compact, true);
+process.report.compact = false;
+assert.strictEqual(process.report.compact, false);
+process.report.compact = true;
+assert.strictEqual(process.report.compact, true);
+assert.throws(() => {
+  process.report.compact = {};
+}, { code: 'ERR_INVALID_ARG_TYPE' });
+assert.strictEqual(process.report.compact, true);
+
+// Verify that process.report.excludeNetwork behaves properly.
+assert.strictEqual(process.report.excludeNetwork, false);
+process.report.excludeNetwork = true;
+assert.strictEqual(process.report.excludeNetwork, true);
+process.report.excludeNetwork = false;
+assert.strictEqual(process.report.excludeNetwork, false);
+assert.throws(() => {
+  process.report.excludeNetwork = {};
+}, { code: 'ERR_INVALID_ARG_TYPE' });
+assert.strictEqual(process.report.excludeNetwork, false);
+
 if (!common.isWindows) {
   // Verify that process.report.signal behaves properly.
   assert.strictEqual(process.report.signal, 'SIGUSR2');
@@ -70,13 +87,13 @@ if (!common.isWindows) {
     process.report.signal = 'foo';
   }, {
     code: 'ERR_UNKNOWN_SIGNAL',
-    message: 'Unknown signal: foo'
+    message: 'Unknown signal: foo',
   });
   assert.throws(() => {
     process.report.signal = 'sigusr1';
   }, {
     code: 'ERR_UNKNOWN_SIGNAL',
-    message: 'Unknown signal: sigusr1 (signals must use all capital letters)'
+    message: 'Unknown signal: sigusr1 (signals must use all capital letters)',
   });
   assert.strictEqual(process.report.signal, 'SIGUSR2');
   process.report.signal = 'SIGUSR1';

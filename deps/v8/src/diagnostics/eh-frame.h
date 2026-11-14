@@ -7,7 +7,7 @@
 
 #include "src/base/compiler-specific.h"
 #include "src/base/memory.h"
-#include "src/codegen/register-arch.h"
+#include "src/codegen/register.h"
 #include "src/common/globals.h"
 #include "src/zone/zone-containers.h"
 
@@ -19,11 +19,12 @@ class CodeDesc;
 class V8_EXPORT_PRIVATE EhFrameConstants final
     : public NON_EXPORTED_BASE(AllStatic) {
  public:
-  enum class DwarfOpcodes : byte {
+  enum class DwarfOpcodes : uint8_t {
     kNop = 0x00,
     kAdvanceLoc1 = 0x02,
     kAdvanceLoc2 = 0x03,
     kAdvanceLoc4 = 0x04,
+    kRestoreExtended = 0x06,
     kSameValue = 0x08,
     kDefCfa = 0x0c,
     kDefCfaRegister = 0x0d,
@@ -31,7 +32,7 @@ class V8_EXPORT_PRIVATE EhFrameConstants final
     kOffsetExtendedSf = 0x11,
   };
 
-  enum DwarfEncodingSpecifiers : byte {
+  enum DwarfEncodingSpecifiers : uint8_t {
     kUData4 = 0x03,
     kSData4 = 0x0b,
     kPcRel = 0x10,
@@ -71,13 +72,15 @@ class V8_EXPORT_PRIVATE EhFrameConstants final
 class V8_EXPORT_PRIVATE EhFrameWriter {
  public:
   explicit EhFrameWriter(Zone* zone);
+  EhFrameWriter(const EhFrameWriter&) = delete;
+  EhFrameWriter& operator=(const EhFrameWriter&) = delete;
 
   // The empty frame is a hack to trigger fp-based unwinding in Linux perf
   // compiled with libunwind support when processing DWARF-based call graphs.
   //
   // It is effectively a valid eh_frame_hdr with an empty look up table.
   //
-  static void WriteEmptyEhFrame(std::ostream& stream);  // NOLINT
+  static void WriteEmptyEhFrame(std::ostream& stream);
 
   // Write the CIE and FDE header. Call it before any other method.
   void Initialize();
@@ -102,11 +105,17 @@ class V8_EXPORT_PRIVATE EhFrameWriter {
     RecordRegisterSavedToStack(RegisterToDwarfCode(name), offset);
   }
 
+  // Directly accepts a DWARF register code, needed for
+  // handling pseudo-registers on some platforms.
+  void RecordRegisterSavedToStack(int dwarf_register_code, int offset);
+
   // The register has not been modified from the previous frame.
   void RecordRegisterNotModified(Register name);
+  void RecordRegisterNotModified(int dwarf_register_code);
 
   // The register follows the rule defined in the CIE.
   void RecordRegisterFollowsInitialRule(Register name);
+  void RecordRegisterFollowsInitialRule(int dwarf_register_code);
 
   void Finish(int code_size);
 
@@ -129,18 +138,18 @@ class V8_EXPORT_PRIVATE EhFrameWriter {
   void WriteSLeb128(int32_t value);
   void WriteULeb128(uint32_t value);
 
-  void WriteByte(byte value) { eh_frame_buffer_.push_back(value); }
+  void WriteByte(uint8_t value) { eh_frame_buffer_.push_back(value); }
   void WriteOpcode(EhFrameConstants::DwarfOpcodes opcode) {
-    WriteByte(static_cast<byte>(opcode));
+    WriteByte(static_cast<uint8_t>(opcode));
   }
-  void WriteBytes(const byte* start, int size) {
+  void WriteBytes(const uint8_t* start, int size) {
     eh_frame_buffer_.insert(eh_frame_buffer_.end(), start, start + size);
   }
   void WriteInt16(uint16_t value) {
-    WriteBytes(reinterpret_cast<const byte*>(&value), sizeof(value));
+    WriteBytes(reinterpret_cast<const uint8_t*>(&value), sizeof(value));
   }
   void WriteInt32(uint32_t value) {
-    WriteBytes(reinterpret_cast<const byte*>(&value), sizeof(value));
+    WriteBytes(reinterpret_cast<const uint8_t*>(&value), sizeof(value));
   }
   void PatchInt32(int base_offset, uint32_t value) {
     DCHECK_EQ(
@@ -168,10 +177,6 @@ class V8_EXPORT_PRIVATE EhFrameWriter {
 
   // Write nops until the size reaches a multiple of 8 bytes.
   void WritePaddingToAlignedSize(int unpadded_size);
-
-  // Internal version that directly accepts a DWARF register code, needed for
-  // handling pseudo-registers on some platforms.
-  void RecordRegisterSavedToStack(int register_code, int offset);
 
   int GetProcedureAddressOffset() const {
     return fde_offset() + EhFrameConstants::kProcedureAddressOffsetInFde;
@@ -202,14 +207,12 @@ class V8_EXPORT_PRIVATE EhFrameWriter {
   InternalState writer_state_;
   Register base_register_;
   int base_offset_;
-  ZoneVector<byte> eh_frame_buffer_;
-
-  DISALLOW_COPY_AND_ASSIGN(EhFrameWriter);
+  ZoneVector<uint8_t> eh_frame_buffer_;
 };
 
 class V8_EXPORT_PRIVATE EhFrameIterator {
  public:
-  EhFrameIterator(const byte* start, const byte* end)
+  EhFrameIterator(const uint8_t* start, const uint8_t* end)
       : start_(start), next_(start), end_(end) {
     DCHECK_LE(start, end);
   }
@@ -235,7 +238,7 @@ class V8_EXPORT_PRIVATE EhFrameIterator {
 
   uint32_t GetNextUInt32() { return GetNextValue<uint32_t>(); }
   uint16_t GetNextUInt16() { return GetNextValue<uint16_t>(); }
-  byte GetNextByte() { return GetNextValue<byte>(); }
+  uint8_t GetNextByte() { return GetNextValue<uint8_t>(); }
   EhFrameConstants::DwarfOpcodes GetNextOpcode() {
     return static_cast<EhFrameConstants::DwarfOpcodes>(GetNextByte());
   }
@@ -262,8 +265,8 @@ class V8_EXPORT_PRIVATE EhFrameIterator {
  private:
   static const int kDirectivesOffsetInFde = 4 * kInt32Size + 1;
 
-  static uint32_t DecodeULeb128(const byte* encoded, int* encoded_size);
-  static int32_t DecodeSLeb128(const byte* encoded, int* encoded_size);
+  static uint32_t DecodeULeb128(const uint8_t* encoded, int* encoded_size);
+  static int32_t DecodeSLeb128(const uint8_t* encoded, int* encoded_size);
 
   template <typename T>
   T GetNextValue() {
@@ -274,32 +277,32 @@ class V8_EXPORT_PRIVATE EhFrameIterator {
     return result;
   }
 
-  const byte* start_;
-  const byte* next_;
-  const byte* end_;
+  const uint8_t* start_;
+  const uint8_t* next_;
+  const uint8_t* end_;
 };
 
 #ifdef ENABLE_DISASSEMBLER
 
 class EhFrameDisassembler final {
  public:
-  EhFrameDisassembler(const byte* start, const byte* end)
+  EhFrameDisassembler(const uint8_t* start, const uint8_t* end)
       : start_(start), end_(end) {
     DCHECK_LT(start, end);
   }
+  EhFrameDisassembler(const EhFrameDisassembler&) = delete;
+  EhFrameDisassembler& operator=(const EhFrameDisassembler&) = delete;
 
-  void DisassembleToStream(std::ostream& stream);  // NOLINT
+  void DisassembleToStream(std::ostream& stream);
 
  private:
-  static void DumpDwarfDirectives(std::ostream& stream,  // NOLINT
-                                  const byte* start, const byte* end);
+  static void DumpDwarfDirectives(std::ostream& stream, const uint8_t* start,
+                                  const uint8_t* end);
 
   static const char* DwarfRegisterCodeToString(int code);
 
-  const byte* start_;
-  const byte* end_;
-
-  DISALLOW_COPY_AND_ASSIGN(EhFrameDisassembler);
+  const uint8_t* start_;
+  const uint8_t* end_;
 };
 
 #endif

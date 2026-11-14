@@ -5,8 +5,15 @@
 #ifndef V8_OBJECTS_JS_ARRAY_BUFFER_H_
 #define V8_OBJECTS_JS_ARRAY_BUFFER_H_
 
+#include "include/v8-array-buffer.h"
+#include "include/v8-typed-array.h"
+#include "src/base/bit-field.h"
+#include "src/handles/maybe-handles.h"
 #include "src/objects/backing-store.h"
+#include "src/objects/js-function.h"
 #include "src/objects/js-objects.h"
+#include "src/sandbox/check.h"
+#include "src/sandbox/external-pointer.h"
 
 // Has to be the last include (doesn't have include guards):
 #include "src/objects/object-macros.h"
@@ -14,45 +21,74 @@
 namespace v8 {
 namespace internal {
 
-class JSArrayBuffer : public JSObject {
+class ArrayBufferExtension;
+
+V8_OBJECT class JSArrayBuffer : public JSAPIObjectWithEmbedderSlots {
  public:
 // The maximum length for JSArrayBuffer's supported by V8.
 // On 32-bit architectures we limit this to 2GiB, so that
 // we can continue to use CheckBounds with the Unsigned31
 // restriction for the length.
-#if V8_HOST_ARCH_32_BIT
+#if V8_ENABLE_SANDBOX
+  static constexpr size_t kMaxByteLength = kMaxSafeBufferSizeForSandbox;
+#elif V8_HOST_ARCH_32_BIT
   static constexpr size_t kMaxByteLength = kMaxInt;
 #else
   static constexpr size_t kMaxByteLength = kMaxSafeInteger;
 #endif
 
   // [byte_length]: length in bytes
-  DECL_PRIMITIVE_ACCESSORS(byte_length, size_t)
+  inline size_t byte_length() const;
+  inline void set_byte_length(size_t value);
+  inline size_t byte_length_unchecked() const;
+
+  // [max_byte_length]: maximum length in bytes
+  inline size_t max_byte_length() const;
+  inline void set_max_byte_length(size_t value);
 
   // [backing_store]: backing memory for this array
-  DECL_ACCESSORS(backing_store, void*)
+  // It should not be assumed that this will be nullptr for empty ArrayBuffers.
+  inline void* backing_store() const;
+  inline void* backing_store(PtrComprCageBase cage_base) const;
+  inline void set_backing_store(Isolate* isolate, void* value);
 
-  // For non-wasm, allocation_length and allocation_base are byte_length and
-  // backing_store, respectively.
-  inline size_t allocation_length() const;
-  inline void* allocation_base() const;
+  // [extension]: extension object used for GC
+  inline ArrayBufferExtension* extension() const;
+  inline void set_extension(ArrayBufferExtension* value);
+  inline void init_extension();
+  // Returns the current extension and resets it to nullptr. Expects a witness
+  // DisallowGarbageCollection to make sure the returned extension isn't freed
+  // while a pointer to it is held on stack.
+  inline ArrayBufferExtension* extract_extension(
+      Isolate* isolate,
+      const DisallowGarbageCollection& disallow_gc V8_LIFETIME_BOUND);
 
   // [bit_field]: boolean flags
-  DECL_PRIMITIVE_ACCESSORS(bit_field, uint32_t)
+  inline uint32_t bit_field() const;
+  inline void set_bit_field(uint32_t value);
 
   // Clear uninitialized padding space. This ensures that the snapshot content
   // is deterministic. Depending on the V8 build mode there could be no padding.
   V8_INLINE void clear_padding();
 
-// Bit positions for [bit_field].
-#define JS_ARRAY_BUFFER_BIT_FIELD_FIELDS(V, _) \
-  V(IsExternalBit, bool, 1, _)                 \
-  V(IsDetachableBit, bool, 1, _)               \
-  V(WasDetachedBit, bool, 1, _)                \
-  V(IsAsmJsMemoryBit, bool, 1, _)              \
-  V(IsSharedBit, bool, 1, _)
-  DEFINE_BIT_FIELDS(JS_ARRAY_BUFFER_BIT_FIELD_FIELDS)
-#undef JS_ARRAY_BUFFER_BIT_FIELD_FIELDS
+  // Bit positions for [bit_field].
+  using IsExternalBit = base::BitField<bool, 0, 1, uint32_t>;
+  using IsDetachableBit = IsExternalBit::Next<bool, 1>;
+  using WasDetachedBit = IsDetachableBit::Next<bool, 1>;
+  using IsSharedBit = WasDetachedBit::Next<SharedFlag, 1>;
+  using IsResizableByJsBit = IsSharedBit::Next<ResizableFlag, 1>;
+  using IsImmutableBit = IsResizableByJsBit::Next<ImmutableFlag, 1>;
+  enum Flag : uint32_t {
+    kNone = 0,
+    kIsExternal = IsExternalBit::kMask,
+    kIsDetachable = IsDetachableBit::kMask,
+    kWasDetached = WasDetachedBit::kMask,
+    kIsShared = IsSharedBit::kMask,
+    kIsResizableByJs = IsResizableByJsBit::kMask,
+    kIsImmutable = IsImmutableBit::kMask,
+  };
+  using Flags = base::Flags<Flag>;
+  static constexpr int kFlagCount = 6;
 
   // [is_external]: true indicates that the embedder is in charge of freeing the
   // backing_store, while is_external == false means that v8 will free the
@@ -64,24 +100,57 @@ class JSArrayBuffer : public JSObject {
 
   // [was_detached]: true => the buffer was previously detached.
   DECL_BOOLEAN_ACCESSORS(was_detached)
+  inline bool was_detached(AcquireLoadTag) const;
+  inline void set_was_detached(bool value, ReleaseStoreTag);
 
-  // [is_asmjs_memory]: true => this buffer was once used as asm.js memory.
-  DECL_BOOLEAN_ACCESSORS(is_asmjs_memory)
+  // [is_shared]: true if this is a SharedArrayBuffer or a
+  // GrowableSharedArrayBuffer.
+  inline SharedFlag is_shared() const;
+  inline void set_is_shared(SharedFlag value);
 
-  // [is_shared]: tells whether this is an ArrayBuffer or a SharedArrayBuffer.
-  DECL_BOOLEAN_ACCESSORS(is_shared)
+  // [is_resizable_by_js]: true if this is a ResizableArrayBuffer or a
+  // GrowableSharedArrayBuffer.
+  inline ResizableFlag is_resizable_by_js() const;
+  inline void set_is_resizable_by_js(ResizableFlag value);
 
-  DECL_CAST(JSArrayBuffer)
+  // [is_immutable]: true if this is an ImmutableArrayBuffer.
+  inline bool is_immutable() const;
+  inline void set_is_immutable(ImmutableFlag value);
+
+  V8_EXPORT_PRIVATE void MakeImmutable(Isolate* isolate);
+
+  // An ArrayBuffer is empty if its BackingStore is empty or if there is none.
+  // An empty ArrayBuffer will have a byte_length of zero but not necessarily a
+  // nullptr backing_store. An ArrayBuffer with a byte_length of zero may not
+  // necessarily be empty though, as it may be a GrowableSharedArrayBuffer.
+  // An ArrayBuffer with a size greater than zero is never empty.
+  inline bool IsEmpty() const;
+
+  inline Tagged<MaybeObject> views_or_detach_key() const;
+  inline void set_views_or_detach_key(
+      Tagged<MaybeObject> value, WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
+
+  inline Tagged<MaybeObject> views() const;
+  inline void set_views(Tagged<MaybeObject> value,
+                        WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
+
+  void AttachView(Tagged<JSArrayBufferView> view);
+
+  inline Tagged<Object> DetachKey(Isolate* isolate);
+  static void SetDetachKey(DirectHandle<JSArrayBuffer> array_buffer,
+                           DirectHandle<Object> key, Isolate* isolate);
+
+  static constexpr Tagged<Smi> kNoView = Smi::zero();
+  static constexpr Tagged<Smi> kManyViews = Smi::FromInt(1);
 
   // Initializes the fields of the ArrayBuffer. The provided backing_store can
   // be nullptr. If it is not nullptr, then the function registers it with
   // src/heap/array-buffer-tracker.h.
-  V8_EXPORT_PRIVATE void Setup(SharedFlag shared,
-                               std::shared_ptr<BackingStore> backing_store);
+  V8_EXPORT_PRIVATE void Setup(SharedFlag shared, ResizableFlag resizable,
+                               std::shared_ptr<BackingStore> backing_store,
+                               Isolate* isolate,
+                               Tagged<MaybeObject> views = kNoView);
 
-  // Attaches the backing store to an already constructed empty ArrayBuffer.
-  // This is intended to be used only in ArrayBufferConstructor builtin.
-  V8_EXPORT_PRIVATE void Attach(std::shared_ptr<BackingStore> backing_store);
   // Detach the backing store from this array buffer if it is detachable.
   // This sets the internal pointer and length to 0 and unregisters the backing
   // store from the array buffer tracker. If the array buffer is not detachable,
@@ -92,107 +161,381 @@ class JSArrayBuffer : public JSObject {
   // of growing the underlying memory object. The {force_for_wasm_memory} flag
   // is used by the implementation of Wasm memory growth in order to bypass the
   // non-detachable check.
-  V8_EXPORT_PRIVATE void Detach(bool force_for_wasm_memory = false);
+  V8_EXPORT_PRIVATE V8_WARN_UNUSED_RESULT static Maybe<bool> Detach(
+      DirectHandle<JSArrayBuffer> buffer, bool force_for_wasm_memory = false,
+      DirectHandle<Object> key = {});
 
   // Get a reference to backing store of this array buffer, if there is a
   // backing store. Returns nullptr if there is no backing store (e.g. detached
   // or a zero-length array buffer).
-  std::shared_ptr<BackingStore> GetBackingStore();
+  inline std::shared_ptr<BackingStore> GetBackingStore() const;
+
+  inline size_t GetByteLength() const;
+
+  static size_t GsabByteLength(Isolate* isolate, Address raw_array_buffer);
+
+  static Maybe<bool> GetResizableBackingStorePageConfiguration(
+      Isolate* isolate, size_t byte_length, size_t max_byte_length,
+      ShouldThrow should_throw, size_t* page_size, size_t* initial_pages,
+      size_t* max_pages);
+
+  static std::optional<MessageTemplate>
+  GetResizableBackingStorePageConfigurationImpl(
+      Isolate* isolate, size_t byte_length, size_t max_byte_length,
+      size_t* page_size, size_t* initial_pages, size_t* max_pages);
+
+  // Allocates an ArrayBufferExtension for this array buffer. This is assumed to
+  // be only called during setup as it always creates a new extension.
+  V8_EXPORT_PRIVATE ArrayBufferExtension* CreateExtension(
+      Isolate* isolate, std::shared_ptr<BackingStore> backing_store);
 
   // Dispatched behavior.
   DECL_PRINTER(JSArrayBuffer)
   DECL_VERIFIER(JSArrayBuffer)
 
-// Layout description.
-#define JS_ARRAY_BUFFER_FIELDS(V)                                           \
-  V(kEndOfTaggedFieldsOffset, 0)                                            \
-  /* Raw data fields. */                                                    \
-  V(kByteLengthOffset, kUIntptrSize)                                        \
-  V(kBackingStoreOffset, kSystemPointerSize)                                \
-  V(kBitFieldOffset, kInt32Size)                                            \
-  /* Pads header size to be a multiple of kTaggedSize. */                   \
-  V(kOptionalPaddingOffset, OBJECT_POINTER_PADDING(kOptionalPaddingOffset)) \
-  /* Header size. */                                                        \
-  V(kHeaderSize, 0)
-
-  DEFINE_FIELD_OFFSET_CONSTANTS(JSObject::kHeaderSize, JS_ARRAY_BUFFER_FIELDS)
-#undef JS_ARRAY_BUFFER_FIELDS
-
-  static const int kSizeWithEmbedderFields =
-      kHeaderSize +
-      v8::ArrayBuffer::kEmbedderFieldCount * kEmbedderDataSlotSize;
-
   class BodyDescriptor;
 
-  OBJECT_CONSTRUCTORS(JSArrayBuffer, JSObject);
+  static uint32_t NotValidMask(TypedArrayAccessMode mode) {
+    switch (mode) {
+      case TypedArrayAccessMode::kRead:
+        return JSArrayBuffer::WasDetachedBit::kMask;
+      case TypedArrayAccessMode::kWrite:
+        return JSArrayBuffer::WasDetachedBit::kMask |
+               JSArrayBuffer::IsImmutableBit::kMask;
+    }
+    UNREACHABLE();
+  }
+
+#if TAGGED_SIZE_8_BYTES
+  static const int kOptionalPaddingOffset;
+  static const int kOptionalPaddingOffsetEnd;
+#endif
+  static const int kHeaderSize;
+  static const int kSizeWithEmbedderFields;
+  static constexpr bool kContainsEmbedderFields =
+      v8::ArrayBuffer::kEmbedderFieldCount > 0;
+
+ private:
+  inline Tagged<Cell> detach_key() const;
+  inline void set_detach_key(Tagged<Cell> value,
+                             WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
+  inline bool has_detach_key() const;
+
+  static void DetachInternal(DirectHandle<JSArrayBuffer> array_buffer,
+                             bool force_for_wasm_memory, Isolate* isolate);
+
+  static bool TryDetachViews(DirectHandle<JSArrayBuffer> array_buffer,
+                             Isolate* isolate);
+
+#if V8_COMPRESS_POINTERS
+  // When pointer compression is enabled, the pointer to the extension is
+  // stored in the external pointer table and the object itself only contains a
+  // 32-bit external pointer handles. This simplifies alignment requirements
+  // and is also necessary for the sandbox.
+  inline ExternalPointerHandle* extension_handle_location() const;
+#else
+  inline ArrayBufferExtension** extension_location() const;
+#endif  // V8_COMPRESS_POINTERS
+
+ public:
+  TaggedMember<MaybeObject> views_or_detach_key_;
+  UnalignedValueMember<uintptr_t> raw_byte_length_;
+  UnalignedValueMember<uintptr_t> raw_max_byte_length_;
+  UnalignedValueMember<Address> backing_store_;
+  ExternalPointerMember<kArrayBufferExtensionTag> extension_;
+  uint32_t bit_field_;
+#if TAGGED_SIZE_8_BYTES
+  uint32_t optional_padding_;
+#endif
+} V8_OBJECT_END;
+
+#if TAGGED_SIZE_8_BYTES
+inline constexpr int JSArrayBuffer::kOptionalPaddingOffset =
+    offsetof(JSArrayBuffer, optional_padding_);
+inline constexpr int JSArrayBuffer::kOptionalPaddingOffsetEnd =
+    kOptionalPaddingOffset + sizeof(uint32_t) - 1;
+#endif
+inline constexpr int JSArrayBuffer::kHeaderSize = sizeof(JSArrayBuffer);
+inline constexpr int JSArrayBuffer::kSizeWithEmbedderFields =
+    JSArrayBuffer::kHeaderSize +
+    v8::ArrayBuffer::kEmbedderFieldCount * kEmbedderDataSlotSize;
+
+// Each JSArrayBuffer (with a backing store) has a corresponding native-heap
+// allocated ArrayBufferExtension for GC purposes and storing the backing store.
+// When marking a JSArrayBuffer, the GC also marks the native
+// extension-object. The GC periodically iterates all extensions concurrently
+// and frees unmarked ones.
+// https://docs.google.com/document/d/1-ZrLdlFX1nXT3z-FAgLbKal1gI8Auiaya_My-a0UJ28/edit
+class ArrayBufferExtension final
+#ifdef V8_COMPRESS_POINTERS
+    : public ExternalPointerTable::ManagedResource {
+#else
+    : public Malloced {
+#endif  // V8_COMPRESS_POINTERS
+ public:
+  enum class Age : uint8_t { kYoung = 0, kOld = 1 };
+
+  // Packs `accounting_length` and `age` into a single integer for consistent
+  // accounting, allowing resize while concurrently sweeping.
+  struct AccountingState final {
+    size_t accounting_length() const {
+      return AccountingLengthField::decode(value);
+    }
+    Age age() const { return static_cast<Age>(AgeField::decode(value)); }
+
+    uint64_t value;
+  };
+
+  ArrayBufferExtension(std::shared_ptr<BackingStore> backing_store,
+                       ArrayBufferExtension::Age age, SharedFlag is_shared,
+                       ResizableFlag is_resizable_by_js)
+      : backing_store_(std::move(backing_store)),
+        accounting_state_(AccountingLengthField::encode(static_cast<size_t>(
+                              backing_store_->PerIsolateAccountingLength())) |
+                          AgeField::encode(static_cast<uint8_t>(age))),
+        is_shared_(is_shared),
+        is_resizable_by_js_(is_resizable_by_js) {
+    initialized_for_gc_.store(true, std::memory_order_release);
+  }
+
+  // Barrier used for publishing the object. This barrier must be used whenever
+  // the extension is accessed off the main thread.
+  //
+  // The constructor sets a value with release that is read with acquire in this
+  // varrier.
+  void InitializationBarrier() const {
+    std::ignore = initialized_for_gc_.load(std::memory_order_acquire);
+  }
+
+  void Mark() { marked_.store(true, std::memory_order_relaxed); }
+  void Unmark() { marked_.store(false, std::memory_order_relaxed); }
+  bool IsMarked() const { return marked_.load(std::memory_order_relaxed); }
+
+  void YoungMark() {
+    SBXCHECK_EQ(ArrayBufferExtension::Age::kYoung, age());
+    set_young_gc_state(GcState::Copied);
+  }
+  void YoungMarkPromoted() {
+    // When iterating promoted pages the extension object is already set as
+    // being promoted which happens before the page iteration. This may even run
+    // racefully between AB sweeping and page iteration.
+    set_young_gc_state(GcState::Promoted);
+  }
+  void YoungUnmark() {
+    DCHECK_EQ(ArrayBufferExtension::Age::kYoung, age());
+    set_young_gc_state(GcState::Dead);
+  }
+  bool IsYoungMarked() const {
+    DCHECK_EQ(ArrayBufferExtension::Age::kYoung, age());
+    return young_gc_state() != GcState::Dead;
+  }
+  bool IsYoungPromoted() const {
+    DCHECK_EQ(ArrayBufferExtension::Age::kYoung, age());
+    return young_gc_state() == GcState::Promoted;
+  }
+
+  std::shared_ptr<BackingStore> backing_store() { return backing_store_; }
+  void set_backing_store(std::shared_ptr<BackingStore> backing_store) {
+    backing_store_ = std::move(backing_store);
+  }
+  std::shared_ptr<BackingStore> RemoveBackingStore() {
+    return std::move(backing_store_);
+  }
+
+  size_t accounting_length() const {
+    return AccountingState{accounting_state_.load(std::memory_order_relaxed)}
+        .accounting_length();
+  }
+  // Applies `delta` to `accounting_length` and returns the AccountingState
+  // before the update.
+  AccountingState UpdateAccountingLength(int64_t delta) {
+    if (delta >= 0) {
+      return {accounting_state_.fetch_add(
+          AccountingLengthField::encode(static_cast<size_t>(delta)),
+          std::memory_order_relaxed)};
+    }
+    return {accounting_state_.fetch_sub(
+        AccountingLengthField::encode(static_cast<size_t>(-delta)),
+        std::memory_order_relaxed)};
+  }
+  // Clears `accounting_length` and returns the AccountingState before the
+  // update.
+  AccountingState ClearAccountingLength() {
+    return {accounting_state_.fetch_and(AgeField::kMask,
+                                        std::memory_order_relaxed)};
+  }
+
+  ArrayBufferExtension* next() const { return next_; }
+  void set_next(ArrayBufferExtension* extension) { next_ = extension; }
+
+  SharedFlag is_shared() const { return is_shared_; }
+
+  ResizableFlag is_resizable_by_js() const { return is_resizable_by_js_; }
+  void set_is_resizable_by_js(ResizableFlag value) {
+    is_resizable_by_js_ = value;
+  }
+
+  Age age() const {
+    return AccountingState{accounting_state_.load(std::memory_order_relaxed)}
+        .age();
+  }
+  // Updates `age` and returns the AccountingState before the update.
+  AccountingState SetOld() {
+    return {
+        accounting_state_.fetch_or(AgeField::kMask, std::memory_order_relaxed)};
+  }
+  AccountingState SetYoung() {
+    return {accounting_state_.fetch_and(~AgeField::kMask,
+                                        std::memory_order_relaxed)};
+  }
+
+ private:
+  enum class GcState : uint8_t { Dead = 0, Copied, Promoted };
+
+  using AgeField = base::BitField<uint8_t, 0, 1, uint64_t>;
+  using AccountingLengthField = AgeField::Next<size_t, 63>;
+
+  GcState young_gc_state() const {
+    return young_gc_state_.load(std::memory_order_relaxed);
+  }
+
+  void set_young_gc_state(GcState value) {
+    young_gc_state_.store(value, std::memory_order_relaxed);
+  }
+
+  std::shared_ptr<BackingStore> backing_store_;
+  ArrayBufferExtension* next_ = nullptr;
+  std::atomic<uint64_t> accounting_state_;
+  std::atomic<bool> initialized_for_gc_{false};
+  std::atomic<bool> marked_{false};
+  std::atomic<GcState> young_gc_state_{GcState::Dead};
+
+  // Trusted copies of the in-sandbox JSArrayBuffer flags. We verify that the
+  // in-sandbox flags match these trusted copies during critical operations.
+  const SharedFlag is_shared_;
+  ResizableFlag is_resizable_by_js_;
 };
 
-class JSArrayBufferView : public JSObject {
+V8_OBJECT class JSArrayBufferView : public JSAPIObjectWithEmbedderSlots {
+  V8_IT_ABSTRACT;
+
  public:
-  // [buffer]: ArrayBuffer that this typed array views.
-  DECL_ACCESSORS(buffer, Object)
+  // [buffer]: the underlying ArrayBuffer.
+  inline Tagged<JSArrayBuffer> buffer() const;
+  inline void set_buffer(Tagged<JSArrayBuffer> value,
+                         WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
 
   // [byte_offset]: offset of typed array in bytes.
-  DECL_PRIMITIVE_ACCESSORS(byte_offset, size_t)
+  inline size_t byte_offset() const;
+  inline void set_byte_offset(size_t value);
 
   // [byte_length]: length of typed array in bytes.
-  DECL_PRIMITIVE_ACCESSORS(byte_length, size_t)
+  // Only use for fixed-size arrays (`!IsVariableLength()`). Otherwise use
+  // `JSTypedArray::GetByteLength()`.
+  inline size_t byte_length() const;
+  inline void set_byte_length(size_t value);
 
-  DECL_CAST(JSArrayBufferView)
+  // [bit_field]: boolean flags
+  inline uint32_t bit_field() const;
+  inline void set_bit_field(uint32_t value);
 
   DECL_VERIFIER(JSArrayBufferView)
 
+  // Bit positions for [bit_field].
+  using IsLengthTrackingBit = base::BitField<bool, 0, 1, uint32_t>;
+  using IsBackedByRabBit = IsLengthTrackingBit::Next<bool, 1>;
+  enum Flag : uint32_t {
+    kNone = 0,
+    kIsLengthTracking = IsLengthTrackingBit::kMask,
+    kIsBackedByRab = IsBackedByRabBit::kMask,
+  };
+  using Flags = base::Flags<Flag>;
+  static constexpr int kFlagCount = 2;
+
   inline bool WasDetached() const;
+  inline bool IsDetachedOrOutOfBounds() const;
 
-// Layout description.
-#define JS_ARRAY_BUFFER_VIEW_FIELDS(V) \
-  V(kBufferOffset, kTaggedSize)        \
-  V(kEndOfTaggedFieldsOffset, 0)       \
-  /* Raw data fields. */               \
-  V(kByteOffsetOffset, kUIntptrSize)   \
-  V(kByteLengthOffset, kUIntptrSize)   \
-  /* Header size. */                   \
-  V(kHeaderSize, 0)
+  DECL_BOOLEAN_ACCESSORS(is_length_tracking)
+  DECL_BOOLEAN_ACCESSORS(is_backed_by_rab)
+  inline bool IsVariableLength() const;
 
-  DEFINE_FIELD_OFFSET_CONSTANTS(JSObject::kHeaderSize,
-                                JS_ARRAY_BUFFER_VIEW_FIELDS)
-#undef JS_ARRAY_BUFFER_VIEW_FIELDS
+  class BodyDescriptor;
 
-  STATIC_ASSERT(IsAligned(kByteOffsetOffset, kUIntptrSize));
-  STATIC_ASSERT(IsAligned(kByteLengthOffset, kUIntptrSize));
+  static const int kHeaderSize;
 
-  OBJECT_CONSTRUCTORS(JSArrayBufferView, JSObject);
-};
-
-class JSTypedArray : public JSArrayBufferView {
  public:
-  // TODO(v8:4153): This should be equal to JSArrayBuffer::kMaxByteLength
-  // eventually.
-  static constexpr size_t kMaxLength = v8::TypedArray::kMaxLength;
+  TaggedMember<JSArrayBuffer> buffer_;
+  uint32_t bit_field_;
+#if TAGGED_SIZE_8_BYTES
+  uint32_t optional_padding_;
+#endif
+  UnalignedValueMember<uintptr_t> raw_byte_offset_;
+  UnalignedValueMember<uintptr_t> raw_byte_length_;
+} V8_OBJECT_END;
 
-  // [length]: length of typed array in elements.
-  DECL_PRIMITIVE_ACCESSORS(length, size_t)
+inline constexpr int JSArrayBufferView::kHeaderSize = sizeof(JSArrayBufferView);
+
+static_assert(IsAligned(offsetof(JSArrayBufferView, raw_byte_offset_),
+                        kUIntptrSize));
+static_assert(IsAligned(offsetof(JSArrayBufferView, raw_byte_length_),
+                        kUIntptrSize));
+
+V8_OBJECT class JSTypedArray : public JSArrayBufferView {
+  V8_IT_OWN_TYPE;
+
+ public:
+  static constexpr size_t kMaxByteLength = JSArrayBuffer::kMaxByteLength;
+  static_assert(kMaxByteLength == v8::TypedArray::kMaxByteLength);
+
+  static constexpr std::pair<ExternalArrayType, size_t> TypeAndElementSizeFor(
+      ElementsKind);
+
+  // [length]: length in elements.
+  inline size_t length() const;
+
+  // [base_pointer]: the ByteArray containing the backing store, if it is
+  // on-heap, or Smi::zero() if it is off-heap.
+  inline Tagged<Object> base_pointer() const;
+  inline Tagged<Object> base_pointer(AcquireLoadTag) const;
 
   // ES6 9.4.5.3
   V8_WARN_UNUSED_RESULT static Maybe<bool> DefineOwnProperty(
-      Isolate* isolate, Handle<JSTypedArray> o, Handle<Object> key,
+      Isolate* isolate, DirectHandle<JSTypedArray> o, DirectHandle<Object> key,
       PropertyDescriptor* desc, Maybe<ShouldThrow> should_throw);
 
-  DECL_CAST(JSTypedArray)
+  ExternalArrayType type() const;
+  V8_EXPORT_PRIVATE size_t element_size() const;
 
-  ExternalArrayType type();
-  V8_EXPORT_PRIVATE size_t element_size();
+  V8_EXPORT_PRIVATE Handle<JSArrayBuffer> GetBuffer(Isolate* isolate);
 
-  V8_EXPORT_PRIVATE Handle<JSArrayBuffer> GetBuffer();
+  // The `DataPtr` is `base_ptr + external_pointer`, and `base_ptr` is nullptr
+  // for off-heap typed arrays.
+  static constexpr bool kOffHeapDataPtrEqualsExternalPointer = true;
 
   // Use with care: returns raw pointer into heap.
   inline void* DataPtr();
 
-  inline void SetOffHeapDataPtr(void* base, Address offset);
-  inline void SetOnHeapDataPtr(HeapObject base, Address offset);
+  inline void SetOffHeapDataPtr(Isolate* isolate, void* base, Address offset);
 
   // Whether the buffer's backing store is on-heap or off-heap.
   inline bool is_on_heap() const;
+  inline bool is_on_heap(AcquireLoadTag tag) const;
+
+  // Only valid to call when IsVariableLength() is true.
+  size_t GetVariableByteLengthOrOutOfBounds(bool& out_of_bounds) const;
+  size_t GetVariableLengthOrOutOfBounds(bool& out_of_bounds) const;
+
+  inline size_t GetLengthOrOutOfBounds(bool& out_of_bounds) const;
+  inline size_t GetLength() const;
+  inline size_t GetByteLength() const;
+  inline bool IsOutOfBounds() const;
+
+  static inline void ForFixedTypedArray(ExternalArrayType array_type,
+                                        size_t* element_size,
+                                        ElementsKind* element_kind);
+
+  static size_t LengthTrackingGsabBackedTypedArrayLength(Isolate* isolate,
+                                                         Address raw_array);
 
   // Note: this is a pointer compression specific optimization.
   // Normally, on-heap typed arrays contain HeapObject value in |base_pointer|
@@ -204,38 +547,22 @@ class JSTypedArray : public JSArrayBufferView {
   // as Tagged_t value and an |external_pointer| value.
   // For full-pointer mode the compensation value is zero.
   static inline Address ExternalPointerCompensationForOnHeapArray(
-      Isolate* isolate);
+      PtrComprCageBase cage_base);
 
-  // Subtracts external pointer compensation from the external pointer value.
-  inline void RemoveExternalPointerCompensationForSerialization();
+  //
+  // Serializer/deserializer support.
+  //
 
-  static inline MaybeHandle<JSTypedArray> Validate(Isolate* isolate,
-                                                   Handle<Object> receiver,
-                                                   const char* method_name);
+  // Initializes the external pointer value for on-heap typed arrays.
+  inline void InitOnHeapDataPtrAfterDeserialization(Isolate* isolate);
+
+  static inline MaybeDirectHandle<JSTypedArray> Validate(
+      Isolate* isolate, DirectHandle<Object> receiver, const char* method_name,
+      TypedArrayAccessMode access_mode = TypedArrayAccessMode::kRead);
 
   // Dispatched behavior.
   DECL_PRINTER(JSTypedArray)
   DECL_VERIFIER(JSTypedArray)
-
-// Layout description.
-#define JS_TYPED_ARRAY_FIELDS(V)                \
-  /* Raw data fields. */                        \
-  V(kLengthOffset, kUIntptrSize)                \
-  V(kExternalPointerOffset, kSystemPointerSize) \
-  V(kBasePointerOffset, kTaggedSize)            \
-  /* Header size. */                            \
-  V(kHeaderSize, 0)
-
-  DEFINE_FIELD_OFFSET_CONSTANTS(JSArrayBufferView::kHeaderSize,
-                                JS_TYPED_ARRAY_FIELDS)
-#undef JS_TYPED_ARRAY_FIELDS
-
-  STATIC_ASSERT(IsAligned(kLengthOffset, kUIntptrSize));
-  STATIC_ASSERT(IsAligned(kExternalPointerOffset, kSystemPointerSize));
-
-  static const int kSizeWithEmbedderFields =
-      kHeaderSize +
-      v8::ArrayBufferView::kEmbedderFieldCount * kEmbedderDataSlotSize;
 
   class BodyDescriptor;
 
@@ -245,50 +572,122 @@ class JSTypedArray : public JSArrayBufferView {
   static constexpr size_t kMaxSizeInHeap = 64;
 #endif
 
+  static inline void MarkDetached(DirectHandle<JSTypedArray> array,
+                                  Isolate* isolate);
+
+  static const int kHeaderSize;
+  static const int kSizeWithEmbedderFields;
+  static constexpr bool kContainsEmbedderFields =
+      v8::ArrayBufferView::kEmbedderFieldCount > 0;
+
  private:
-  friend class Deserializer;
+  friend class Factory;
 
-  // [base_pointer]: TODO(v8:4153)
-  DECL_ACCESSORS(base_pointer, Object)
+  inline void set_length(size_t value);
+  inline Address external_pointer() const;
+  inline Address external_pointer(PtrComprCageBase cage_base) const;
 
-  // [external_pointer]: TODO(v8:4153)
-  DECL_PRIMITIVE_ACCESSORS(external_pointer, Address)
+  inline void set_base_pointer(Tagged<Object> value,
+                               WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
+  inline void set_base_pointer(Tagged<Object> value, ReleaseStoreTag,
+                               WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
 
-  OBJECT_CONSTRUCTORS(JSTypedArray, JSArrayBufferView);
-};
+  inline void set_external_pointer(Isolate* isolate, Address value);
 
-class JSDataView : public JSArrayBufferView {
+ public:
+  UnalignedValueMember<uintptr_t> raw_length_;
+  UnalignedValueMember<Address> external_pointer_;
+  TaggedMember<Object> base_pointer_;
+} V8_OBJECT_END;
+
+inline constexpr int JSTypedArray::kHeaderSize = sizeof(JSTypedArray);
+inline constexpr int JSTypedArray::kSizeWithEmbedderFields =
+    JSTypedArray::kHeaderSize +
+    v8::ArrayBufferView::kEmbedderFieldCount * kEmbedderDataSlotSize;
+
+// TODO(v8:9287): Re-enable when GCMole stops mixing 32/64 bit configs.
+// static_assert(IsAligned(JSTypedArray::kRawLengthOffset, kTaggedSize));
+// static_assert(IsAligned(JSTypedArray::kExternalPointerOffset, kTaggedSize));
+
+V8_OBJECT class JSDetachedTypedArray : public JSTypedArray {
+ public:
+  DECL_PRINTER(JSDetachedTypedArray)
+  DECL_VERIFIER(JSDetachedTypedArray)
+} V8_OBJECT_END;
+
+V8_OBJECT class JSDataViewOrRabGsabDataView : public JSArrayBufferView {
+  V8_IT_ABSTRACT;
+
  public:
   // [data_pointer]: pointer to the actual data.
-  DECL_PRIMITIVE_ACCESSORS(data_pointer, void*)
-
-  DECL_CAST(JSDataView)
-
-  // Dispatched behavior.
-  DECL_PRINTER(JSDataView)
-  DECL_VERIFIER(JSDataView)
-
-  // Layout description.
-#define JS_DATA_VIEW_FIELDS(V)       \
-  /* Raw data fields. */             \
-  V(kDataPointerOffset, kIntptrSize) \
-  /* Header size. */                 \
-  V(kHeaderSize, 0)
-
-  DEFINE_FIELD_OFFSET_CONSTANTS(JSArrayBufferView::kHeaderSize,
-                                JS_DATA_VIEW_FIELDS)
-#undef JS_DATA_VIEW_FIELDS
-
-  STATIC_ASSERT(IsAligned(kDataPointerOffset, kUIntptrSize));
-
-  static const int kSizeWithEmbedderFields =
-      kHeaderSize +
-      v8::ArrayBufferView::kEmbedderFieldCount * kEmbedderDataSlotSize;
+  inline void* data_pointer() const;
+  inline void* data_pointer(PtrComprCageBase cage_base) const;
+  inline void set_data_pointer(Isolate* isolate, void* value);
 
   class BodyDescriptor;
 
-  OBJECT_CONSTRUCTORS(JSDataView, JSArrayBufferView);
-};
+  static const int kHeaderSize;
+  static const int kSizeWithEmbedderFields;
+  static constexpr bool kContainsEmbedderFields =
+      v8::ArrayBufferView::kEmbedderFieldCount > 0;
+
+ public:
+  UnalignedValueMember<Address> data_pointer_;
+} V8_OBJECT_END;
+
+inline constexpr int JSDataViewOrRabGsabDataView::kHeaderSize =
+    sizeof(JSDataViewOrRabGsabDataView);
+inline constexpr int JSDataViewOrRabGsabDataView::kSizeWithEmbedderFields =
+    JSDataViewOrRabGsabDataView::kHeaderSize +
+    v8::ArrayBufferView::kEmbedderFieldCount * kEmbedderDataSlotSize;
+
+// TODO(v8:9287): Re-enable when GCMole stops mixing 32/64 bit configs.
+// static_assert(IsAligned(JSDataViewOrRabGsabDataView::kDataPointerOffset,
+//                         kTaggedSize));
+
+V8_OBJECT class JSDataView : public JSDataViewOrRabGsabDataView {
+ public:
+  DECL_PRINTER(JSDataView)
+  DECL_VERIFIER(JSDataView)
+} V8_OBJECT_END;
+
+V8_OBJECT class JSRabGsabDataView : public JSDataViewOrRabGsabDataView {
+ public:
+  DECL_PRINTER(JSRabGsabDataView)
+  DECL_VERIFIER(JSRabGsabDataView)
+
+  inline size_t GetByteLength() const;
+  inline bool IsOutOfBounds() const;
+} V8_OBJECT_END;
+
+V8_OBJECT class TypedArrayConstructor : public JSFunctionWithPrototype {
+  V8_IT_ABSTRACT;
+} V8_OBJECT_END;
+V8_OBJECT class Uint8TypedArrayConstructor : public TypedArrayConstructor {
+} V8_OBJECT_END;
+V8_OBJECT class Int8TypedArrayConstructor : public TypedArrayConstructor {
+} V8_OBJECT_END;
+V8_OBJECT class Uint16TypedArrayConstructor : public TypedArrayConstructor {
+} V8_OBJECT_END;
+V8_OBJECT class Int16TypedArrayConstructor : public TypedArrayConstructor {
+} V8_OBJECT_END;
+V8_OBJECT class Uint32TypedArrayConstructor : public TypedArrayConstructor {
+} V8_OBJECT_END;
+V8_OBJECT class Int32TypedArrayConstructor : public TypedArrayConstructor {
+} V8_OBJECT_END;
+V8_OBJECT class Float16TypedArrayConstructor : public TypedArrayConstructor {
+} V8_OBJECT_END;
+V8_OBJECT class Float32TypedArrayConstructor : public TypedArrayConstructor {
+} V8_OBJECT_END;
+V8_OBJECT class Float64TypedArrayConstructor : public TypedArrayConstructor {
+} V8_OBJECT_END;
+V8_OBJECT class Uint8ClampedTypedArrayConstructor
+    : public TypedArrayConstructor {
+} V8_OBJECT_END;
+V8_OBJECT class Biguint64TypedArrayConstructor : public TypedArrayConstructor {
+} V8_OBJECT_END;
+V8_OBJECT class Bigint64TypedArrayConstructor : public TypedArrayConstructor {
+} V8_OBJECT_END;
 
 }  // namespace internal
 }  // namespace v8

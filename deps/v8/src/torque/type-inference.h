@@ -5,17 +5,15 @@
 #ifndef V8_TORQUE_TYPE_INFERENCE_H_
 #define V8_TORQUE_TYPE_INFERENCE_H_
 
+#include <optional>
 #include <string>
 #include <unordered_map>
 
-#include "src/base/optional.h"
 #include "src/torque/ast.h"
 #include "src/torque/declarations.h"
 #include "src/torque/types.h"
 
-namespace v8 {
-namespace internal {
-namespace torque {
+namespace v8::internal::torque {
 
 // Type argument inference computes a potential instantiation of a generic
 // callable given some concrete argument types. As an example, consider the
@@ -55,30 +53,27 @@ namespace torque {
 // should be instantiated in the appropriate scope.
 class TypeArgumentInference {
  public:
-  TypeArgumentInference(const NameVector& type_parameters,
-                        const TypeVector& explicit_type_arguments,
-                        const std::vector<TypeExpression*>& term_parameters,
-                        const TypeVector& term_argument_types);
+  TypeArgumentInference(
+      const GenericParameters& type_parameters,
+      const TypeVector& explicit_type_arguments,
+      const std::vector<TypeExpression*>& term_parameters,
+      const std::vector<std::optional<const Type*>>& term_argument_types);
 
   bool HasFailed() const { return failure_reason_.has_value(); }
-  const char* GetFailureReason() { return *failure_reason_; }
+  const std::string& GetFailureReason() { return *failure_reason_; }
   TypeVector GetResult() const;
+  void Fail(std::string reason) { failure_reason_ = {reason}; }
 
  private:
-  void Fail(const char* reason) { failure_reason_ = {reason}; }
-
   void Match(TypeExpression* parameter, const Type* argument_type);
-  void MatchGeneric(BasicTypeExpression* parameter,
-                    const StructType* argument_type);
+  void MatchGeneric(BasicTypeExpression* parameter, const Type* argument_type);
 
   size_t num_explicit_;
   std::unordered_map<std::string, size_t> type_parameter_from_name_;
-  std::vector<base::Optional<const Type*>> inferred_;
-  base::Optional<const char*> failure_reason_;
+  std::vector<std::optional<const Type*>> inferred_;
+  std::optional<std::string> failure_reason_;
 };
 
-}  // namespace torque
-}  // namespace internal
-}  // namespace v8
+}  // namespace v8::internal::torque
 
 #endif  // V8_TORQUE_TYPE_INFERENCE_H_

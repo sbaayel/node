@@ -12,11 +12,11 @@ const bench = common.createBenchmark(main, {
     ['/foo/bar/baz/quux', '/foo/bar/baz/quux'].join('|'),
     ['/foo/bar/baz/quux', '/var/log'].join('|'),
   ],
-  n: [1e5]
+  n: [1e5],
 });
 
 function main({ n, paths }) {
-  var to = '';
+  let to = '';
   const delimIdx = paths.indexOf('|');
   if (delimIdx > -1) {
     to = paths.slice(delimIdx + 1);

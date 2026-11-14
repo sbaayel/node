@@ -15,19 +15,24 @@ class Protectors : public AllStatic {
   static const int kProtectorValid = 1;
   static const int kProtectorInvalid = 0;
 
-#define DECLARED_PROTECTORS_ON_NATIVE_CONTEXT(V) \
-  V(RegExpSpeciesLookupChainProtector, regexp_species_protector)
-
 #define DECLARED_PROTECTORS_ON_ISOLATE(V)                                     \
   V(ArrayBufferDetaching, ArrayBufferDetachingProtector,                      \
     array_buffer_detaching_protector)                                         \
-  V(ArrayConstructor, ArrayConstructorProtector, array_constructor_protector) \
+  V(ArrayBufferMutable, ArrayBufferMutableProtector,                          \
+    array_buffer_mutable_protector)                                           \
   V(ArrayIteratorLookupChain, ArrayIteratorProtector,                         \
     array_iterator_protector)                                                 \
   V(ArraySpeciesLookupChain, ArraySpeciesProtector, array_species_protector)  \
   V(IsConcatSpreadableLookupChain, IsConcatSpreadableProtector,               \
     is_concat_spreadable_protector)                                           \
+  V(NoDateTimeConfigurationChange, NoDateTimeConfigurationChangeProtector,    \
+    no_date_time_configuration_change_protector)                              \
   V(NoElements, NoElementsProtector, no_elements_protector)                   \
+                                                                              \
+  V(MegaDOM, MegaDOMProtector, mega_dom_protector)                            \
+  V(NoProfiling, NoProfilingProtector, no_profiling_protector)                \
+  V(NoUndetectableObjects, NoUndetectableObjectsProtector,                    \
+    no_undetectable_objects_protector)                                        \
                                                                               \
   /* The MapIterator protector protects the original iteration behaviors   */ \
   /* of Map.prototype.keys(), Map.prototype.values(), and                  */ \
@@ -41,6 +46,19 @@ class Protectors : public AllStatic {
   /*   property holder is the %IteratorPrototype%. Note that this also     */ \
   /*   invalidates the SetIterator protector (see below).                  */ \
   V(MapIteratorLookupChain, MapIteratorProtector, map_iterator_protector)     \
+  /* String.prototype.{matchAll|replace|split} looks up                    */ \
+  /* Symbol.{matchAll|replace|split} (aka @@matchAll, @@replace @split) on */ \
+  /* the search term to check if it is regexp-like.                        */ \
+  /* This protector ensures the prototype chain of String.prototype and    */ \
+  /* Number.prototype does not contain Symbol.{matchAll|replace|split}.    */ \
+  /* It enables a fast-path for String.prototype.{matchAll|replace|split}  */ \
+  /* by ensuring that                                                      */ \
+  /* the implicit wrapper object for strings and numbers do not contain    */ \
+  /* the property Symbol.{matchAll|replace|split}.                         */ \
+  V(NumberStringNotRegexpLike, NumberStringNotRegexpLikeProtector,            \
+    number_string_not_regexp_like_protector)                                  \
+  V(RegExpSpeciesLookupChain, RegExpSpeciesProtector,                         \
+    regexp_species_protector)                                                 \
   V(PromiseHook, PromiseHookProtector, promise_hook_protector)                \
   V(PromiseThenLookupChain, PromiseThenProtector, promise_then_protector)     \
   V(PromiseResolveLookupChain, PromiseResolveProtector,                       \
@@ -79,22 +97,16 @@ class Protectors : public AllStatic {
     string_iterator_protector)                                                \
   V(StringLengthOverflowLookupChain, StringLengthProtector,                   \
     string_length_protector)                                                  \
+  /* This protects the ToPrimitive conversion of string wrappers (with the */ \
+  /* default type hint NUMBER). */                                            \
+  V(StringWrapperToPrimitive, StringWrapperToPrimitiveProtector,              \
+    string_wrapper_to_primitive_protector)                                    \
   V(TypedArraySpeciesLookupChain, TypedArraySpeciesProtector,                 \
     typed_array_species_protector)
-
-#define DECLARE_PROTECTOR_ON_NATIVE_CONTEXT(name, unused_cell) \
-  V8_EXPORT_PRIVATE static inline bool Is##name##Intact(       \
-      Handle<NativeContext> native_context);                   \
-  V8_EXPORT_PRIVATE static void Invalidate##name(              \
-      Isolate* isolate, Handle<NativeContext> native_context);
-
-  DECLARED_PROTECTORS_ON_NATIVE_CONTEXT(DECLARE_PROTECTOR_ON_NATIVE_CONTEXT)
-#undef DECLARE_PROTECTOR_ON_NATIVE_CONTEXT
 
 #define DECLARE_PROTECTOR_ON_ISOLATE(name, unused_root_index, unused_cell) \
   V8_EXPORT_PRIVATE static inline bool Is##name##Intact(Isolate* isolate); \
   V8_EXPORT_PRIVATE static void Invalidate##name(Isolate* isolate);
-
   DECLARED_PROTECTORS_ON_ISOLATE(DECLARE_PROTECTOR_ON_ISOLATE)
 #undef DECLARE_PROTECTOR_ON_ISOLATE
 };

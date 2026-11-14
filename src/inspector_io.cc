@@ -1,16 +1,20 @@
 #include "inspector_io.h"
 
-#include "inspector_socket_server.h"
-#include "inspector/main_thread_interface.h"
-#include "inspector/node_string.h"
 #include "base_object-inl.h"
+#include "crypto/crypto_util.h"
 #include "debug_utils-inl.h"
+#include "inspector/main_thread_interface.h"
+#include "inspector/node_json.h"
+#include "inspector/node_string.h"
+#include "inspector/target_agent.h"
+#include "inspector/target_manager.h"
+#include "inspector_socket_server.h"
+#include "ncrypto.h"
 #include "node.h"
-#include "node_crypto.h"
 #include "node_internals.h"
 #include "node_mutex.h"
-#include "v8-inspector.h"
 #include "util-inl.h"
+#include "v8-inspector.h"
 #include "zlib.h"
 
 #include <deque>
@@ -46,8 +50,7 @@ std::string ScriptPath(uv_loop_t* loop, const std::string& script_name) {
 // Used ver 4 - with numbers
 std::string GenerateID() {
   uint16_t buffer[8];
-  CHECK(crypto::EntropySource(reinterpret_cast<unsigned char*>(buffer),
-                              sizeof(buffer)));
+  CHECK(ncrypto::CSPRNG(buffer, sizeof(buffer)));
 
   char uuid[256];
   snprintf(uuid, sizeof(uuid), "%04x%04x-%04x-%04x-%04x-%04x%04x%04x",
@@ -75,7 +78,7 @@ class RequestToServer {
     switch (action_) {
       case TransportAction::kKill:
         server->TerminateConnections();
-        // Fallthrough
+        [[fallthrough]];
       case TransportAction::kStop:
         server->Stop();
         break;
@@ -209,7 +212,7 @@ class IoSessionDelegate : public InspectorSessionDelegate {
 class InspectorIoDelegate: public node::inspector::SocketServerDelegate {
  public:
   InspectorIoDelegate(std::shared_ptr<RequestQueueData> queue,
-                      std::shared_ptr<MainThreadHandle> main_threade,
+                      std::shared_ptr<MainThreadHandle> main_thread,
                       const std::string& target_id,
                       const std::string& script_path,
                       const std::string& script_name);
@@ -218,6 +221,7 @@ class InspectorIoDelegate: public node::inspector::SocketServerDelegate {
   void StartSession(int session_id, const std::string& target_id) override;
   void MessageReceived(int session_id, const std::string& message) override;
   void EndSession(int session_id) override;
+  std::optional<std::string> GetTargetSessionId(const std::string& message);
 
   std::vector<std::string> GetTargetIds() override;
   std::string GetTargetTitle(const std::string& id) override;
@@ -239,7 +243,7 @@ class InspectorIoDelegate: public node::inspector::SocketServerDelegate {
 std::unique_ptr<InspectorIo> InspectorIo::Start(
     std::shared_ptr<MainThreadHandle> main_thread,
     const std::string& path,
-    std::shared_ptr<HostPort> host_port,
+    std::shared_ptr<ExclusiveAccess<HostPort>> host_port,
     const InspectPublishUid& inspect_publish_uid) {
   auto io = std::unique_ptr<InspectorIo>(
       new InspectorIo(main_thread,
@@ -254,7 +258,7 @@ std::unique_ptr<InspectorIo> InspectorIo::Start(
 
 InspectorIo::InspectorIo(std::shared_ptr<MainThreadHandle> main_thread,
                          const std::string& path,
-                         std::shared_ptr<HostPort> host_port,
+                         std::shared_ptr<ExclusiveAccess<HostPort>> host_port,
                          const InspectPublishUid& inspect_publish_uid)
     : main_thread_(main_thread),
       host_port_(host_port),
@@ -283,6 +287,11 @@ void InspectorIo::ThreadMain(void* io) {
 }
 
 void InspectorIo::ThreadMain() {
+  int thread_name_error = uv_thread_setname("InspectorIo");
+  if (!thread_name_error) [[unlikely]] {
+    per_process::Debug(node::DebugCategory::INSPECTOR_SERVER,
+                       "Failed to set thread name for Inspector\n");
+  }
   uv_loop_t loop;
   loop.data = nullptr;
   int err = uv_loop_init(&loop);
@@ -293,10 +302,17 @@ void InspectorIo::ThreadMain() {
   std::unique_ptr<InspectorIoDelegate> delegate(
       new InspectorIoDelegate(queue, main_thread_, id_,
                               script_path, script_name_));
+  std::string host;
+  int port;
+  {
+    ExclusiveAccess<HostPort>::Scoped host_port(host_port_);
+    host = host_port->host();
+    port = host_port->port();
+  }
   InspectorSocketServer server(std::move(delegate),
                                &loop,
-                               host_port_->host(),
-                               host_port_->port(),
+                               std::move(host),
+                               port,
                                inspect_publish_uid_);
   request_queue_ = queue->handle();
   // Its lifetime is now that of the server delegate
@@ -304,7 +320,8 @@ void InspectorIo::ThreadMain() {
   {
     Mutex::ScopedLock scoped_lock(thread_start_lock_);
     if (server.Start()) {
-      host_port_->set_port(server.Port());
+      ExclusiveAccess<HostPort>::Scoped host_port(host_port_);
+      host_port->set_port(server.Port());
     }
     thread_start_condition_.Broadcast(scoped_lock);
   }
@@ -313,7 +330,8 @@ void InspectorIo::ThreadMain() {
 }
 
 std::string InspectorIo::GetWsUrl() const {
-  return FormatWsAddress(host_port_->host(), host_port_->port(), id_, true);
+  ExclusiveAccess<HostPort>::Scoped host_port(host_port_);
+  return FormatWsAddress(host_port->host(), host_port->port(), id_, true);
 }
 
 InspectorIoDelegate::InspectorIoDelegate(
@@ -328,20 +346,74 @@ InspectorIoDelegate::InspectorIoDelegate(
 
 void InspectorIoDelegate::StartSession(int session_id,
                                        const std::string& target_id) {
-  auto session = main_thread_->Connect(
-      std::unique_ptr<InspectorSessionDelegate>(
-          new IoSessionDelegate(request_queue_->handle(), session_id)), true);
-  if (session) {
-    sessions_[session_id] = std::move(session);
-    fprintf(stderr, "Debugger attached.\n");
+  fprintf(stderr, "Debugger attached.\n");
+}
+
+std::optional<std::string> InspectorIoDelegate::GetTargetSessionId(
+    const std::string& message) {
+  std::string_view view(message.data(), message.size());
+  std::unique_ptr<protocol::DictionaryValue> value =
+      protocol::DictionaryValue::cast(JsonUtil::parseJSON(view));
+  if (!value) {
+    return std::nullopt;
   }
+  protocol::String target_session_id;
+  protocol::Value* target_session_id_value = value->get("sessionId");
+  if (target_session_id_value) {
+    target_session_id_value->asString(&target_session_id);
+  }
+
+  if (!target_session_id.empty()) {
+    return target_session_id;
+  }
+  return std::nullopt;
 }
 
 void InspectorIoDelegate::MessageReceived(int session_id,
                                           const std::string& message) {
-  auto session = sessions_.find(session_id);
-  if (session != sessions_.end())
+  std::optional<std::string> target_session_id_str =
+      GetTargetSessionId(message);
+  std::shared_ptr<MainThreadHandle> worker = nullptr;
+  int merged_session_id = session_id;
+  if (target_session_id_str) {
+    bool is_number = std::all_of(target_session_id_str->begin(),
+                                 target_session_id_str->end(),
+                                 ::isdigit);
+    if (is_number) {
+      int target_session_id = std::stoi(*target_session_id_str);
+      worker = TargetManager::WorkerForSession(target_session_id);
+      if (worker) {
+        merged_session_id += target_session_id << 16;
+      }
+    }
+  }
+
+  auto session = sessions_.find(merged_session_id);
+
+  if (session == sessions_.end()) {
+    std::unique_ptr<InspectorSession> session;
+    if (worker) {
+      session = worker->Connect(
+          std::unique_ptr<InspectorSessionDelegate>(
+              new IoSessionDelegate(request_queue_->handle(), session_id)),
+          true);
+    } else {
+      session = main_thread_->Connect(
+          std::unique_ptr<InspectorSessionDelegate>(
+              new IoSessionDelegate(request_queue_->handle(), session_id)),
+          true);
+    }
+
+    if (session) {
+      sessions_[merged_session_id] = std::move(session);
+      sessions_[merged_session_id]->Dispatch(
+          Utf8ToStringView(message)->string());
+    } else {
+      fprintf(stderr, "Failed to connect to inspector session.\n");
+    }
+  } else {
     session->second->Dispatch(Utf8ToStringView(message)->string());
+  }
 }
 
 void InspectorIoDelegate::EndSession(int session_id) {

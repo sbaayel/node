@@ -1,9 +1,13 @@
+// Flags: --no-deprecation
+
 'use strict';
 const common = require('../common');
 const assert = require('assert');
 const domain = require('domain');
 const fs = require('fs');
 const vm = require('vm');
+
+process.on('warning', common.mustNotCall());
 
 {
   const d = domain.create();
@@ -65,7 +69,7 @@ const vm = require('vm');
   d2.run(common.mustCall(() => {
     p.then(d1.bind(common.mustCall((v) => {
       assert.strictEqual(process.domain, d1);
-    })));
+    }))).then(common.mustCall());
   }));
 }
 
@@ -122,5 +126,15 @@ const vm = require('vm');
         assert.strictEqual(process.domain, d);
       }));
     }));
+  }));
+}
+{
+  // Unhandled rejections become errors on the domain
+  const d = domain.create();
+  d.on('error', common.mustCall((e) => {
+    assert.strictEqual(e.message, 'foo');
+  }));
+  d.run(common.mustCall(() => {
+    Promise.reject(new Error('foo'));
   }));
 }

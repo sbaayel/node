@@ -2,16 +2,18 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+#ifndef V8_OBJECTS_JS_RELATIVE_TIME_FORMAT_H_
+#define V8_OBJECTS_JS_RELATIVE_TIME_FORMAT_H_
+
+#include "src/common/globals.h"
 #ifndef V8_INTL_SUPPORT
 #error Internationalization is expected to be enabled.
 #endif  // V8_INTL_SUPPORT
 
-#ifndef V8_OBJECTS_JS_RELATIVE_TIME_FORMAT_H_
-#define V8_OBJECTS_JS_RELATIVE_TIME_FORMAT_H_
-
 #include <set>
 #include <string>
 
+#include "src/base/bit-field.h"
 #include "src/execution/isolate.h"
 #include "src/heap/factory.h"
 #include "src/objects/managed.h"
@@ -23,61 +25,58 @@
 
 namespace U_ICU_NAMESPACE {
 class RelativeDateTimeFormatter;
-}
+}  // namespace U_ICU_NAMESPACE
 
 namespace v8 {
 namespace internal {
 
-class JSRelativeTimeFormat : public JSObject {
+V8_OBJECT class JSRelativeTimeFormat : public JSObject {
  public:
   // Creates relative time format object with properties derived from input
   // locales and options.
-  V8_WARN_UNUSED_RESULT static MaybeHandle<JSRelativeTimeFormat> New(
-      Isolate* isolate, Handle<Map> map, Handle<Object> locales,
-      Handle<Object> options);
+  V8_WARN_UNUSED_RESULT static MaybeDirectHandle<JSRelativeTimeFormat> New(
+      Isolate* isolate, DirectHandle<Map> map, DirectHandle<Object> locales,
+      DirectHandle<Object> options, const char* method_name);
 
-  V8_WARN_UNUSED_RESULT static Handle<JSObject> ResolvedOptions(
-      Isolate* isolate, Handle<JSRelativeTimeFormat> format_holder);
+  V8_WARN_UNUSED_RESULT static DirectHandle<JSObject> ResolvedOptions(
+      Isolate* isolate, DirectHandle<JSRelativeTimeFormat> format_holder);
 
-  Handle<String> StyleAsString() const;
-  Handle<String> NumericAsString() const;
+  Handle<String> NumericAsString(Isolate* isolate) const;
 
-  // ecma402/#sec-Intl.RelativeTimeFormat.prototype.format
-  V8_WARN_UNUSED_RESULT static MaybeHandle<String> Format(
+  // https://tc39.es/ecma402/#sec-Intl.RelativeTimeFormat.prototype.format
+  V8_WARN_UNUSED_RESULT static MaybeDirectHandle<String> Format(
       Isolate* isolate, Handle<Object> value_obj, Handle<Object> unit_obj,
-      Handle<JSRelativeTimeFormat> format);
+      DirectHandle<JSRelativeTimeFormat> format);
 
-  // ecma402/#sec-Intl.RelativeTimeFormat.prototype.formatToParts
-  V8_WARN_UNUSED_RESULT static MaybeHandle<JSArray> FormatToParts(
+  // https://tc39.es/ecma402/#sec-Intl.RelativeTimeFormat.prototype.formatToParts
+  V8_WARN_UNUSED_RESULT static MaybeDirectHandle<JSArray> FormatToParts(
       Isolate* isolate, Handle<Object> value_obj, Handle<Object> unit_obj,
-      Handle<JSRelativeTimeFormat> format);
+      DirectHandle<JSRelativeTimeFormat> format);
 
   V8_EXPORT_PRIVATE static const std::set<std::string>& GetAvailableLocales();
 
-  DECL_CAST(JSRelativeTimeFormat)
-
   // RelativeTimeFormat accessors.
-  DECL_ACCESSORS(locale, String)
+  inline Tagged<String> locale() const;
+  inline void set_locale(Tagged<String> value,
+                         WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
 
-  DECL_ACCESSORS(icu_formatter, Managed<icu::RelativeDateTimeFormatter>)
+  inline Tagged<String> numberingSystem() const;
+  inline void set_numberingSystem(Tagged<String> value,
+                                  WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
 
-  // Style: identifying the relative time format style used.
-  //
-  // ecma402/#sec-properties-of-intl-relativetimeformat-instances
+  inline Tagged<Managed<icu::RelativeDateTimeFormatter>> icu_formatter() const;
+  inline void set_icu_formatter(
+      Tagged<Managed<icu::RelativeDateTimeFormatter>> value,
+      WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
 
-  enum class Style {
-    LONG,   // Everything spelled out.
-    SHORT,  // Abbreviations used when possible.
-    NARROW  // Use the shortest possible form.
-  };
-  inline void set_style(Style style);
-  inline Style style() const;
+  inline int flags() const;
+  inline void set_flags(int value);
 
   // Numeric: identifying whether numerical descriptions are always used, or
   // used only when no more specific version is available (e.g., "1 day ago" vs
   // "yesterday").
   //
-  // ecma402/#sec-properties-of-intl-relativetimeformat-instances
+  // https://tc39.es/ecma402/#sec-properties-of-intl-relativetimeformat-instances
   enum class Numeric {
     ALWAYS,  // numerical descriptions are always used ("1 day ago")
     AUTO     // numerical descriptions are used only when no more specific
@@ -86,35 +85,27 @@ class JSRelativeTimeFormat : public JSObject {
   inline void set_numeric(Numeric numeric);
   inline Numeric numeric() const;
 
-// Bit positions in |flags|.
-#define FLAGS_BIT_FIELDS(V, _) \
-  V(StyleBits, Style, 2, _)    \
-  V(NumericBits, Numeric, 1, _)
-  DEFINE_BIT_FIELDS(FLAGS_BIT_FIELDS)
-#undef FLAGS_BIT_FIELDS
+  // Bit positions in |flags|.
+  using NumericBit =
+      base::BitField<JSRelativeTimeFormat::Numeric, 0, 1, uint32_t>;
 
-  STATIC_ASSERT(Style::LONG <= StyleBits::kMax);
-  STATIC_ASSERT(Style::SHORT <= StyleBits::kMax);
-  STATIC_ASSERT(Style::NARROW <= StyleBits::kMax);
-  STATIC_ASSERT(Numeric::AUTO <= NumericBits::kMax);
-  STATIC_ASSERT(Numeric::ALWAYS <= NumericBits::kMax);
-
-  // [flags] Bit field containing various flags about the function.
-  DECL_INT_ACCESSORS(flags)
+  static_assert(NumericBit::is_valid(Numeric::AUTO));
+  static_assert(NumericBit::is_valid(Numeric::ALWAYS));
 
   DECL_PRINTER(JSRelativeTimeFormat)
   DECL_VERIFIER(JSRelativeTimeFormat)
 
-  // Layout description.
-  DEFINE_FIELD_OFFSET_CONSTANTS(JSObject::kHeaderSize,
-                                TORQUE_GENERATED_JS_RELATIVE_TIME_FORMAT_FIELDS)
+  static const int kHeaderSize;
 
- private:
-  static Style getStyle(const char* str);
-  static Numeric getNumeric(const char* str);
+ public:
+  TaggedMember<String> locale_;
+  TaggedMember<String> numberingSystem_;
+  TaggedMember<Foreign> icu_formatter_;
+  TaggedMember<Smi> flags_;
+} V8_OBJECT_END;
 
-  OBJECT_CONSTRUCTORS(JSRelativeTimeFormat, JSObject);
-};
+inline constexpr int JSRelativeTimeFormat::kHeaderSize =
+    sizeof(JSRelativeTimeFormat);
 
 }  // namespace internal
 }  // namespace v8

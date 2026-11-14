@@ -4,11 +4,19 @@ const common = require('../common');
 const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
+const process = require('node:process');
 
 const tmpdir = require('../common/tmpdir');
 
 const testDir = tmpdir.path;
 const files = ['empty', 'files', 'for', 'just', 'testing'];
+
+process.on('warning', (cause) => {
+  // If any directory handle was left unclosed and then GC'd,
+  // it will emit `Warning: Closing directory handle on garbage collection`.
+  // Treat this warning as error.
+  throw new Error('Expected no warnings', { cause });
+});
 
 // Make sure tmp directory is clean
 tmpdir.refresh();
@@ -17,6 +25,13 @@ tmpdir.refresh();
 files.forEach(function(filename) {
   fs.closeSync(fs.openSync(path.join(testDir, filename), 'w'));
 });
+
+function assertDir(dir) {
+  assert(dir instanceof fs.Dir);
+  assert.throws(() => dir.constructor.prototype.path, {
+    code: 'ERR_INVALID_THIS',
+  });
+}
 
 function assertDirent(dirent) {
   assert(dirent instanceof fs.Dirent);
@@ -33,20 +48,26 @@ const dirclosedError = {
   code: 'ERR_DIR_CLOSED'
 };
 
+const dirconcurrentError = {
+  code: 'ERR_DIR_CONCURRENT_OPERATION'
+};
+
 const invalidCallbackObj = {
-  code: 'ERR_INVALID_CALLBACK',
+  code: 'ERR_INVALID_ARG_TYPE',
   name: 'TypeError'
 };
 
 // Check the opendir Sync version
 {
   const dir = fs.opendirSync(testDir);
+  assertDir(dir);
   const entries = files.map(() => {
     const dirent = dir.readSync();
     assertDirent(dirent);
-    return dirent.name;
-  });
-  assert.deepStrictEqual(files, entries.sort());
+    return { name: dirent.name, parentPath: dirent.parentPath, toString() { return dirent.name; } };
+  }).sort();
+  assert.deepStrictEqual(entries.map((d) => d.name), files);
+  assert.deepStrictEqual(entries.map((d) => d.parentPath), Array(entries.length).fill(testDir));
 
   // dir.read should return null when no more entries exist
   assert.strictEqual(dir.readSync(), null);
@@ -61,25 +82,21 @@ const invalidCallbackObj = {
 }
 
 // Check the opendir async version
-fs.opendir(testDir, common.mustCall(function(err, dir) {
-  assert.ifError(err);
+fs.opendir(testDir, common.mustSucceed((dir) => {
+  assertDir(dir);
   let sync = true;
-  dir.read(common.mustCall((err, dirent) => {
+  dir.read(common.mustSucceed((dirent) => {
     assert(!sync);
-    assert.ifError(err);
 
     // Order is operating / file system dependent
     assert(files.includes(dirent.name), `'files' should include ${dirent}`);
     assertDirent(dirent);
 
     let syncInner = true;
-    dir.read(common.mustCall((err, dirent) => {
+    dir.read(common.mustSucceed((dirent) => {
       assert(!syncInner);
-      assert.ifError(err);
 
-      dir.close(common.mustCall(function(err) {
-        assert.ifError(err);
-      }));
+      dir.close(common.mustSucceed());
     }));
     syncInner = false;
   }));
@@ -93,7 +110,7 @@ assert.throws(function() {
 
 assert.throws(function() {
   fs.opendir(__filename);
-}, /TypeError \[ERR_INVALID_CALLBACK\]: Callback must be a function/);
+}, /TypeError \[ERR_INVALID_ARG_TYPE\]: The "callback" argument must be of type function/);
 
 fs.opendir(__filename, common.mustCall(function(e) {
   assert.strictEqual(e.code, 'ENOTDIR');
@@ -120,6 +137,7 @@ fs.opendir(__filename, common.mustCall(function(e) {
 async function doPromiseTest() {
   // Check the opendir Promise version
   const dir = await fs.promises.opendir(testDir);
+  assertDir(dir);
   const entries = [];
 
   let i = files.length;
@@ -160,19 +178,19 @@ async function doAsyncIterBreakTest() {
     break;
   }
 
-  await assert.rejects(async () => dir.read(), dirclosedError);
+  await assert.rejects(dir.read(), dirclosedError);
 }
 doAsyncIterBreakTest().then(common.mustCall());
 
 async function doAsyncIterReturnTest() {
   const dir = await fs.promises.opendir(testDir);
   await (async function() {
-    for await (const dirent of dir) { // eslint-disable-line no-unused-vars
+    for await (const dirent of dir) {
       return;
     }
   })();
 
-  await assert.rejects(async () => dir.read(), dirclosedError);
+  await assert.rejects(dir.read(), dirclosedError);
 }
 doAsyncIterReturnTest().then(common.mustCall());
 
@@ -188,21 +206,21 @@ async function doAsyncIterThrowTest() {
     }
   }
 
-  await assert.rejects(async () => dir.read(), dirclosedError);
+  await assert.rejects(dir.read(), dirclosedError);
 }
 doAsyncIterThrowTest().then(common.mustCall());
 
 // Check error thrown on invalid values of bufferSize
 for (const bufferSize of [-1, 0, 0.5, 1.5, Infinity, NaN]) {
   assert.throws(
-    () => fs.opendirSync(testDir, { bufferSize }),
+    () => fs.opendirSync(testDir, common.mustNotMutateObjectDeep({ bufferSize })),
     {
       code: 'ERR_OUT_OF_RANGE'
     });
 }
 for (const bufferSize of ['', '1', null]) {
   assert.throws(
-    () => fs.opendirSync(testDir, { bufferSize }),
+    () => fs.opendirSync(testDir, common.mustNotMutateObjectDeep({ bufferSize })),
     {
       code: 'ERR_INVALID_ARG_TYPE'
     });
@@ -210,7 +228,7 @@ for (const bufferSize of ['', '1', null]) {
 
 // Check that passing a positive integer as bufferSize works
 {
-  const dir = fs.opendirSync(testDir, { bufferSize: 1024 });
+  const dir = fs.opendirSync(testDir, common.mustNotMutateObjectDeep({ bufferSize: 1024 }));
   assertDirent(dir.readSync());
   dir.close();
 }
@@ -219,14 +237,73 @@ for (const bufferSize of ['', '1', null]) {
 async function doAsyncIterInvalidCallbackTest() {
   const dir = await fs.promises.opendir(testDir);
   assert.throws(() => dir.close('not function'), invalidCallbackObj);
+  dir.close();
 }
 doAsyncIterInvalidCallbackTest().then(common.mustCall());
 
-// Check if directory already closed - throw an exception
+// Check first call to close() - should not report an error.
 async function doAsyncIterDirClosedTest() {
   const dir = await fs.promises.opendir(testDir);
   await dir.close();
-
-  assert.throws(() => dir.close(), dirclosedError);
+  await assert.rejects(() => dir.close(), dirclosedError);
 }
 doAsyncIterDirClosedTest().then(common.mustCall());
+
+// Check that readSync() and closeSync() during read() throw exceptions
+async function doConcurrentAsyncAndSyncOps() {
+  const dir = await fs.promises.opendir(testDir);
+  const promise = dir.read();
+
+  assert.throws(() => dir.closeSync(), dirconcurrentError);
+  assert.throws(() => dir.readSync(), dirconcurrentError);
+
+  await promise;
+  dir.closeSync();
+}
+doConcurrentAsyncAndSyncOps().then(common.mustCall());
+
+// Check read throw exceptions on invalid callback
+{
+  const dir = fs.opendirSync(testDir);
+  assert.throws(() => dir.read('INVALID_CALLBACK'), /ERR_INVALID_ARG_TYPE/);
+  dir.close();
+}
+
+// Check that concurrent read() operations don't do weird things.
+async function doConcurrentAsyncOps() {
+  const dir = await fs.promises.opendir(testDir);
+  const promise1 = dir.read();
+  const promise2 = dir.read();
+
+  assertDirent(await promise1);
+  assertDirent(await promise2);
+  dir.closeSync();
+}
+doConcurrentAsyncOps().then(common.mustCall());
+
+// Check that concurrent read() + close() operations don't do weird things.
+async function doConcurrentAsyncMixedOps() {
+  const dir = await fs.promises.opendir(testDir);
+  const promise1 = dir.read();
+  const promise2 = dir.close();
+
+  assertDirent(await promise1);
+  await promise2;
+}
+doConcurrentAsyncMixedOps().then(common.mustCall());
+
+// Check if directory already closed - the callback should pass an error.
+{
+  const dir = fs.opendirSync(testDir);
+  dir.closeSync();
+  dir.close(common.mustCall((error) => {
+    assert.strictEqual(error.code, dirclosedError.code);
+  }));
+}
+
+// Check if directory already closed - throw an promise exception.
+{
+  const dir = fs.opendirSync(testDir);
+  dir.closeSync();
+  assert.rejects(dir.close(), dirclosedError).then(common.mustCall());
+}

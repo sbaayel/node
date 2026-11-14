@@ -6,8 +6,12 @@
 
 #include <map>
 #include <string>
-#include "include/v8.h"
-#include "src/execution/simulator.h"
+
+#include "include/v8-isolate.h"
+#include "include/v8-local-handle.h"
+#include "include/v8-template.h"
+#include "include/v8-unwinder.h"
+#include "src/api/api.h"
 #include "src/flags/flags.h"
 #include "test/cctest/cctest.h"
 
@@ -16,81 +20,17 @@ namespace {
 class Sample {
  public:
   enum { kFramesLimit = 255 };
+  using DataVector = v8::base::EmbeddedVector<void*, kFramesLimit>;
 
   Sample() = default;
 
-  using const_iterator = const void* const*;
-  const_iterator begin() const { return data_.begin(); }
-  const_iterator end() const { return &data_[data_.length()]; }
-
-  int size() const { return data_.length(); }
-  v8::internal::Vector<void*>& data() { return data_; }
+  const void* operator[](size_t index) const { return data_[index]; }
+  size_t size() const { return data_.size(); }
+  DataVector& data() { return data_; }
 
  private:
-  v8::internal::EmbeddedVector<void*, kFramesLimit> data_;
+  DataVector data_;
 };
-
-
-#if defined(USE_SIMULATOR)
-class SimulatorHelper {
- public:
-  inline bool Init(v8::Isolate* isolate) {
-    simulator_ = reinterpret_cast<v8::internal::Isolate*>(isolate)
-                     ->thread_local_top()
-                     ->simulator_;
-    // Check if there is active simulator.
-    return simulator_ != nullptr;
-  }
-
-  inline void FillRegisters(v8::RegisterState* state) {
-#if V8_TARGET_ARCH_ARM
-    state->pc = reinterpret_cast<void*>(simulator_->get_pc());
-    state->sp = reinterpret_cast<void*>(
-        simulator_->get_register(v8::internal::Simulator::sp));
-    state->fp = reinterpret_cast<void*>(
-        simulator_->get_register(v8::internal::Simulator::r11));
-    state->lr = reinterpret_cast<void*>(
-        simulator_->get_register(v8::internal::Simulator::lr));
-#elif V8_TARGET_ARCH_ARM64
-    if (simulator_->sp() == 0 || simulator_->fp() == 0) {
-      // It's possible that the simulator is interrupted while it is updating
-      // the sp or fp register. ARM64 simulator does this in two steps:
-      // first setting it to zero and then setting it to a new value.
-      // Bailout if sp/fp doesn't contain the new value.
-      return;
-    }
-    state->pc = reinterpret_cast<void*>(simulator_->pc());
-    state->sp = reinterpret_cast<void*>(simulator_->sp());
-    state->fp = reinterpret_cast<void*>(simulator_->fp());
-    state->lr = reinterpret_cast<void*>(simulator_->lr());
-#elif V8_TARGET_ARCH_MIPS || V8_TARGET_ARCH_MIPS64
-    state->pc = reinterpret_cast<void*>(simulator_->get_pc());
-    state->sp = reinterpret_cast<void*>(
-        simulator_->get_register(v8::internal::Simulator::sp));
-    state->fp = reinterpret_cast<void*>(
-        simulator_->get_register(v8::internal::Simulator::fp));
-#elif V8_TARGET_ARCH_PPC || V8_TARGET_ARCH_PPC64
-    state->pc = reinterpret_cast<void*>(simulator_->get_pc());
-    state->sp = reinterpret_cast<void*>(
-        simulator_->get_register(v8::internal::Simulator::sp));
-    state->fp = reinterpret_cast<void*>(
-        simulator_->get_register(v8::internal::Simulator::fp));
-    state->lr = reinterpret_cast<void*>(simulator_->get_lr());
-#elif V8_TARGET_ARCH_S390 || V8_TARGET_ARCH_S390X
-    state->pc = reinterpret_cast<void*>(simulator_->get_pc());
-    state->sp = reinterpret_cast<void*>(
-        simulator_->get_register(v8::internal::Simulator::sp));
-    state->fp = reinterpret_cast<void*>(
-        simulator_->get_register(v8::internal::Simulator::fp));
-    state->lr = reinterpret_cast<void*>(
-        simulator_->get_register(v8::internal::Simulator::ra));
-#endif
-  }
-
- private:
-  v8::internal::Simulator* simulator_;
-};
-#endif  // USE_SIMULATOR
 
 
 class SamplingTestHelper {
@@ -108,10 +48,10 @@ class SamplingTestHelper {
     instance_ = this;
     v8::HandleScope scope(isolate_);
     v8::Local<v8::ObjectTemplate> global = v8::ObjectTemplate::New(isolate_);
-    global->Set(v8_str("CollectSample"),
+    global->Set(isolate_, "CollectSample",
                 v8::FunctionTemplate::New(isolate_, CollectSample));
     LocalContext env(isolate_, nullptr, global);
-    isolate_->SetJitCodeEventHandler(v8::kJitCodeEventDefault,
+    isolate_->SetJitCodeEventHandler(v8::kJitCodeEventEnumExisting,
                                      JitCodeEventHandler);
     CompileRun(v8_str(test_function.c_str()));
   }
@@ -133,7 +73,8 @@ class SamplingTestHelper {
   }
 
  private:
-  static void CollectSample(const v8::FunctionCallbackInfo<v8::Value>& args) {
+  static void CollectSample(const v8::FunctionCallbackInfo<v8::Value>& info) {
+    CHECK(i::ValidateCallbackInfo(info));
     instance_->DoCollectSample();
   }
 
@@ -154,10 +95,10 @@ class SamplingTestHelper {
     state.sp = &state;
 #endif
     v8::SampleInfo info;
-    isolate_->GetStackSample(state, sample_.data().begin(),
-                             static_cast<size_t>(sample_.size()), &info);
+    isolate_->GetStackSample(state, sample_.data().begin(), sample_.size(),
+                             &info);
     size_t frames_count = info.frames_count;
-    CHECK_LE(frames_count, static_cast<size_t>(sample_.size()));
+    CHECK_LE(frames_count, sample_.size());
     sample_.data().Truncate(static_cast<int>(frames_count));
     sample_is_taken_ = true;
   }
@@ -204,7 +145,6 @@ SamplingTestHelper* SamplingTestHelper::instance_;
 
 }  // namespace
 
-
 // A JavaScript function which takes stack depth
 // (minimum value 2) as an argument.
 // When at the bottom of the recursion,
@@ -216,18 +156,43 @@ static const char* test_function =
     "  else return func(depth - 1);"
     "}";
 
-
 TEST(StackDepthIsConsistent) {
   SamplingTestHelper helper(std::string(test_function) + "func(8);");
   CHECK_EQ(8, helper.sample().size());
 }
-
 
 TEST(StackDepthDoesNotExceedMaxValue) {
   SamplingTestHelper helper(std::string(test_function) + "func(300);");
   CHECK_EQ(Sample::kFramesLimit, helper.sample().size());
 }
 
+static const char* test_function_call_builtin =
+    "function func(depth) {"
+    "  if (depth == 2) CollectSample();"
+    "  else return [0].forEach(function recurse() { func(depth - 1) });"
+    "}";
+
+TEST(BuiltinsInSamples) {
+  SamplingTestHelper helper(std::string(test_function_call_builtin) +
+                            "func(10);");
+  Sample& sample = helper.sample();
+  CHECK_EQ(26, sample.size());
+  for (int i = 0; i < 20; i++) {
+    const SamplingTestHelper::CodeEventEntry* entry;
+    entry = helper.FindEventEntry(sample[i]);
+    switch (i % 3) {
+      case 0:
+        CHECK(std::string::npos != entry->name.find("func"));
+        break;
+      case 1:
+        CHECK(std::string::npos != entry->name.find("recurse"));
+        break;
+      case 2:
+        CHECK(std::string::npos != entry->name.find("ArrayForEach"));
+        break;
+    }
+  }
+}
 
 // The captured sample should have three pc values.
 // They should fall in the range where the compiled code resides.
@@ -236,7 +201,7 @@ TEST(StackDepthDoesNotExceedMaxValue) {
 //                              ^      ^       ^
 // sample.stack indices         2      1       0
 TEST(StackFramesConsistent) {
-  i::FLAG_allow_natives_syntax = true;
+  i::v8_flags.allow_natives_syntax = true;
   const char* test_script =
       "function test_sampler_api_inner() {"
       "  CollectSample();"
@@ -254,11 +219,11 @@ TEST(StackFramesConsistent) {
   CHECK_EQ(3, sample.size());
 
   const SamplingTestHelper::CodeEventEntry* entry;
-  entry = helper.FindEventEntry(sample.begin()[0]);
+  entry = helper.FindEventEntry(sample[0]);
   CHECK(entry);
   CHECK(std::string::npos != entry->name.find("test_sampler_api_inner"));
 
-  entry = helper.FindEventEntry(sample.begin()[1]);
+  entry = helper.FindEventEntry(sample[1]);
   CHECK(entry);
   CHECK(std::string::npos != entry->name.find("test_sampler_api_outer"));
 }

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "inspector/network_resource_manager.h"
 #if defined(NODE_WANT_INTERNALS) && NODE_WANT_INTERNALS
 
 #if !HAVE_INSPECTOR
@@ -7,6 +8,7 @@
 #endif
 
 #include "node_options.h"
+#include "uv.h"
 #include "v8.h"
 
 #include <cstddef>
@@ -48,7 +50,7 @@ class Agent {
   // Create client_, may create io_ if option enabled
   bool Start(const std::string& path,
              const DebugOptions& options,
-             std::shared_ptr<HostPort> host_port,
+             std::shared_ptr<ExclusiveAccess<HostPort>> host_port,
              bool is_main);
   // Stop and destroy io_
   void Stop();
@@ -59,14 +61,24 @@ class Agent {
   // --inspect command line flag) or if inspector JS API had been used.
   bool IsActive();
 
-  // Option is set to wait for session connection
-  bool WillWaitForConnect();
   // Blocks till frontend connects and sends "runIfWaitingForDebugger"
   void WaitForConnect();
+  bool WaitForConnectByOptions();
+  void StopIfWaitingForConnect();
+
   // Blocks till all the sessions with "WaitForDisconnectOnShutdown" disconnect
   void WaitForDisconnect();
   void ReportUncaughtException(v8::Local<v8::Value> error,
                                v8::Local<v8::Message> message);
+
+  void EmitProtocolEvent(v8::Local<v8::Context> context,
+                         const v8_inspector::StringView& event,
+                         v8::Local<v8::Object> params);
+
+  void SetupNetworkTracking(v8::Local<v8::Function> enable_function,
+                            v8::Local<v8::Function> disable_function);
+  void EnableNetworkTracking();
+  void DisableNetworkTracking();
 
   // Async stack traces instrumentation.
   void AsyncTaskScheduled(const v8_inspector::StringView& taskName, void* task,
@@ -79,12 +91,12 @@ class Agent {
   void RegisterAsyncHook(v8::Isolate* isolate,
     v8::Local<v8::Function> enable_function,
     v8::Local<v8::Function> disable_function);
-  void EnableAsyncHook();
-  void DisableAsyncHook();
+  void SetAsyncHookTrackingEnabled(bool enabled);
 
   void SetParentHandle(std::unique_ptr<ParentInspectorHandle> parent_handle);
-  std::unique_ptr<ParentInspectorHandle> GetParentHandle(
-      int thread_id, const std::string& url);
+  std::unique_ptr<ParentInspectorHandle> GetParentHandle(uint64_t thread_id,
+                                                         std::string_view url,
+                                                         std::string_view name);
 
   // Called to create inspector sessions that can be used from the same thread.
   // The inspector responds by using the delegate to send messages back.
@@ -106,19 +118,23 @@ class Agent {
   // Can only be called from the main thread.
   bool StartIoThread();
 
-  // Calls StartIoThread() from off the main thread.
+  // Calls StartIoThread() from off the main thread. Only valid while the
+  // Environment owns the inspector and has not started cleanup.
   void RequestIoThreadStart();
 
   const DebugOptions& options() { return debug_options_; }
-  std::shared_ptr<HostPort> host_port() { return host_port_; }
+  std::shared_ptr<ExclusiveAccess<HostPort>> host_port() { return host_port_; }
   void ContextCreated(v8::Local<v8::Context> context, const ContextInfo& info);
 
   // Interface for interacting with inspectors in worker threads
   std::shared_ptr<WorkerManager> GetWorkerManager();
 
+  inline Environment* env() const { return parent_env_; }
+  std::shared_ptr<NetworkResourceManager> GetNetworkResourceManager();
+
  private:
-  void ToggleAsyncHook(v8::Isolate* isolate,
-                       const v8::Global<v8::Function>& fn);
+  void SyncAsyncHookState();
+  void ToggleNetworkTracking(v8::Isolate* isolate, v8::Local<v8::Function> fn);
 
   node::Environment* parent_env_;
   // Encapsulates majority of the Inspector functionality
@@ -133,12 +149,25 @@ class Agent {
   // pointer which is meant to store the actual host and port of the inspector
   // server.
   DebugOptions debug_options_;
-  std::shared_ptr<HostPort> host_port_;
+  std::shared_ptr<ExclusiveAccess<HostPort>> host_port_;
 
-  bool pending_enable_async_hook_ = false;
-  bool pending_disable_async_hook_ = false;
-  v8::Global<v8::Function> enable_async_hook_function_;
-  v8::Global<v8::Function> disable_async_hook_function_;
+  // The state of the async hook used for async stack traces that the protocol
+  // last requested, and the state JS currently has. SyncAsyncHookState()
+  // reconciles the two when it is possible and safe to call into JS.
+  bool async_hook_wanted_ = false;
+  bool async_hook_enabled_ = false;
+  bool syncing_async_hook_state_ = false;
+
+  // Woken by the SIGUSR1 watchdog; closed by the cleanup hook or ~Agent(),
+  // whichever runs first, and freed by its close callback.
+  uv_async_t* start_io_thread_async_ = nullptr;
+  void StopAcceptingIoThreadStarts();
+  static void StopAcceptingIoThreadStartsHook(void* agent);
+
+  bool network_tracking_enabled_ = false;
+  bool pending_enable_network_tracking = false;
+  bool pending_disable_network_tracking = false;
+  std::shared_ptr<NetworkResourceManager> network_resource_manager_;
 };
 
 }  // namespace inspector

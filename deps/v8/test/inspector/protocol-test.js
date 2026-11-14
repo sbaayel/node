@@ -36,7 +36,8 @@ InspectorTest.logMessage = function(originalMessage) {
   const nonStableFields = new Set([
     'objectId', 'scriptId', 'exceptionId', 'timestamp', 'executionContextId',
     'callFrameId', 'breakpointId', 'bindRemoteObjectFunctionId',
-    'formatterObjectId', 'debuggerId', 'bodyGetterId'
+    'formatterObjectId', 'debuggerId', 'bodyGetterId', 'uniqueId',
+    'executionContextUniqueId'
   ]);
   const message = JSON.parse(JSON.stringify(originalMessage, replacer.bind(null, Symbol(), nonStableFields)));
   if (message.id)
@@ -105,9 +106,51 @@ InspectorTest.logObject = function(object, title) {
   InspectorTest.log(lines.join("\n"));
 }
 
+InspectorTest.decodeBase64 = function(base64) {
+  const LOOKUP = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+
+  const paddingLength = base64.match(/=*$/)[0].length;
+  const bytesLength = base64.length * 0.75 - paddingLength;
+
+  let bytes = new Uint8Array(bytesLength);
+
+  for (let i = 0, p = 0; i < base64.length; i += 4, p += 3) {
+    let bits = 0;
+    for (let j = 0; j < 4; j++) {
+      bits <<= 6;
+      const c = base64[i + j];
+      if (c !== '=') bits |= LOOKUP.indexOf(c);
+    }
+    for (let j = p + 2; j >= p; j--) {
+      if (j < bytesLength) bytes[j] = bits;
+      bits >>= 8;
+    }
+  }
+
+  return bytes;
+}
+
+InspectorTest.trimErrorMessage = function(message) {
+  if (!message.error || !message.error.data)
+    return message;
+  message.error.data = message.error.data.replace(/at position \d+/,
+                                                  'at <some position>');
+  return message;
+}
+
 InspectorTest.ContextGroup = class {
   constructor() {
     this.id = utils.createContextGroup();
+  }
+
+  waitForDebugger() {
+    return new Promise(resolve => {
+      utils.waitForDebugger(this.id, resolve);
+    });
+  }
+
+  createContext(name) {
+    utils.createContext(this.id, name || '');
   }
 
   schedulePauseOnNextStatement(reason, details) {
@@ -119,7 +162,7 @@ InspectorTest.ContextGroup = class {
   }
 
   addScript(string, lineOffset, columnOffset, url) {
-    utils.compileAndRunWithOrigin(this.id, string, url || '', lineOffset || 0, columnOffset || 0, false);
+    utils.compileAndRunWithOrigin(this.id, string, url || '', lineOffset || 0, columnOffset || 0, false, true);
   }
 
   addInlineScript(string, url) {
@@ -129,15 +172,21 @@ InspectorTest.ContextGroup = class {
   }
 
   addModule(string, url, lineOffset, columnOffset) {
-    utils.compileAndRunWithOrigin(this.id, string, url, lineOffset || 0, columnOffset || 0, true);
+    utils.compileAndRunWithOrigin(this.id, string, url, lineOffset || 0, columnOffset || 0, true, true);
+  }
+
+  // Registers a module so that it can be resolved as a dependency, but leaves
+  // it unevaluated. Used to set up the target of an `import defer`.
+  addModuleWithoutEvaluating(string, url, lineOffset, columnOffset) {
+    utils.compileAndRunWithOrigin(this.id, string, url, lineOffset || 0, columnOffset || 0, true, false);
   }
 
   loadScript(fileName) {
     this.addScript(utils.read(fileName));
   }
 
-  connect() {
-    return new InspectorTest.Session(this);
+  connect(isFullyTrusted = true) {
+    return new InspectorTest.Session(this, Boolean(isFullyTrusted));
   }
 
   reset() {
@@ -152,7 +201,7 @@ InspectorTest.ContextGroup = class {
         "PropertyDescriptor","object","get","set","value","configurable",
         "enumerable","symbol","getPrototypeOf","nativeAccessorDescriptor",
         "isBuiltin","hasGetter","hasSetter","getOwnPropertyDescriptor",
-        "description","formatAccessorsAsProperties","isOwn","name",
+        "description","isOwn","name",
         "typedArrayProperties","keys","getOwnPropertyNames",
         "getOwnPropertySymbols","isPrimitiveValue","com","toLowerCase",
         "ELEMENT","trim","replace","DOCUMENT","size","byteLength","toString",
@@ -191,14 +240,16 @@ InspectorTest.ContextGroup = class {
 };
 
 InspectorTest.Session = class {
-  constructor(contextGroup) {
+  constructor(contextGroup, isFullyTrusted, embedderState) {
     this.contextGroup = contextGroup;
     this._dispatchTable = new Map();
     this._eventHandlers = new Map();
     this._requestId = 0;
+    this._isFullyTrusted = isFullyTrusted;
+    this._embedderState = embedderState;
     this.Protocol = this._setupProtocol();
     InspectorTest._sessions.add(this);
-    this.id = utils.connectSession(contextGroup.id, '', this._dispatchMessage.bind(this));
+    this.id = utils.connectSession(contextGroup.id, '', this._dispatchMessage.bind(this), isFullyTrusted, embedderState);
   }
 
   disconnect() {
@@ -208,7 +259,7 @@ InspectorTest.Session = class {
 
   reconnect() {
     var state = utils.disconnectSession(this.id);
-    this.id = utils.connectSession(this.contextGroup.id, state, this._dispatchMessage.bind(this));
+    this.id = utils.connectSession(this.contextGroup.id, state, this._dispatchMessage.bind(this), this._isFullyTrusted, this._embedderState);
   }
 
   async addInspectedObject(serializable) {
@@ -222,38 +273,64 @@ InspectorTest.Session = class {
     utils.sendMessageToBackend(this.id, command);
   }
 
+  stop() {
+    utils.stop(this.id);
+  }
+
   setupScriptMap() {
     if (this._scriptMap)
       return;
     this._scriptMap = new Map();
   }
 
+  getCallFrameUrl(frame) {
+    const {scriptId} = frame.location ? frame.location : frame;
+    return (this._scriptMap.get(scriptId) ?? frame).url;
+  }
+
   logCallFrames(callFrames) {
     for (var frame of callFrames) {
       var functionName = frame.functionName || '(anonymous)';
-      var scriptId = frame.location ? frame.location.scriptId : frame.scriptId;
-      var url = frame.url ? frame.url : this._scriptMap.get(scriptId).url;
+      var url = this.getCallFrameUrl(frame);
       var lineNumber = frame.location ? frame.location.lineNumber : frame.lineNumber;
       var columnNumber = frame.location ? frame.location.columnNumber : frame.columnNumber;
       InspectorTest.log(`${functionName} (${url}:${lineNumber}:${columnNumber})`);
     }
   }
 
-  logSourceLocation(location, forceSourceRequest) {
+  async getScriptWithSource(scriptId, forceSourceRequest) {
+    var script = this._scriptMap.get(scriptId);
+    if (forceSourceRequest || !(script.scriptSource || script.bytecode)) {
+      var message = await this.Protocol.Debugger.getScriptSource({ scriptId });
+      script.scriptSource = message.result.scriptSource;
+      if (message.result.bytecode) {
+        script.bytecode = InspectorTest.decodeBase64(message.result.bytecode);
+      }
+    }
+    return script;
+  }
+
+  async logSourceLocation(location, forceSourceRequest) {
     var scriptId = location.scriptId;
     if (!this._scriptMap || !this._scriptMap.has(scriptId)) {
       InspectorTest.log("setupScriptMap should be called before Protocol.Debugger.enable.");
       InspectorTest.completeTest();
     }
-    var script = this._scriptMap.get(scriptId);
-    if (!script.scriptSource || forceSourceRequest) {
-      return this.Protocol.Debugger.getScriptSource({ scriptId })
-          .then(message => script.scriptSource = message.result.scriptSource)
-          .then(dumpSourceWithLocation);
-    }
-    return Promise.resolve().then(dumpSourceWithLocation);
+    var script = await this.getScriptWithSource(scriptId, forceSourceRequest);
 
-    function dumpSourceWithLocation() {
+    if (script.bytecode) {
+      if (location.lineNumber != 0) {
+        InspectorTest.log('Unexpected wasm line number: ' + location.lineNumber);
+      }
+      let wasm_opcode = script.bytecode[location.columnNumber];
+      let opcode_str = wasm_opcode.toString(16);
+      if (opcode_str.length % 2) opcode_str = `0${opcode_str}`;
+      if (InspectorTest.getWasmOpcodeName) {
+        opcode_str += ` (${InspectorTest.getWasmOpcodeName(wasm_opcode)})`;
+      }
+      InspectorTest.log(`Script ${script.url} byte offset ${
+          location.columnNumber}: Wasm opcode 0x${opcode_str}`);
+    } else {
       var lines = script.scriptSource.split('\n');
       var line = lines[location.lineNumber];
       line = line.slice(0, location.columnNumber) + '#' + (line.slice(location.columnNumber) || '');
@@ -272,11 +349,7 @@ InspectorTest.Session = class {
   async logBreakLocations(inputLocations) {
     let locations = inputLocations.slice();
     let scriptId = locations[0].scriptId;
-    let script = this._scriptMap.get(scriptId);
-    if (!script.scriptSource) {
-      let message = await this.Protocol.Debugger.getScriptSource({scriptId});
-      script.scriptSource = message.result.scriptSource;
-    }
+    let script = await this.getScriptWithSource(scriptId);
     let lines = script.scriptSource.split('\n');
     locations = locations.sort((loc1, loc2) => {
       if (loc2.lineNumber !== loc1.lineNumber) return loc2.lineNumber - loc1.lineNumber;
@@ -358,6 +431,12 @@ InspectorTest.Session = class {
     var messageObject = JSON.parse(messageString);
     if (InspectorTest._dumpInspectorProtocolMessages)
       utils.print("backend: " + JSON.stringify(messageObject));
+    const kMethodNotFound = -32601;
+    if (messageObject.error && messageObject.error.code === kMethodNotFound) {
+      InspectorTest.log(`Error: Called non-existent method. ${
+          messageObject.error.message} code: ${messageObject.error.code}`);
+      InspectorTest.completeTest();
+    }
     try {
       var messageId = messageObject["id"];
       if (typeof messageId === "number") {
@@ -419,7 +498,7 @@ InspectorTest.runAsyncTestSuite = async function(testSuite) {
     try {
       await test();
     } catch (e) {
-      utils.print(e.stack);
+      utils.print(e.stack || "Caught error without stack trace!");
     }
   }
   InspectorTest.completeTest();
@@ -435,3 +514,49 @@ InspectorTest.start = function(description) {
     utils.print(e.stack);
   }
 }
+
+/**
+ * Two helper functions for the tests in `debugger/restart-frame/*`.
+ */
+
+InspectorTest.evaluateAndWaitForPause = async (expression) => {
+  const pausedPromise = Protocol.Debugger.oncePaused();
+  const evaluatePromise = Protocol.Runtime.evaluate({ expression });
+
+  const { params: { callFrames } } = await pausedPromise;
+  InspectorTest.log('Paused at (after evaluation):');
+  await session.logSourceLocation(callFrames[0].location);
+
+  // Ignore the last frame, it's always an anonymous empty frame for the
+  // Runtime#evaluate call.
+  InspectorTest.log('Pause stack:');
+  for (const frame of callFrames.slice(0, -1)) {
+    InspectorTest.log(`  ${frame.functionName}:${frame.location.lineNumber} (canBeRestarted = ${frame.canBeRestarted ?? false})`);
+  }
+  InspectorTest.log('');
+
+  return { callFrames, evaluatePromise };
+};
+
+// TODO(crbug.com/1303521): Remove `quitOnFailure` once no longer needed.
+InspectorTest.restartFrameAndWaitForPause = async (callFrames, index, quitOnFailure = true) => {
+  const pausedPromise = Protocol.Debugger.oncePaused();
+  const frame = callFrames[index];
+
+  InspectorTest.log(`Restarting function "${frame.functionName}" ...`);
+  const response = await Protocol.Debugger.restartFrame({ callFrameId: frame.callFrameId, mode: 'StepInto' });
+  if (response.error) {
+    InspectorTest.log(`Failed to restart function "${frame.functionName}":`);
+    InspectorTest.logMessage(response.error);
+    if (quitOnFailure) {
+      InspectorTest.completeTest();
+    }
+    return;
+  }
+
+  const { params: { callFrames: pausedCallFrames } } = await pausedPromise;
+  InspectorTest.log('Paused at (after restart):');
+  await session.logSourceLocation(pausedCallFrames[0].location);
+
+  return callFrames;
+};

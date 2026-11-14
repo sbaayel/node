@@ -1,7 +1,12 @@
 'use strict';
 const common = require('../common');
+
+if (common.isWindows) {
+  // https://github.com/nodejs/node/issues/48300
+  common.skip('Does not work with cygwin quirks on Windows');
+}
+
 const assert = require('assert');
-const path = require('path');
 const fs = require('fs');
 const spawn = require('child_process').spawn;
 const tmpdir = require('../common/tmpdir');
@@ -18,15 +23,16 @@ const MB = KB * KB;
 
 {
   tmpdir.refresh();
-  const file = path.resolve(tmpdir.path, 'data.txt');
+  const file = tmpdir.resolve('data.txt');
   const buf = Buffer.alloc(MB).fill('x');
 
-  // Most OS commands that deal with data, attach special
-  // meanings to new line - for example, line buffering.
-  // So cut the buffer into lines at some points, forcing
-  // data flow to be split in the stream.
-  for (let i = 0; i < KB; i++)
-    buf[i * KB] = 10;
+  // Most OS commands that deal with data, attach special meanings to new line -
+  // for example, line buffering. So cut the buffer into lines at some points,
+  // forcing data flow to be split in the stream. Do not use os.EOL for \n as
+  // that is 2 characters on Windows and is sometimes converted to 1 character
+  // which causes the test to fail.
+  for (let i = 1; i < KB; i++)
+    buf.write('\n', i * KB);
   fs.writeFileSync(file, buf.toString());
 
   cat = spawn('cat', [file]);
@@ -60,7 +66,13 @@ const MB = KB * KB;
     }));
   });
 
+  let wcBuf = '';
   wc.stdout.on('data', common.mustCall((data) => {
-    assert.strictEqual(data.toString().trim(), MB.toString());
+    wcBuf += data;
   }));
+
+  process.on('exit', () => {
+    // Grep always adds one extra byte at the end.
+    assert.strictEqual(wcBuf.trim(), (MB + 1).toString());
+  });
 }

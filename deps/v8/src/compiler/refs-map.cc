@@ -4,6 +4,8 @@
 
 #include "src/compiler/refs-map.h"
 
+#include "src/base/hashing.h"
+
 namespace v8 {
 namespace internal {
 namespace compiler {
@@ -22,13 +24,21 @@ RefsMap::Entry* RefsMap::Lookup(const Address& key) const {
   return UnderlyingMap::Lookup(key, Hash(key));
 }
 
-RefsMap::Entry* RefsMap::LookupOrInsert(const Address& key, Zone* zone) {
-  return UnderlyingMap::LookupOrInsert(key, RefsMap::Hash(key),
-                                       []() { return nullptr; },
-                                       ZoneAllocationPolicy(zone));
+RefsMap::Entry* RefsMap::InsertNew(const Address& key) {
+  return UnderlyingMap::InsertNew(key, RefsMap::Hash(key));
 }
 
-uint32_t RefsMap::Hash(Address addr) { return static_cast<uint32_t>(addr); }
+ObjectData* RefsMap::Remove(const Address& key) {
+  return UnderlyingMap::Remove(key, RefsMap::Hash(key));
+}
+
+uint32_t RefsMap::Hash(Address addr) {
+  // Don't use a plain cast: keys are handle locations, which are
+  // pointer-aligned and consecutive within a handle block, so they would
+  // fill every eighth bucket in a contiguous run and linear probing would
+  // degrade to a scan.
+  return static_cast<uint32_t>(base::hash64(addr));
+}
 
 }  // namespace compiler
 }  // namespace internal

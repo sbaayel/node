@@ -10,10 +10,12 @@ process.env.PIPE_NAME = PIPE;
 
 tmpdir.refresh();
 
-const server = http.createServer((req, res) => {
+// For Node.js versions below v13.3.0 this benchmark will require
+// the flag --max-http-header-size 64000 in order to work properly
+const server = http.createServer({ maxHeaderSize: 64000 }, (req, res) => {
   const headers = {
     'content-type': 'text/plain',
-    'content-length': '2'
+    'content-length': '2',
   };
   res.writeHead(200, headers);
   res.end('ok');
@@ -26,9 +28,13 @@ server.listen(PIPE);
 
 const child = fork(
   `${__dirname}/_chunky_http_client.js`,
-  process.argv.slice(2)
+  process.argv.slice(2),
 );
-child.on('message', common.sendResult);
+child.on('message', (data) => {
+  if (data.type === 'report') {
+    common.sendResult(data);
+  }
+});
 child.on('close', (code) => {
   server.close();
   assert.strictEqual(code, 0);

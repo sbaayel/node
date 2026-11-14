@@ -2,9 +2,12 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-// Flags: --allow-natives-syntax --liftoff --no-future --no-wasm-tier-up
+// Flags: --allow-natives-syntax --liftoff --no-wasm-tier-up
+// In this test we are interested in the generated code, so force code
+// generation by disabling lazy compilation.
+// Flags: --no-wasm-lazy-compilation
 
-load('test/mjsunit/wasm/wasm-module-builder.js');
+d8.file.execute('test/mjsunit/wasm/wasm-module-builder.js');
 
 (function testLiftoffFlag() {
   print(arguments.callee.name);

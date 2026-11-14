@@ -26,7 +26,6 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-#include <assert.h>
 #include <errno.h>
 
 #include <sys/types.h>
@@ -58,6 +57,9 @@
 #include <as400_protos.h>
 #include <as400_types.h>
 
+char* original_exepath = NULL;
+uv_mutex_t process_title_mutex;
+uv_once_t process_title_mutex_once = UV_ONCE_INIT;
 
 typedef struct {
   int bytes_available;
@@ -163,7 +165,7 @@ static void iconv_a2e(const char* src, unsigned char dst[], size_t length) {
 
   srclen = strlen(src);
   if (srclen > length)
-    abort();
+    srclen = length;
   for (i = 0; i < srclen; i++)
     dst[i] = a2e[src[i]];
   /* padding the remaining part with spaces */
@@ -171,6 +173,9 @@ static void iconv_a2e(const char* src, unsigned char dst[], size_t length) {
     dst[i] = a2e[' '];
 }
 
+void init_process_title_mutex_once(void) {
+  uv_mutex_init(&process_title_mutex);
+}
 
 static int get_ibmi_system_status(SSTS0200* rcvr) {
   /* rcvrlen is input parameter 2 to QWCRSSTS */
@@ -225,22 +230,7 @@ uint64_t uv_get_free_memory(void) {
   if (get_ibmi_system_status(&rcvr))
     return 0;
 
-  /* The amount of main storage, in kilobytes, in the system. */
-  uint64_t main_storage_size = rcvr.main_storage_size;
-
-  /* The current amount of storage in use for temporary objects.
-   * in millions (M) of bytes.
-   */
-  uint64_t current_unprotected_storage_used =
-    rcvr.current_unprotected_storage_used * 1024ULL;
-
-  /* Current unprotected storage includes the storage used for memory
-   * and disks so it is possible to exceed the amount of main storage.
-   */
-  if (main_storage_size <= current_unprotected_storage_used)
-    return 0ULL;
-
-  return (main_storage_size - current_unprotected_storage_used) * 1024ULL;
+  return (uint64_t)rcvr.main_storage_size * 1024ULL;
 }
 
 
@@ -255,7 +245,12 @@ uint64_t uv_get_total_memory(void) {
 
 
 uint64_t uv_get_constrained_memory(void) {
-  return 0;  /* Memory constraints are unknown. */
+  return uv__get_rlimit_max_memory();
+}
+
+
+uint64_t uv_get_available_memory(void) {
+  return uv_get_free_memory();
 }
 
 
@@ -369,6 +364,10 @@ static int get_ibmi_physical_address(const char* line, char (*phys_addr)[6]) {
   if (rc != 0)
     return rc;
 
+  if (err.bytes_available > 0) {
+    return -1;
+  }
+
   /* convert ebcdic loca_adapter_address to ascii first */
   iconv_e2a(rcvr.loca_adapter_address, mac_addr,
             sizeof(rcvr.loca_adapter_address));
@@ -395,6 +394,8 @@ static int get_ibmi_physical_address(const char* line, char (*phys_addr)[6]) {
 int uv_interface_addresses(uv_interface_address_t** addresses, int* count) {
   uv_interface_address_t* address;
   struct ifaddrs_pase *ifap = NULL, *cur;
+  size_t namelen;
+  char* name;
   int inet6, r = 0;
 
   *count = 0;
@@ -404,6 +405,7 @@ int uv_interface_addresses(uv_interface_address_t** addresses, int* count) {
     return UV_ENOSYS;
 
   /* The first loop to get the size of the array to be allocated */
+  namelen = 0;
   for (cur = ifap; cur; cur = cur->ifa_next) {
     if (!(cur->ifa_addr->sa_family == AF_INET6 ||
           cur->ifa_addr->sa_family == AF_INET))
@@ -412,6 +414,7 @@ int uv_interface_addresses(uv_interface_address_t** addresses, int* count) {
     if (!(cur->ifa_flags & IFF_UP && cur->ifa_flags & IFF_RUNNING))
       continue;
 
+    namelen += strlen(cur->ifa_name) + 1;
     (*count)++;
   }
 
@@ -421,11 +424,13 @@ int uv_interface_addresses(uv_interface_address_t** addresses, int* count) {
   }
 
   /* Alloc the return interface structs */
-  *addresses = uv__calloc(*count, sizeof(**addresses));
+  *addresses = uv__calloc(1, *count * sizeof(**addresses) + namelen);
   if (*addresses == NULL) {
     Qp2freeifaddrs(ifap);
     return UV_ENOMEM;
   }
+
+  name = (char*) &(*addresses)[*count];
   address = *addresses;
 
   /* The second loop to fill in the array */
@@ -437,7 +442,9 @@ int uv_interface_addresses(uv_interface_address_t** addresses, int* count) {
     if (!(cur->ifa_flags & IFF_UP && cur->ifa_flags & IFF_RUNNING))
       continue;
 
-    address->name = uv__strdup(cur->ifa_name);
+    namelen = strlen(cur->ifa_name) + 1;
+    address->name = memcpy(name, cur->ifa_name, namelen);
+    name += namelen;
 
     inet6 = (cur->ifa_addr->sa_family == AF_INET6);
 
@@ -452,9 +459,42 @@ int uv_interface_addresses(uv_interface_address_t** addresses, int* count) {
     }
     address->is_internal = cur->ifa_flags & IFF_LOOPBACK ? 1 : 0;
     if (!address->is_internal) {
-      int rc = get_ibmi_physical_address(address->name, &address->phys_addr);
-      if (rc != 0)
-        r = rc;
+      int rc = -1;
+      size_t name_len = strlen(address->name);
+      /* To get the associated MAC address, we must convert the address to a
+       * line description. Normally, the name field contains the line
+       * description name, but for VLANs it has the VLAN appended with a
+       * period. Since object names can also contain periods and numbers, there
+       * is no way to know if a returned name is for a VLAN or not. eg.
+       * *LIND ETH1.1 and *LIND ETH1, VLAN 1 both have the same name: ETH1.1
+       *
+       * Instead, we apply the same heuristic used by some of the XPF ioctls:
+       * - names > 10 *must* contain a VLAN
+       * - assume names <= 10 do not contain a VLAN and try directly
+       * - if >10 or QDCRLIND returned an error, try to strip off a VLAN
+       *   and try again
+       * - if we still get an error or couldn't find a period, leave the MAC as
+       *   00:00:00:00:00:00
+       */
+      if (name_len <= 10) {
+        /* Assume name does not contain a VLAN ID */
+        rc = get_ibmi_physical_address(address->name, &address->phys_addr);
+      }
+
+      if (name_len > 10 || rc != 0) {
+        /* The interface name must contain a VLAN ID suffix. Attempt to strip
+         * it off so we can get the line description to pass to QDCRLIND.
+         */
+        char* temp_name = uv__strdup(address->name);
+        char* dot = strrchr(temp_name, '.');
+        if (dot != NULL) {
+          *dot = '\0';
+          if (strlen(temp_name) <= 10) {
+            rc = get_ibmi_physical_address(temp_name, &address->phys_addr);
+          }
+        }
+        uv__free(temp_name);
+      }
     }
 
     address++;
@@ -465,12 +505,42 @@ int uv_interface_addresses(uv_interface_address_t** addresses, int* count) {
 }
 
 
-void uv_free_interface_addresses(uv_interface_address_t* addresses, int count) {
-  int i;
+char** uv_setup_args(int argc, char** argv) {
+  char exepath[UV__PATH_MAX];
+  char* s;
+  size_t size;
 
-  for (i = 0; i < count; ++i) {
-    uv__free(addresses[i].name);
+  if (argc > 0) {
+    /* Use argv[0] to determine value for uv_exepath(). */
+    size = sizeof(exepath);
+    if (uv__search_path(argv[0], exepath, &size) == 0) {
+      uv_once(&process_title_mutex_once, init_process_title_mutex_once);
+      uv_mutex_lock(&process_title_mutex);
+      original_exepath = uv__strdup(exepath);
+      uv_mutex_unlock(&process_title_mutex);
+    }
   }
 
-  uv__free(addresses);
+  return argv;
+}
+
+int uv_set_process_title(const char* title) {
+  return 0;
+}
+
+int uv_get_process_title(char* buffer, size_t size) {
+  if (buffer == NULL || size == 0)
+    return UV_EINVAL;
+
+  buffer[0] = '\0';
+  return 0;
+}
+
+void uv__process_title_cleanup(void) {
+}
+
+void uv__ahafs_event(uv_loop_t* loop,
+                     uv__io_t* event_watch,
+                     unsigned int fflags) {
+  /* Stub function to satisfy the linker. */
 }

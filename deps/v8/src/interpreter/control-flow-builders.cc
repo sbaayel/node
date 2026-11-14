@@ -41,12 +41,15 @@ void BreakableControlFlowBuilder::EmitJumpIfUndefined(BytecodeLabels* sites) {
   builder()->JumpIfUndefined(sites->New());
 }
 
-void BreakableControlFlowBuilder::EmitJumpIfNull(BytecodeLabels* sites) {
-  builder()->JumpIfNull(sites->New());
+void BreakableControlFlowBuilder::EmitJumpIfForInDone(BytecodeLabels* sites,
+                                                      Register index,
+                                                      Register cache_length) {
+  builder()->JumpIfForInDone(sites->New(), index, cache_length);
 }
 
 LoopBuilder::~LoopBuilder() {
   DCHECK(continue_labels_.empty() || continue_labels_.is_bound());
+  DCHECK(end_labels_.empty() || end_labels_.is_bound());
 }
 
 void LoopBuilder::LoopHeader() {
@@ -54,7 +57,8 @@ void LoopBuilder::LoopHeader() {
   // requirements of bytecode basic blocks. The only entry into a loop
   // must be the loop header. Surely breaks is okay? Not if nested
   // and misplaced between the headers.
-  DCHECK(break_labels_.empty() && continue_labels_.empty());
+  DCHECK(break_labels_.empty() && continue_labels_.empty() &&
+         end_labels_.empty());
   builder()->Bind(&loop_header_);
 }
 
@@ -64,16 +68,33 @@ void LoopBuilder::LoopBody() {
   }
 }
 
-void LoopBuilder::JumpToHeader(int loop_depth) {
-  // Pass the proper loop nesting level to the backwards branch, to trigger
-  // on-stack replacement when armed for the given loop nesting depth.
-  int level = Min(loop_depth, AbstractCode::kMaxLoopNestingMarker - 1);
-  // Loop must have closed form, i.e. all loop elements are within the loop,
-  // the loop header precedes the body and next elements in the loop.
-  builder()->JumpLoop(&loop_header_, level);
+void LoopBuilder::JumpToHeader(int loop_depth, LoopBuilder* const parent_loop) {
+  BindLoopEnd();
+  if (parent_loop &&
+      loop_header_.offset() == parent_loop->loop_header_.offset()) {
+    // TurboFan can't cope with multiple loops that have the same loop header
+    // bytecode offset. If we have an inner loop with the same header offset
+    // than its parent loop, we do not create a JumpLoop bytecode. Instead, we
+    // Jump to our parent's JumpToHeader which in turn can be a JumpLoop or, iff
+    // they are a nested inner loop too, a Jump to its parent's JumpToHeader.
+    parent_loop->JumpToLoopEnd();
+  } else {
+    // Pass the proper loop depth to the backwards branch for triggering OSR.
+    // For purposes of OSR, the loop depth is capped at `kMaxOsrUrgency - 1`.
+    // Once that urgency is reached, all loops become OSR candidates.
+    //
+    // The loop must have closed form, i.e. all loop elements are within the
+    // loop, the loop header precedes the body and next elements in the loop.
+    int slot_index = feedback_vector_spec_->AddJumpLoopSlot().ToInt();
+    builder()->JumpLoop(
+        &loop_header_, std::min(loop_depth, FeedbackVector::kMaxOsrUrgency - 1),
+        source_position_, slot_index);
+  }
 }
 
 void LoopBuilder::BindContinueTarget() { continue_labels_.Bind(builder()); }
+
+void LoopBuilder::BindLoopEnd() { end_labels_.Bind(builder()); }
 
 SwitchBuilder::~SwitchBuilder() {
 #ifdef DEBUG
@@ -83,13 +104,49 @@ SwitchBuilder::~SwitchBuilder() {
 #endif
 }
 
-void SwitchBuilder::SetCaseTarget(int index, CaseClause* clause) {
-  BytecodeLabel& site = case_sites_.at(index);
-  builder()->Bind(&site);
-  if (block_coverage_builder_) {
-    block_coverage_builder_->IncrementBlockCounter(clause,
-                                                   SourceRangeKind::kBody);
+void SwitchBuilder::BindCaseTargetForJumpTable(int case_value,
+                                               CaseClause* clause) {
+  builder()->Bind(jump_table_, case_value);
+  BuildBlockCoverage(clause);
+}
+
+void SwitchBuilder::BindCaseTargetForCompareJump(int index,
+                                                 CaseClause* clause) {
+  builder()->Bind(&case_sites_.at(index));
+  BuildBlockCoverage(clause);
+}
+
+void SwitchBuilder::JumpToCaseIfTrue(BytecodeArrayBuilder::ToBooleanMode mode,
+                                     int index) {
+  builder()->JumpIfTrue(mode, &case_sites_.at(index));
+}
+
+// Precondition: tag is in the accumulator
+void SwitchBuilder::EmitJumpTableIfExists(
+    int min_case, int max_case, std::map<int, CaseClause*>& covered_cases) {
+  builder()->SwitchOnSmiNoFeedback(jump_table_);
+  fall_through_.Bind(builder());
+  // Bind any uncovered cases.
+  for (int j = min_case;; ++j) {
+    if (!covered_cases.contains(j)) {
+      this->BindCaseTargetForJumpTable(j, nullptr);
+    }
+    // Check for the exit condition here rather than the for in case
+    // `max_case == INT_MAX` and we can't go above it.
+    if (j >= max_case) break;
   }
+}
+
+void SwitchBuilder::BindDefault(CaseClause* clause) {
+  default_.Bind(builder());
+  BuildBlockCoverage(clause);
+}
+
+void SwitchBuilder::JumpToDefault() { this->EmitJump(&default_); }
+
+void SwitchBuilder::JumpToFallThroughIfFalse() {
+  this->EmitJumpIfFalse(BytecodeArrayBuilder::ToBooleanMode::kAlreadyBoolean,
+                        &fall_through_);
 }
 
 TryCatchBuilder::~TryCatchBuilder() {
@@ -103,15 +160,21 @@ void TryCatchBuilder::BeginTry(Register context) {
   builder()->MarkTryBegin(handler_id_, context);
 }
 
-
-void TryCatchBuilder::EndTry() {
+void TryCatchBuilder::EndTry(bool emit_catch) {
   builder()->MarkTryEnd(handler_id_);
-  builder()->Jump(&exit_);
-  builder()->MarkHandler(handler_id_, catch_prediction_);
-
-  if (block_coverage_builder_ != nullptr) {
-    block_coverage_builder_->IncrementBlockCounter(statement_,
-                                                   SourceRangeKind::kCatch);
+  if (emit_catch) {
+    builder()->Jump(&exit_);
+    builder()->MarkHandler(handler_id_, catch_prediction_);
+    if (block_coverage_builder_ != nullptr) {
+      block_coverage_builder_->IncrementBlockCounter(statement_,
+                                                     SourceRangeKind::kCatch);
+    }
+  } else {
+    builder()->DropHandlerEntry(handler_id_);
+    if (block_coverage_builder_ != nullptr) {
+      block_coverage_builder_->AllocateBlockCoverageSlot(
+          statement_, SourceRangeKind::kCatch);
+    }
   }
 }
 
@@ -155,6 +218,43 @@ void TryFinallyBuilder::BeginFinally() {
 
 void TryFinallyBuilder::EndFinally() {
   // Nothing to be done here.
+}
+
+ConditionalChainControlFlowBuilder::~ConditionalChainControlFlowBuilder() {
+  end_labels_.Bind(builder());
+#ifdef DEBUG
+  DCHECK(end_labels_.empty() || end_labels_.is_bound());
+
+  for (auto* label : then_labels_list_) {
+    DCHECK(label->empty() || label->is_bound());
+  }
+
+  for (auto* label : else_labels_list_) {
+    DCHECK(label->empty() || label->is_bound());
+  }
+#endif
+}
+
+void ConditionalChainControlFlowBuilder::JumpToEnd() {
+  builder()->Jump(end_labels_.New());
+}
+
+void ConditionalChainControlFlowBuilder::ThenAt(size_t index) {
+  DCHECK_LT(index, then_labels_list_.length());
+  then_labels_at(index)->Bind(builder());
+  if (block_coverage_builder_) {
+    block_coverage_builder_->IncrementBlockCounter(
+        block_coverage_then_slot_at(index));
+  }
+}
+
+void ConditionalChainControlFlowBuilder::ElseAt(size_t index) {
+  DCHECK_LT(index, else_labels_list_.length());
+  else_labels_at(index)->Bind(builder());
+  if (block_coverage_builder_) {
+    block_coverage_builder_->IncrementBlockCounter(
+        block_coverage_else_slot_at(index));
+  }
 }
 
 ConditionalControlFlowBuilder::~ConditionalControlFlowBuilder() {

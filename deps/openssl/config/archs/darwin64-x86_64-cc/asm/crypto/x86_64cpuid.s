@@ -1,18 +1,20 @@
 
+
 .private_extern	_OPENSSL_cpuid_setup
 .mod_init_func
 	.p2align	3
 	.quad	_OPENSSL_cpuid_setup
 
 .private_extern	_OPENSSL_ia32cap_P
-.comm	_OPENSSL_ia32cap_P,16,2
-
+.comm	_OPENSSL_ia32cap_P,40,2
 .text	
 
 .globl	_OPENSSL_atomic_add
 
 .p2align	4
 _OPENSSL_atomic_add:
+
+.byte	243,15,30,250
 	movl	(%rdi),%eax
 L$spin:	leaq	(%rsi,%rax,1),%r8
 .byte	0xf0
@@ -23,14 +25,18 @@ L$spin:	leaq	(%rsi,%rax,1),%r8
 	.byte	0xf3,0xc3
 
 
+
 .globl	_OPENSSL_rdtsc
 
 .p2align	4
 _OPENSSL_rdtsc:
+
+.byte	243,15,30,250
 	rdtsc
 	shlq	$32,%rdx
 	orq	%rdx,%rax
 	.byte	0xf3,0xc3
+
 
 
 .globl	_OPENSSL_ia32_cpuid
@@ -38,6 +44,7 @@ _OPENSSL_rdtsc:
 .p2align	4
 _OPENSSL_ia32_cpuid:
 
+.byte	243,15,30,250
 	movq	%rbx,%r8
 
 
@@ -157,6 +164,7 @@ L$generic:
 	movl	$7,%eax
 	xorl	%ecx,%ecx
 	cpuid
+	movd	%eax,%xmm1
 	btl	$26,%r9d
 	jc	L$notknights
 	andl	$0xfff7ffff,%ebx
@@ -167,9 +175,31 @@ L$notknights:
 	jne	L$notskylakex
 	andl	$0xfffeffff,%ebx
 
+
 L$notskylakex:
 	movl	%ebx,8(%rdi)
 	movl	%ecx,12(%rdi)
+	movl	%edx,16(%rdi)
+
+	movd	%xmm1,%eax
+	cmpl	$0x1,%eax
+	jb	L$no_extended_info
+	movl	$0x7,%eax
+	movl	$0x1,%ecx
+	cpuid
+	movl	%eax,20(%rdi)
+	movl	%edx,24(%rdi)
+	movl	%ebx,28(%rdi)
+	movl	%ecx,32(%rdi)
+
+	andl	$0x80000,%edx
+	cmpl	$0x0,%edx
+	je	L$no_extended_info
+	movl	$0x24,%eax
+	movl	$0x0,%ecx
+	cpuid
+	movl	%ebx,36(%rdi)
+
 L$no_extended_info:
 
 	btl	$27,%r9d
@@ -188,6 +218,9 @@ L$no_extended_info:
 	cmpl	$6,%eax
 	je	L$done
 L$clear_avx:
+	andl	$0xff7fffff,20(%rdi)
+
+
 	movl	$0xefffe7ff,%eax
 	andl	%eax,%r9d
 	movl	$0x3fdeffdf,%eax
@@ -206,6 +239,8 @@ L$done:
 
 .p2align	4
 _OPENSSL_cleanse:
+
+.byte	243,15,30,250
 	xorq	%rax,%rax
 	cmpq	$15,%rsi
 	jae	L$ot
@@ -237,10 +272,13 @@ L$aligned:
 	.byte	0xf3,0xc3
 
 
+
 .globl	_CRYPTO_memcmp
 
 .p2align	4
 _CRYPTO_memcmp:
+
+.byte	243,15,30,250
 	xorq	%rax,%rax
 	xorq	%r10,%r10
 	cmpq	$0,%rdx
@@ -270,41 +308,13 @@ L$oop_cmp:
 L$no_data:
 	.byte	0xf3,0xc3
 
-.globl	_OPENSSL_wipe_cpu
-
-.p2align	4
-_OPENSSL_wipe_cpu:
-	pxor	%xmm0,%xmm0
-	pxor	%xmm1,%xmm1
-	pxor	%xmm2,%xmm2
-	pxor	%xmm3,%xmm3
-	pxor	%xmm4,%xmm4
-	pxor	%xmm5,%xmm5
-	pxor	%xmm6,%xmm6
-	pxor	%xmm7,%xmm7
-	pxor	%xmm8,%xmm8
-	pxor	%xmm9,%xmm9
-	pxor	%xmm10,%xmm10
-	pxor	%xmm11,%xmm11
-	pxor	%xmm12,%xmm12
-	pxor	%xmm13,%xmm13
-	pxor	%xmm14,%xmm14
-	pxor	%xmm15,%xmm15
-	xorq	%rcx,%rcx
-	xorq	%rdx,%rdx
-	xorq	%rsi,%rsi
-	xorq	%rdi,%rdi
-	xorq	%r8,%r8
-	xorq	%r9,%r9
-	xorq	%r10,%r10
-	xorq	%r11,%r11
-	leaq	8(%rsp),%rax
-	.byte	0xf3,0xc3
 
 .globl	_OPENSSL_instrument_bus
 
 .p2align	4
 _OPENSSL_instrument_bus:
+
+.byte	243,15,30,250
 	movq	%rdi,%r10
 	movq	%rsi,%rcx
 	movq	%rsi,%r11
@@ -333,10 +343,13 @@ L$oop:	rdtsc
 	.byte	0xf3,0xc3
 
 
+
 .globl	_OPENSSL_instrument_bus2
 
 .p2align	4
 _OPENSSL_instrument_bus2:
+
+.byte	243,15,30,250
 	movq	%rdi,%r10
 	movq	%rsi,%rcx
 	movq	%rdx,%r11
@@ -380,10 +393,13 @@ L$done2:
 	subq	%rcx,%rax
 	.byte	0xf3,0xc3
 
+
 .globl	_OPENSSL_ia32_rdrand_bytes
 
 .p2align	4
 _OPENSSL_ia32_rdrand_bytes:
+
+.byte	243,15,30,250
 	xorq	%rax,%rax
 	cmpq	$0,%rsi
 	je	L$done_rdrand_bytes
@@ -421,10 +437,13 @@ L$done_rdrand_bytes:
 	xorq	%r10,%r10
 	.byte	0xf3,0xc3
 
+
 .globl	_OPENSSL_ia32_rdseed_bytes
 
 .p2align	4
 _OPENSSL_ia32_rdseed_bytes:
+
+.byte	243,15,30,250
 	xorq	%rax,%rax
 	cmpq	$0,%rsi
 	je	L$done_rdseed_bytes
@@ -461,4 +480,5 @@ L$tail_rdseed_bytes:
 L$done_rdseed_bytes:
 	xorq	%r10,%r10
 	.byte	0xf3,0xc3
+
 

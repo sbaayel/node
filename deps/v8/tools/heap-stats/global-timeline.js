@@ -4,15 +4,18 @@
 
 'use strict';
 
-const global_timeline_template =
-    document.currentScript.ownerDocument.querySelector(
-        '#global-timeline-template');
+import {
+  VIEW_BY_INSTANCE_TYPE,
+  VIEW_BY_INSTANCE_CATEGORY,
+  VIEW_BY_FIELD_TYPE
+} from './details-selection.js';
 
-class GlobalTimeline extends HTMLElement {
+defineCustomElement('global-timeline', (templateText) =>
+ class GlobalTimeline extends HTMLElement {
   constructor() {
     super();
     const shadowRoot = this.attachShadow({mode: 'open'});
-    shadowRoot.appendChild(global_timeline_template.content.cloneNode(true));
+    shadowRoot.innerHTML = templateText;
   }
 
   $(id) {
@@ -66,7 +69,6 @@ class GlobalTimeline extends HTMLElement {
       {type: 'number', label: 'Tagged fields (excl. in-object Smis)'},
       {type: 'number', label: 'In-object Smi-only fields'},
       {type: 'number', label: 'Other raw fields'},
-      {type: 'number', label: 'Unboxed doubles'},
       {type: 'number', label: 'Boxed doubles'},
       {type: 'number', label: 'String data'}
     ];
@@ -84,7 +86,6 @@ class GlobalTimeline extends HTMLElement {
                     data_set.inobject_smi_fields +
                     data_set.embedder_fields +
                     data_set.other_raw_fields +
-                    data_set.unboxed_double_fields +
                     data_set.boxed_double_fields +
                     data_set.string_data;
       const ptr_compr_benefit =
@@ -102,7 +103,6 @@ class GlobalTimeline extends HTMLElement {
       data.push(data_set.tagged_fields / KB);
       data.push(data_set.inobject_smi_fields / KB);
       data.push(data_set.other_raw_fields / KB);
-      data.push(data_set.unboxed_double_fields / KB);
       data.push(data_set.boxed_double_fields / KB);
       data.push(data_set.string_data / KB);
       chart_data.push(data);
@@ -206,6 +206,10 @@ class GlobalTimeline extends HTMLElement {
   }
 
   drawChart() {
+    setTimeout(() => this._drawChart(), 10);
+  }
+
+  _drawChart() {
     console.assert(this.data, 'invalid data');
     console.assert(this.selection, 'invalid selection');
 
@@ -217,6 +221,4 @@ class GlobalTimeline extends HTMLElement {
     this.show();
     chart.draw(data, google.charts.Line.convertOptions(options));
   }
-}
-
-customElements.define('global-timeline', GlobalTimeline);
+});

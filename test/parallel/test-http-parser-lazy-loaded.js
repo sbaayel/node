@@ -20,7 +20,7 @@ binding.HTTPParser = DummyParser;
 
 const assert = require('assert');
 const { spawn } = require('child_process');
-const { parsers } = require('_http_common');
+const { parsers } = require('internal/http/common');
 
 // Test _http_common was not loaded before monkey patching
 const parser = parsers.alloc();
@@ -31,7 +31,7 @@ assert.strictEqual(parser.test_type, DummyParser.REQUEST);
 if (process.argv[2] !== 'child') {
   // Also test in a child process with IPC (specific case of https://github.com/nodejs/node/issues/23716)
   const child = spawn(process.execPath, [
-    '--expose-internals', __filename, 'child'
+    '--expose-internals', __filename, 'child',
   ], {
     stdio: ['inherit', 'inherit', 'inherit', 'ipc']
   });

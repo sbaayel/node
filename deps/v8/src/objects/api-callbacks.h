@@ -5,14 +5,18 @@
 #ifndef V8_OBJECTS_API_CALLBACKS_H_
 #define V8_OBJECTS_API_CALLBACKS_H_
 
+#include "src/base/bit-field.h"
 #include "src/objects/struct.h"
-#include "torque-generated/class-definitions-tq.h"
+#include "src/sandbox/external-pointer.h"
 
 // Has to be the last include (doesn't have include guards):
 #include "src/objects/object-macros.h"
 
 namespace v8 {
 namespace internal {
+
+class Undefined;
+class StructBodyDescriptor;
 
 // An accessor must have a getter, but can have no setter.
 //
@@ -23,30 +27,27 @@ namespace internal {
 // If the accessor in the prototype has the READ_ONLY property attribute, then
 // a new value is added to the derived object when the property is set.
 // This shadows the accessor in the prototype.
-class AccessorInfo : public Struct {
+V8_OBJECT class AccessorInfo : public HeapObject {
  public:
-  DECL_ACCESSORS(name, Name)
-  DECL_INT_ACCESSORS(flags)
-  DECL_ACCESSORS(expected_receiver_type, Object)
-  // This directly points at a foreign C function to be used from the runtime.
-  DECL_ACCESSORS(getter, Object)
-  inline bool has_getter();
-  DECL_ACCESSORS(setter, Object)
-  inline bool has_setter();
-  // This either points at the same as above, or a trampoline in case we are
-  // running with the simulator. Use these entries from generated code.
-  DECL_ACCESSORS(js_getter, Object)
-  DECL_ACCESSORS(data, Object)
+  inline Tagged<Object> data() const;
+  inline void set_data(Tagged<Object> value,
+                       WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
 
-  static Address redirect(Address address, AccessorComponent component);
-  Address redirected_getter() const;
+  inline Tagged<Name> name() const;
+  inline void set_name(Tagged<Name> value,
+                       WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
 
-  // Dispatched behavior.
-  DECL_PRINTER(AccessorInfo)
+  inline uint32_t flags() const;
+  inline void set_flags(uint32_t value);
 
-  DECL_BOOLEAN_ACCESSORS(all_can_read)
-  DECL_BOOLEAN_ACCESSORS(all_can_write)
-  DECL_BOOLEAN_ACCESSORS(is_special_data_property)
+  // C function pointer that can be called from native code.
+  DECL_REDIRECTED_CALLBACK_ACCESSORS_MAYBE_READ_ONLY_HOST(getter, Address)
+  inline bool has_getter(Isolate* isolate);
+
+  // The field contains the address of the C function.
+  DECL_EXTERNAL_POINTER_ACCESSORS_MAYBE_READ_ONLY_HOST(setter, Address)
+  inline bool has_setter(Isolate* isolate);
+
   DECL_BOOLEAN_ACCESSORS(replace_on_access)
   DECL_BOOLEAN_ACCESSORS(is_sloppy)
 
@@ -65,96 +66,268 @@ class AccessorInfo : public Struct {
   // Checks whether the given receiver is compatible with this accessor.
   static bool IsCompatibleReceiverMap(Handle<AccessorInfo> info,
                                       Handle<Map> map);
-  inline bool IsCompatibleReceiver(Object receiver);
-
-  DECL_CAST(AccessorInfo)
-
-  // Dispatched behavior.
-  DECL_VERIFIER(AccessorInfo)
+  inline bool IsCompatibleReceiver(Tagged<Object> receiver);
 
   // Append all descriptors to the array that are not already there.
   // Return number added.
-  static int AppendUnique(Isolate* isolate, Handle<Object> descriptors,
-                          Handle<FixedArray> array, int valid_descriptors);
+  static int AppendUnique(Isolate* isolate, DirectHandle<Object> descriptors,
+                          DirectHandle<FixedArray> array,
+                          int valid_descriptors);
 
-  // Layout description.
-  DEFINE_FIELD_OFFSET_CONSTANTS(HeapObject::kHeaderSize,
-                                TORQUE_GENERATED_ACCESSOR_INFO_FIELDS)
+  DECL_PRINTER(AccessorInfo)
+  DECL_VERIFIER(AccessorInfo)
+
+  inline void RemoveCallbackRedirectionForSerialization(
+      IsolateForSandbox isolate);
+  inline void RestoreCallbackRedirectionAfterDeserialization(
+      IsolateForSandbox isolate);
+
+  inline void clear_padding();
+
+  class BodyDescriptor;
+
+  static const int kOptionalPaddingOffset;
+  static const int kOptionalPaddingOffsetEnd;
+  static const int kEndOfStrongFieldsOffset;
+  static const int kSize;
 
  private:
-  inline bool HasExpectedReceiverType();
+  // Bit positions in |flags|.
+  using IsSloppyBit = base::BitField<bool, 0, 1, uint32_t>;
+  using ReplaceOnAccessBit = IsSloppyBit::Next<bool, 1>;
+  using GetterSideEffectTypeBits = ReplaceOnAccessBit::Next<SideEffectType, 2>;
+  using SetterSideEffectTypeBits =
+      GetterSideEffectTypeBits::Next<SideEffectType, 2>;
+  using InitialAttributesBits =
+      SetterSideEffectTypeBits::Next<PropertyAttributes, 3>;
 
-// Bit positions in |flags|.
-#define ACCESSOR_INFO_FLAGS_BIT_FIELDS(V, _)                           \
-  V(AllCanReadBit, bool, 1, _)                                         \
-  V(AllCanWriteBit, bool, 1, _)                                        \
-  V(IsSpecialDataPropertyBit, bool, 1, _)                              \
-  V(IsSloppyBit, bool, 1, _)                                           \
-  V(ReplaceOnAccessBit, bool, 1, _)                                    \
-  V(GetterSideEffectTypeBits, SideEffectType, 2, _)                    \
-  /* We could save a bit from setter side-effect type, if necessary */ \
-  V(SetterSideEffectTypeBits, SideEffectType, 2, _)                    \
-  V(InitialAttributesBits, PropertyAttributes, 3, _)
+  friend class TorqueGeneratedAccessorInfoAsserts;
+  friend class TorqueGeneratedBitFieldAsserts;
 
-  DEFINE_BIT_FIELDS(ACCESSOR_INFO_FLAGS_BIT_FIELDS)
-#undef ACCESSOR_INFO_FLAGS_BIT_FIELDS
-
-  OBJECT_CONSTRUCTORS(AccessorInfo, Struct);
-};
-
-class AccessCheckInfo
-    : public TorqueGeneratedAccessCheckInfo<AccessCheckInfo, Struct> {
  public:
-  // Dispatched behavior.
+  TaggedMember<Object> data_;
+  TaggedMember<Name> name_;
+  ExternalPointerMember<kAccessorInfoGetterTag> getter_;
+  ExternalPointerMember<kAccessorInfoSetterTag> setter_;
+  uint32_t flags_;
+#if TAGGED_SIZE_8_BYTES
+  uint32_t optional_padding_;
+#endif  // TAGGED_SIZE_8_BYTES
+} V8_OBJECT_END;
+
+inline constexpr int AccessorInfo::kOptionalPaddingOffset =
+    offsetof(AccessorInfo, flags_) + sizeof(uint32_t);
+inline constexpr int AccessorInfo::kOptionalPaddingOffsetEnd =
+    TAGGED_SIZE_8_BYTES
+        ? AccessorInfo::kOptionalPaddingOffset + sizeof(uint32_t) - 1
+        : AccessorInfo::kOptionalPaddingOffset - 1;
+inline constexpr int AccessorInfo::kEndOfStrongFieldsOffset =
+    offsetof(AccessorInfo, getter_);
+inline constexpr int AccessorInfo::kSize = sizeof(AccessorInfo);
+
+V8_OBJECT class AccessCheckInfo : public Struct {
+ public:
+  static Tagged<AccessCheckInfo> Get(Isolate* isolate,
+                                     DirectHandle<JSObject> receiver);
+
+  inline Tagged<UnionOf<Foreign, Smi, Undefined>> callback() const;
+  inline void set_callback(Tagged<UnionOf<Foreign, Smi, Undefined>> value,
+                           WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
+
+  inline Tagged<UnionOf<InterceptorInfo, Smi, Undefined>> named_interceptor()
+      const;
+  inline void set_named_interceptor(
+      Tagged<UnionOf<InterceptorInfo, Smi, Undefined>> value,
+      WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
+
+  inline Tagged<UnionOf<InterceptorInfo, Smi, Undefined>> indexed_interceptor()
+      const;
+  inline void set_indexed_interceptor(
+      Tagged<UnionOf<InterceptorInfo, Smi, Undefined>> value,
+      WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
+
+  inline Tagged<Object> data() const;
+  inline void set_data(Tagged<Object> value,
+                       WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
+
   DECL_PRINTER(AccessCheckInfo)
+  DECL_VERIFIER(AccessCheckInfo)
 
-  static AccessCheckInfo Get(Isolate* isolate, Handle<JSObject> receiver);
+  using BodyDescriptor = StructBodyDescriptor;
 
-  TQ_OBJECT_CONSTRUCTORS(AccessCheckInfo)
-};
+ private:
+  friend class TorqueGeneratedAccessCheckInfoAsserts;
 
-class InterceptorInfo
-    : public TorqueGeneratedInterceptorInfo<InterceptorInfo, Struct> {
+  TaggedMember<UnionOf<Foreign, Smi, Undefined>> callback_;
+  TaggedMember<UnionOf<InterceptorInfo, Smi, Undefined>> named_interceptor_;
+  TaggedMember<UnionOf<InterceptorInfo, Smi, Undefined>> indexed_interceptor_;
+  TaggedMember<Object> data_;
+} V8_OBJECT_END;
+
+// Interceptor callbacks that exist in both named and indexed interceptors.
+#define COMMON_INTERCEPTOR_INFO_CALLBACK_LIST(V) \
+  V(Getter, getter)                              \
+  V(Setter, setter)                              \
+  V(Query, query)                                \
+  V(Descriptor, descriptor)                      \
+  V(Deleter, deleter)                            \
+  V(Enumerator, enumerator)                      \
+  V(Definer, definer)
+
+#define NAMED_INTERCEPTOR_INFO_CALLBACK_LIST(V) \
+  COMMON_INTERCEPTOR_INFO_CALLBACK_LIST(V)
+
+#define INDEXED_INTERCEPTOR_INFO_CALLBACK_LIST(V) \
+  COMMON_INTERCEPTOR_INFO_CALLBACK_LIST(V)        \
+  V(IndexOf, index_of)                            \
+  V(IterableToList, iterable_to_list)
+
+V8_OBJECT class InterceptorInfo : public HeapObject {
  public:
+  inline Tagged<Object> data() const;
+  inline void set_data(Tagged<Object> value,
+                       WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
+
+  inline uint32_t flags() const;
+  inline void set_flags(uint32_t value);
+
+  // Convenient predicates without named/indexed prefix.
+  inline bool has_getter() const;
+  inline bool has_setter() const;
+  inline bool has_query() const;
+  inline bool has_descriptor() const;
+  inline bool has_deleter() const;
+  inline bool has_enumerator() const;
+  inline bool has_definer() const;
+
+  inline bool has_index_of() const;
+  inline bool has_iterable_to_list() const;
+
+  // Accessor callbacks for named interceptors.
+  DECL_LAZY_REDIRECTED_CALLBACK_ACCESSORS_MAYBE_READ_ONLY_HOST(named_getter,
+                                                               Address)
+  DECL_LAZY_REDIRECTED_CALLBACK_ACCESSORS_MAYBE_READ_ONLY_HOST(named_setter,
+                                                               Address)
+  DECL_LAZY_EXTERNAL_POINTER_ACCESSORS_MAYBE_READ_ONLY_HOST(named_query,
+                                                            Address)
+  DECL_LAZY_EXTERNAL_POINTER_ACCESSORS_MAYBE_READ_ONLY_HOST(named_descriptor,
+                                                            Address)
+  DECL_LAZY_EXTERNAL_POINTER_ACCESSORS_MAYBE_READ_ONLY_HOST(named_deleter,
+                                                            Address)
+  DECL_LAZY_EXTERNAL_POINTER_ACCESSORS_MAYBE_READ_ONLY_HOST(named_enumerator,
+                                                            Address)
+  DECL_LAZY_EXTERNAL_POINTER_ACCESSORS_MAYBE_READ_ONLY_HOST(named_definer,
+                                                            Address)
+
+  // Accessor callbacks for indexed interceptors.
+  DECL_LAZY_EXTERNAL_POINTER_ACCESSORS_MAYBE_READ_ONLY_HOST(indexed_getter,
+                                                            Address)
+  DECL_LAZY_EXTERNAL_POINTER_ACCESSORS_MAYBE_READ_ONLY_HOST(indexed_setter,
+                                                            Address)
+  DECL_LAZY_EXTERNAL_POINTER_ACCESSORS_MAYBE_READ_ONLY_HOST(indexed_query,
+                                                            Address)
+  DECL_LAZY_EXTERNAL_POINTER_ACCESSORS_MAYBE_READ_ONLY_HOST(indexed_descriptor,
+                                                            Address)
+  DECL_LAZY_EXTERNAL_POINTER_ACCESSORS_MAYBE_READ_ONLY_HOST(indexed_deleter,
+                                                            Address)
+  DECL_LAZY_EXTERNAL_POINTER_ACCESSORS_MAYBE_READ_ONLY_HOST(indexed_enumerator,
+                                                            Address)
+  DECL_LAZY_EXTERNAL_POINTER_ACCESSORS_MAYBE_READ_ONLY_HOST(indexed_definer,
+                                                            Address)
+
+  // Indexed interceptor-only callbacks.
+  DECL_LAZY_EXTERNAL_POINTER_ACCESSORS_MAYBE_READ_ONLY_HOST(indexed_index_of,
+                                                            Address)
+  DECL_LAZY_EXTERNAL_POINTER_ACCESSORS_MAYBE_READ_ONLY_HOST(
+      indexed_iterable_to_list, Address)
+
   DECL_BOOLEAN_ACCESSORS(can_intercept_symbols)
-  DECL_BOOLEAN_ACCESSORS(all_can_read)
   DECL_BOOLEAN_ACCESSORS(non_masking)
-  DECL_BOOLEAN_ACCESSORS(is_named)
+  inline bool is_named() const;
   DECL_BOOLEAN_ACCESSORS(has_no_side_effect)
+  // TODO(ishell): remove support for old signatures once they go through
+  // Api deprecation process.
+  DECL_BOOLEAN_ACCESSORS(has_new_callbacks_signature)
+  DECL_BOOLEAN_ACCESSORS(has_dont_delete_property)
 
-  inline int flags() const;
-  inline void set_flags(int flags);
+  using CanInterceptSymbolsBit = base::BitField<bool, 0, 1, uint32_t>;
+  using NonMaskingBit = CanInterceptSymbolsBit::Next<bool, 1>;
+  using NamedBit = NonMaskingBit::Next<bool, 1>;
+  using HasNoSideEffectBit = NamedBit::Next<bool, 1>;
+  using HasNewCallbacksSignatureBit = HasNoSideEffectBit::Next<bool, 1>;
+  using HasDontDeletePropertyBit = HasNewCallbacksSignatureBit::Next<bool, 1>;
+  enum Flag : uint32_t {
+    kNone = 0,
+    kCanInterceptSymbols = CanInterceptSymbolsBit::kMask,
+    kNonMasking = NonMaskingBit::kMask,
+    kNamed = NamedBit::kMask,
+    kHasNoSideEffect = HasNoSideEffectBit::kMask,
+    kHasNewCallbacksSignature = HasNewCallbacksSignatureBit::kMask,
+    kHasDontDeleteProperty = HasDontDeletePropertyBit::kMask,
+  };
+  using Flags = base::Flags<Flag>;
+  static constexpr int kFlagCount = 6;
 
-  // Dispatched behavior.
   DECL_PRINTER(InterceptorInfo)
+  DECL_VERIFIER(InterceptorInfo)
 
-  static const int kCanInterceptSymbolsBit = 0;
-  static const int kAllCanReadBit = 1;
-  static const int kNonMasking = 2;
-  static const int kNamed = 3;
-  static const int kHasNoSideEffect = 4;
+  inline void RemoveCallbackRedirectionForSerialization(
+      IsolateForSandbox isolate);
+  inline void RestoreCallbackRedirectionAfterDeserialization(
+      IsolateForSandbox isolate);
 
-  TQ_OBJECT_CONSTRUCTORS(InterceptorInfo)
-};
+  inline void clear_padding();
 
-class CallHandlerInfo
-    : public TorqueGeneratedCallHandlerInfo<CallHandlerInfo, Struct> {
+  class BodyDescriptor;
+
+  static const int kOptionalPaddingOffset;
+  static const int kOptionalPaddingOffsetEnd;
+  static const int kEndOfStrongFieldsOffset;
+  static const int kIndexOfOffsetEnd;
+  static const int kIterableToListOffsetEnd;
+  static const int kSize;
+
+ private:
+  friend class Factory;
+  friend class TorqueGeneratedInterceptorInfoAsserts;
+
+  inline void AllocateExternalPointerEntries(Isolate* isolate);
+
  public:
-  inline bool IsSideEffectFreeCallHandlerInfo() const;
-  inline bool IsSideEffectCallHandlerInfo() const;
-  inline void SetNextCallHasNoSideEffect();
-  // Returns whether or not the next call can be side effect free.
-  // Calling this will change the state back to having a side effect.
-  inline bool NextCallHasNoSideEffect();
+  TaggedMember<Object> data_;
+  uint32_t flags_;
+#if TAGGED_SIZE_8_BYTES
+  uint32_t optional_padding_;
+#endif  // TAGGED_SIZE_8_BYTES
+  ExternalPointerMember<kApiNamedPropertyGetterCallbackTag> getter_;
+  ExternalPointerMember<kApiNamedPropertySetterCallbackTag> setter_;
+  ExternalPointerMember<kApiNamedPropertyQueryCallbackTag> query_;
+  ExternalPointerMember<kApiNamedPropertyDescriptorCallbackTag> descriptor_;
+  ExternalPointerMember<kApiNamedPropertyDeleterCallbackTag> deleter_;
+  ExternalPointerMember<kApiNamedPropertyEnumeratorCallbackTag> enumerator_;
+  ExternalPointerMember<kApiNamedPropertyDefinerCallbackTag> definer_;
+  ExternalPointerMember<kApiIndexedPropertyIndexOfCallbackTag> index_of_;
+  ExternalPointerMember<kApiIndexedPropertyIterableToListCallbackTag>
+      iterable_to_list_;
+} V8_OBJECT_END;
 
-  // Dispatched behavior.
-  DECL_PRINTER(CallHandlerInfo)
-  DECL_VERIFIER(CallHandlerInfo)
-
-  Address redirected_callback() const;
-
-  TQ_OBJECT_CONSTRUCTORS(CallHandlerInfo)
-};
+inline constexpr int InterceptorInfo::kOptionalPaddingOffset =
+    offsetof(InterceptorInfo, flags_) + sizeof(uint32_t);
+inline constexpr int InterceptorInfo::kOptionalPaddingOffsetEnd =
+    TAGGED_SIZE_8_BYTES
+        ? InterceptorInfo::kOptionalPaddingOffset + sizeof(uint32_t) - 1
+        : InterceptorInfo::kOptionalPaddingOffset - 1;
+inline constexpr int InterceptorInfo::kEndOfStrongFieldsOffset =
+    offsetof(InterceptorInfo, flags_);
+inline constexpr int InterceptorInfo::kIndexOfOffsetEnd =
+    offsetof(InterceptorInfo, index_of_) +
+    sizeof(ExternalPointerMember<kApiIndexedPropertyIndexOfCallbackTag>) - 1;
+inline constexpr int InterceptorInfo::kIterableToListOffsetEnd =
+    offsetof(InterceptorInfo, iterable_to_list_) +
+    sizeof(
+        ExternalPointerMember<kApiIndexedPropertyIterableToListCallbackTag>) -
+    1;
+inline constexpr int InterceptorInfo::kSize = sizeof(InterceptorInfo);
 
 }  // namespace internal
 }  // namespace v8
